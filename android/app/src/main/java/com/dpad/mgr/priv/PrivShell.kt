@@ -20,6 +20,9 @@ interface PrivShell {
     /** Run argv to completion; returns exit code and combined stdout+stderr. */
     suspend fun exec(argv: List<String>): ExecResult
 
+    /** Like [exec] but with an explicit timeout (for long-running commands such as `--learn`). */
+    suspend fun execLong(argv: List<String>, timeoutMs: Long): ExecResult = exec(argv)
+
     /** Start argv detached (nohup, stdio to /data/local/tmp/dpadkeys.log); returns pid or -1. */
     suspend fun spawn(argv: List<String>, pidfile: String): Int
 

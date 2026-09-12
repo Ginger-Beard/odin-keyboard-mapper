@@ -20,12 +20,14 @@ class ShizukuUserService() : IUserService.Stub() {
 
     @Volatile private var tailProc: Process? = null
 
-    override fun exec(argv: Array<String>): Bundle {
+    override fun exec(argv: Array<String>): Bundle = execTimeout(argv, 20_000)
+
+    override fun execTimeout(argv: Array<String>, timeoutMs: Int): Bundle {
         val b = Bundle()
         try {
             val p = ProcessBuilder(argv.toList()).redirectErrorStream(true).start()
             val out = p.inputStream.bufferedReader().readText()
-            val done = p.waitFor(20, TimeUnit.SECONDS)
+            val done = p.waitFor(timeoutMs.toLong().coerceAtLeast(1L), TimeUnit.MILLISECONDS)
             if (!done) p.destroyForcibly()
             b.putInt("rc", if (done) p.exitValue() else 124)
             b.putString("out", out)

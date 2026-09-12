@@ -98,6 +98,17 @@ class ShizukuShell(ctx: Context) : PrivShell {
         execRaw(s, argv)
     }
 
+    override suspend fun execLong(argv: List<String>, timeoutMs: Long): ExecResult = withContext(Dispatchers.IO) {
+        val s = svc() ?: return@withContext ExecResult(255, "shizuku: not bound")
+        try {
+            PrivShell.requireSafe(argv)
+            val b = s.execTimeout(argv.toTypedArray(), timeoutMs.coerceIn(1L, Int.MAX_VALUE.toLong()).toInt())
+            ExecResult(b.getInt("rc", 255), b.getString("out") ?: "")
+        } catch (e: Exception) {
+            ExecResult(255, "shizuku exec failed: $e")
+        }
+    }
+
     override suspend fun spawn(argv: List<String>, pidfile: String): Int = withContext(Dispatchers.IO) {
         PrivShell.requireSafe(argv)
         runCatching { svc()?.spawn(argv.toTypedArray(), pidfile) ?: -1 }.getOrDefault(-1)

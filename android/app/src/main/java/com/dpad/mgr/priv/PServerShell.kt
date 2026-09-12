@@ -224,6 +224,8 @@ class PServerShell(ctx: Context) : PrivShell {
         return ExecResult(r.rc ?: 255, if (r.rc == null) "pserver: no result (transact=${r.transact})\n${r.out}" else r.out)
     }
 
+    override suspend fun execLong(argv: List<String>, timeoutMs: Long): ExecResult = execSlow(argv, timeoutMs)
+
     /** Longer-timeout exec for copies etc. */
     suspend fun execSlow(argv: List<String>, timeoutMs: Long): ExecResult {
         PrivShell.requireSafe(argv)

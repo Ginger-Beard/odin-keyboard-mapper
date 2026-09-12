@@ -79,6 +79,47 @@ gamepad. A second `start.sh` refuses to run if one is already active.
 `SIGTERM` (`stop.sh`) cleans up and removes the virtual keyboard. Logs go
 to `/data/local/tmp/dpadkeys.log`.
 
+## Learn-by-press and other devices
+
+Profiles are stored as *pad control -> key* bindings, and the app's profile
+editor is key-first: it lists the keys a game needs (F1-F12, digits,
+arrows, Enter/Space/Esc, wheel, letters) and each key has a **Bind...**
+button that runs `dpadkeys --learn` and records whatever you press. The
+daemon no longer cares about the vendor id: any evdev node with `BTN_SOUTH`
+is a candidate pad, so the same app and profiles work on a Retroid Pocket 5,
+an AYN Thor, or a plugged-in USB/Bluetooth pad.
+
+What transfers between pads:
+
+- Semantic sources (`hat.up`, `btn.south`, `btn.tl`, `ls.up`, `lt`, ...)
+  follow the Linux gamepad conventions, so a profile built from them on the
+  Odin behaves the same on any pad that reports standard codes. The
+  built-in OSRS/WASD profiles only use these.
+- Learn reports the semantic name whenever one exists.
+
+What doesn't:
+
+- Controls that have no standard code are stored as raw sources:
+  `key.0xNNN` (any EV_KEY code, e.g. `key.0x2c4` for an odd back button) or
+  `abs.0xNN.neg` / `abs.0xNN.pos` (any EV_ABS axis, thresholded with the
+  same deadzone as the triggers; a -1..1 hat-style axis fires at +-1).
+  Those codes are device-specific - rebind them on the new pad.
+- `btn.m1` / `btn.m2` are the Odin 2's back buttons (`BTN_C`/`BTN_Z`);
+  other pads may expose their back buttons under different codes.
+
+To add a device: run the app on it with Shizuku, open the profile, and
+press **Bind...** next to each key; press the control on the pad. The
+Status tab shows the detected pad name and `vendor:product`. Binding stops
+a running daemon first (learn needs the pad ungrabbed). A raw source and
+its semantic alias (`key.0x130` and `btn.south`) cannot both be mapped in
+one profile - the daemon rejects that config.
+
+Hand-written configs may add `device.match <substring-of-name>` or
+`device.match vvvv:pppp` (hex) to prefer one pad when several are present;
+otherwise the first gamepad found is used. `dpadkeys --list` shows the
+candidates and `dpadkeys --learn [--learn-timeout-ms N]` prints
+`learned <source>` (or `learned NONE`, exit 3, on timeout).
+
 ## Why this is low-risk for OSRS
 
 - 1:1 mapping: one D-pad press produces exactly one keystroke.

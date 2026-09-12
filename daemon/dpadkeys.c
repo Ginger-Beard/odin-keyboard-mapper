@@ -20,6 +20,12 @@
  * arbitrary pad sources (hat, buttons, sticks, triggers) to arbitrary KEY_*
  * codes or NONE (explicit swallow). --profile fkeys/wasd remain as built-in
  * shorthands equivalent to a two-line config file.
+ *
+ * v3 makes the daemon device-agnostic: any evdev node with BTN_SOUTH is a
+ * candidate pad (optionally narrowed by a `device.match` config line), raw
+ * sources `key.0xNNN` / `abs.0xNN.neg|pos` address controls that have no
+ * semantic name, and `--learn` reports the first control pressed so an app
+ * can bind by pressing.
  */
 
 #include <errno.h>
@@ -31,6 +37,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -42,8 +49,6 @@
 #define BITS_PER_LONG (sizeof(long) * 8)
 #define NLONGS(x) (((x) + BITS_PER_LONG - 1) / BITS_PER_LONG)
 #define TEST_BIT(bit, arr) ((arr[(bit) / BITS_PER_LONG] >> ((bit) % BITS_PER_LONG)) & 1)
-
-#define ODIN_VENDOR 0x2020
 
 /* ---- config sources ---- */
 
@@ -85,6 +90,23 @@ static const struct { int code; source_id_t src; } BTN_MAP[] = {
     { BTN_C, SRC_BTN_M1 }, { BTN_Z, SRC_BTN_M2 }, /* Odin 2 back buttons M1/M2 */
 };
 #define BTN_MAP_LEN (int)(sizeof(BTN_MAP) / sizeof(BTN_MAP[0]))
+
+/* Raw sources: `key.0xNNN` (any EV_KEY code) and `abs.0xNN.neg|pos` (any
+ * EV_ABS code, thresholded like a trigger). They occupy source slots
+ * SRC_COUNT..MAX_SOURCES-1 so all per-source state arrays cover both kinds. */
+#define MAX_RAW 64
+#define MAX_SOURCES (SRC_COUNT + MAX_RAW)
+
+typedef enum { RAW_KEY, RAW_ABS } raw_kind_t;
+
+typedef struct {
+    char name[32];   /* exactly as written in the config */
+    raw_kind_t kind;
+    int code;        /* EV_KEY or EV_ABS code */
+    int dir;         /* RAW_ABS only: -1 (neg) or +1 (pos) */
+    bool axis_known; /* RAW_ABS: axis range queried from the device */
+    struct { int min, max; double center, half; int state; } axis;
+} raw_source_t;
 
 /* ---- target key name table ---- */
 
@@ -134,13 +156,17 @@ static bool target_is_wheel(int t) { return wheel_idx_from_target(t) >= 0; }
 /* ---- config ---- */
 
 typedef struct {
-    int target[SRC_COUNT]; /* KEY_* code, TARGET_WHEEL_*, or TARGET_NONE */
-    int mod_target[SRC_COUNT];   /* layer active while the modifier is held */
-    bool mod_defined[SRC_COUNT]; /* true if a mod+<src> line set mod_target */
-    int modifier_src;      /* SRC_* of the "MOD" source, or -1 if none */
+    int target[MAX_SOURCES]; /* KEY_* code, TARGET_WHEEL_*, or TARGET_NONE */
+    int mod_target[MAX_SOURCES];   /* layer active while the modifier is held */
+    bool mod_defined[MAX_SOURCES]; /* true if a mod+<src> line set mod_target */
+    bool defined[MAX_SOURCES];     /* any config line referenced this source */
+    int modifier_src;      /* source slot of the "MOD" source, or -1 if none */
     double deadzone;       /* fraction of half-range that counts as pressed */
     bool ls_invert_y, rs_invert_y; /* flip stick up/down */
     int wheel_repeat_ms;   /* repeat interval for held wheel targets */
+    int n_raw;             /* raw sources in use (slots SRC_COUNT..SRC_COUNT+n_raw-1) */
+    raw_source_t raw[MAX_RAW];
+    char device_match[128]; /* substring of the pad name, or "vvvv:pppp" hex; empty = any */
 } config_t;
 
 static volatile sig_atomic_t g_running = 1;
@@ -148,10 +174,10 @@ static int g_uinput_fd = -1;
 static int g_pad_fd = -1;
 static bool g_grabbed = false;
 static bool g_verbose = false;
-static bool g_source_pressed[SRC_COUNT] = {0};
+static bool g_source_pressed[MAX_SOURCES] = {0};
 static int g_key_count[KEY_CNT] = {0};
 static bool g_modifier_held = false;
-static int g_resolved_target[SRC_COUNT] = {0}; /* target used at press, replayed at release */
+static int g_resolved_target[MAX_SOURCES] = {0}; /* target used at press, replayed at release */
 static int g_wheel_count[WHEEL_COUNT] = {0};
 static long long g_wheel_next_due_ms[WHEEL_COUNT] = {0};
 static int g_wheel_repeat_ms = 120;
@@ -162,21 +188,101 @@ static void on_signal(int sig) {
 }
 
 static void init_config(config_t *cfg) {
-    for (int i = 0; i < SRC_COUNT; i++) {
+    memset(cfg, 0, sizeof(*cfg));
+    for (int i = 0; i < MAX_SOURCES; i++) {
         cfg->target[i] = TARGET_NONE;
         cfg->mod_target[i] = TARGET_NONE;
         cfg->mod_defined[i] = false;
+        cfg->defined[i] = false;
     }
     cfg->modifier_src = -1;
     cfg->deadzone = 0.5;
     cfg->ls_invert_y = false; cfg->rs_invert_y = false;
     cfg->wheel_repeat_ms = 120;
+    cfg->n_raw = 0;
+    cfg->device_match[0] = '\0';
 }
 
-static int lookup_source(const char *name) {
+static int n_sources(const config_t *cfg) { return SRC_COUNT + cfg->n_raw; }
+
+static const char *source_name(const config_t *cfg, int slot) {
+    if (slot < SRC_COUNT) return SOURCE_NAMES[slot];
+    return cfg->raw[slot - SRC_COUNT].name;
+}
+
+/* Semantic source that a raw EV_KEY code aliases, or -1. */
+static int semantic_for_key(int code) {
+    for (int i = 0; i < BTN_MAP_LEN; i++)
+        if (BTN_MAP[i].code == code) return BTN_MAP[i].src;
+    return -1;
+}
+
+/* Semantic source that a raw hat axis+direction aliases, or -1. Stick and
+ * trigger axes are device-dependent and are checked after detect_axes(). */
+static int semantic_for_abs(int code, int dir) {
+    if (code == ABS_HAT0X) return dir < 0 ? SRC_HAT_LEFT : SRC_HAT_RIGHT;
+    if (code == ABS_HAT0Y) return dir < 0 ? SRC_HAT_UP : SRC_HAT_DOWN;
+    return -1;
+}
+
+/* Parses "key.0xNNN" / "abs.0xNN.neg|pos" into *out; returns true on success. */
+static bool parse_raw_source(const char *name, raw_source_t *out) {
+    memset(out, 0, sizeof(*out));
+    const char *p;
+    char *end;
+    if (strncmp(name, "key.0x", 6) == 0) {
+        p = name + 6;
+        long code = strtol(p, &end, 16);
+        if (end == p || *end != '\0' || code < 0 || code >= KEY_CNT) return false;
+        out->kind = RAW_KEY; out->code = (int)code; out->dir = 0;
+    } else if (strncmp(name, "abs.0x", 6) == 0) {
+        p = name + 6;
+        long code = strtol(p, &end, 16);
+        if (end == p || code < 0 || code >= ABS_CNT) return false;
+        if (strcmp(end, ".neg") == 0) out->dir = -1;
+        else if (strcmp(end, ".pos") == 0) out->dir = 1;
+        else return false;
+        out->kind = RAW_ABS; out->code = (int)code;
+    } else {
+        return false;
+    }
+    if (strlen(name) >= sizeof(out->name)) return false;
+    strcpy(out->name, name);
+    return true;
+}
+
+/* Returns the source slot for a config name, adding a raw slot on first use.
+ * Returns -1 for an unknown name; sets *err for a collision/overflow. */
+static int lookup_or_add_source(config_t *cfg, const char *name, const char **err) {
+    *err = NULL;
     for (int i = 0; i < SRC_COUNT; i++)
         if (strcmp(name, SOURCE_NAMES[i]) == 0) return i;
-    return -1;
+    raw_source_t r;
+    if (!parse_raw_source(name, &r)) return -1;
+    for (int i = 0; i < cfg->n_raw; i++) {
+        const raw_source_t *e = &cfg->raw[i];
+        if (e->kind == r.kind && e->code == r.code && e->dir == r.dir) return SRC_COUNT + i;
+    }
+    int sem = (r.kind == RAW_KEY) ? semantic_for_key(r.code) : semantic_for_abs(r.code, r.dir);
+    if (sem >= 0 && cfg->defined[sem]) {
+        static char msg[96];
+        snprintf(msg, sizeof(msg), "raw source '%s' collides with '%s'", name, SOURCE_NAMES[sem]);
+        *err = msg;
+        return -1;
+    }
+    if (cfg->n_raw >= MAX_RAW) { *err = "too many raw sources"; return -1; }
+    cfg->raw[cfg->n_raw] = r;
+    return SRC_COUNT + cfg->n_raw++;
+}
+
+/* The reverse collision: a semantic line after its raw alias was mapped. */
+static const char *semantic_collides_with_raw(const config_t *cfg, int sem) {
+    for (int i = 0; i < cfg->n_raw; i++) {
+        const raw_source_t *r = &cfg->raw[i];
+        int alias = (r->kind == RAW_KEY) ? semantic_for_key(r->code) : semantic_for_abs(r->code, r->dir);
+        if (alias == sem) return r->name;
+    }
+    return NULL;
 }
 
 static int lookup_target(const char *name) {
@@ -232,14 +338,37 @@ static void load_config_file(const char *path, config_t *cfg) {
             cfg->wheel_repeat_ms = atoi(tok2);
             continue;
         }
+        if (strcmp(tok1, "device.match") == 0) {
+            /* value is the rest of the line (device names may contain spaces) */
+            char buf[128];
+            const char *rest = save ? save : "";
+            while (*rest == ' ' || *rest == '\t') rest++;
+            if (*rest) snprintf(buf, sizeof(buf), "%s %s", tok2, rest);
+            else snprintf(buf, sizeof(buf), "%s", tok2);
+            size_t len = strlen(buf);
+            while (len > 0 && strchr(" \t\r\n", buf[len - 1])) buf[--len] = '\0';
+            snprintf(cfg->device_match, sizeof(cfg->device_match), "%s", buf);
+            continue;
+        }
 
         bool is_mod_line = strncmp(tok1, "mod+", 4) == 0;
         const char *src_name = is_mod_line ? tok1 + 4 : tok1;
-        int src = lookup_source(src_name);
+        const char *err = NULL;
+        int src = lookup_or_add_source(cfg, src_name, &err);
         if (src < 0) {
-            fprintf(stderr, "dpadkeys: %s:%d: unknown source '%s'\n", path, lineno, src_name);
+            if (err) fprintf(stderr, "dpadkeys: %s:%d: %s\n", path, lineno, err);
+            else fprintf(stderr, "dpadkeys: %s:%d: unknown source '%s'\n", path, lineno, src_name);
             exit(2);
         }
+        if (src < SRC_COUNT && !cfg->defined[src]) {
+            const char *raw = semantic_collides_with_raw(cfg, src);
+            if (raw) {
+                fprintf(stderr, "dpadkeys: %s:%d: source '%s' collides with raw source '%s'\n",
+                        path, lineno, src_name, raw);
+                exit(2);
+            }
+        }
+        cfg->defined[src] = true;
 
         if (is_mod_line) {
             int target = lookup_target(tok2);
@@ -255,7 +384,7 @@ static void load_config_file(const char *path, config_t *cfg) {
         if (strcmp(tok2, "MOD") == 0) {
             if (cfg->modifier_src != -1) {
                 fprintf(stderr, "dpadkeys: %s:%d: modifier already declared as '%s'\n",
-                        path, lineno, SOURCE_NAMES[cfg->modifier_src]);
+                        path, lineno, source_name(cfg, cfg->modifier_src));
                 exit(2);
             }
             cfg->modifier_src = src;
@@ -292,17 +421,19 @@ static void load_profile(config_t *cfg, const char *name) {
 
 static void print_config(const config_t *cfg, FILE *out) {
     fprintf(out, "# effective dpadkeys config\n");
-    for (int i = 0; i < SRC_COUNT; i++) {
+    if (cfg->device_match[0]) fprintf(out, "%-12s %s\n", "device.match", cfg->device_match);
+    /* semantic sources are always listed; raw ones exactly as they were given */
+    for (int i = 0; i < n_sources(cfg); i++) {
         const char *tgt = (i == cfg->modifier_src) ? "MOD" : key_name(cfg->target[i]);
-        fprintf(out, "%-12s %s\n", SOURCE_NAMES[i], tgt);
+        fprintf(out, "%-12s %s\n", source_name(cfg, i), tgt);
     }
     fprintf(out, "%-12s %.2f\n", "deadzone", cfg->deadzone);
     fprintf(out, "%-12s %d\n", "ls.invert_y", cfg->ls_invert_y ? 1 : 0);
     fprintf(out, "%-12s %d\n", "rs.invert_y", cfg->rs_invert_y ? 1 : 0);
-    for (int i = 0; i < SRC_COUNT; i++) {
+    for (int i = 0; i < n_sources(cfg); i++) {
         if (!cfg->mod_defined[i]) continue;
-        char name[24];
-        snprintf(name, sizeof(name), "mod+%s", SOURCE_NAMES[i]);
+        char name[48];
+        snprintf(name, sizeof(name), "mod+%s", source_name(cfg, i));
         fprintf(out, "%-12s %s\n", name, key_name(cfg->mod_target[i]));
     }
     fprintf(out, "%-12s %d\n", "wheel_repeat_ms", cfg->wheel_repeat_ms);
@@ -353,7 +484,7 @@ static int open_uinput(const config_t *cfg) {
         return -1;
     }
     bool used[KEY_CNT] = {0};
-    for (int i = 0; i < SRC_COUNT; i++) {
+    for (int i = 0; i < n_sources(cfg); i++) {
         if (cfg->target[i] >= 0 && cfg->target[i] < KEY_CNT) used[cfg->target[i]] = true;
         if (cfg->mod_defined[i] && cfg->mod_target[i] >= 0 && cfg->mod_target[i] < KEY_CNT)
             used[cfg->mod_target[i]] = true;
@@ -367,7 +498,7 @@ static int open_uinput(const config_t *cfg) {
     }
 
     bool uses_wheel = false;
-    for (int i = 0; i < SRC_COUNT; i++) {
+    for (int i = 0; i < n_sources(cfg); i++) {
         if (target_is_wheel(cfg->target[i])) uses_wheel = true;
         if (cfg->mod_defined[i] && target_is_wheel(cfg->mod_target[i])) uses_wheel = true;
     }
@@ -464,14 +595,14 @@ static void apply_target_release(int target) {
  * RELEASE always targets the same key/wheel even if the modifier changed in
  * between (no stuck keys). Toggling the modifier itself never re-evaluates
  * sources that are already held. */
-static void update_source(const config_t *cfg, source_id_t src, bool pressed) {
+static void update_source(const config_t *cfg, int src, bool pressed) {
     if (g_source_pressed[src] == pressed) return;
     g_source_pressed[src] = pressed;
 
-    if ((int)src == cfg->modifier_src) {
+    if (src == cfg->modifier_src) {
         g_modifier_held = pressed;
         if (g_verbose)
-            fprintf(stderr, "dpadkeys: %s -> %s (modifier)\n", SOURCE_NAMES[src], pressed ? "down" : "up");
+            fprintf(stderr, "dpadkeys: %s -> %s (modifier)\n", source_name(cfg, src), pressed ? "down" : "up");
         return;
     }
 
@@ -483,11 +614,11 @@ static void update_source(const config_t *cfg, source_id_t src, bool pressed) {
         apply_target_release(g_resolved_target[src]);
     }
     if (g_verbose)
-        fprintf(stderr, "dpadkeys: %s -> %s\n", SOURCE_NAMES[src], pressed ? "down" : "up");
+        fprintf(stderr, "dpadkeys: %s -> %s\n", source_name(cfg, src), pressed ? "down" : "up");
 }
 
 static void release_all_sources(const config_t *cfg) {
-    for (int i = 0; i < SRC_COUNT; i++)
+    for (int i = 0; i < n_sources(cfg); i++)
         if (g_source_pressed[i]) update_source(cfg, i, false);
 }
 
@@ -640,6 +771,77 @@ static void handle_trigger_axis(const config_t *cfg, axis_t *a, int raw,
     update_source(cfg, src, pressed);
 }
 
+/* ---- raw sources ---- */
+
+/* Query the axis range for every raw abs source (called after the pad is
+ * opened / reacquired). Missing axes stay axis_known=false and never fire. */
+static void raw_query_axes(int fd, config_t *cfg) {
+    for (int i = 0; i < cfg->n_raw; i++) {
+        raw_source_t *r = &cfg->raw[i];
+        if (r->kind != RAW_ABS) continue;
+        struct input_absinfo info;
+        if (ioctl(fd, EVIOCGABS(r->code), &info) < 0) { r->axis_known = false; continue; }
+        r->axis_known = true;
+        r->axis.min = info.minimum; r->axis.max = info.maximum;
+        r->axis.center = (info.minimum + info.maximum) / 2.0;
+        r->axis.half = (info.maximum - info.minimum) / 2.0;
+        if (r->axis.half <= 0) r->axis.half = 1.0;
+        r->axis.state = 0;
+    }
+}
+
+/* Raw abs threshold: same deadzone + 0.1 hysteresis as triggers, mirrored
+ * for `.neg`. A hat-like -1..1 axis therefore fires exactly at -1 / +1. */
+static bool raw_abs_pressed(const raw_source_t *r, int value, double deadzone) {
+    double v = (value - r->axis.center) / r->axis.half;
+    if (r->dir < 0) v = -v;
+    return r->axis.state ? (v >= deadzone - 0.1) : (v >= deadzone);
+}
+
+static void handle_raw_key(config_t *cfg, int code, bool pressed) {
+    for (int i = 0; i < cfg->n_raw; i++) {
+        raw_source_t *r = &cfg->raw[i];
+        if (r->kind == RAW_KEY && r->code == code) update_source(cfg, SRC_COUNT + i, pressed);
+    }
+}
+
+static void handle_raw_abs(config_t *cfg, int code, int value) {
+    for (int i = 0; i < cfg->n_raw; i++) {
+        raw_source_t *r = &cfg->raw[i];
+        if (r->kind != RAW_ABS || r->code != code || !r->axis_known) continue;
+        bool pressed = raw_abs_pressed(r, value, cfg->deadzone);
+        if (pressed == (bool)r->axis.state) continue;
+        r->axis.state = pressed;
+        update_source(cfg, SRC_COUNT + i, pressed);
+    }
+}
+
+/* Stick/trigger axis codes are only known once the pad is open: refuse a
+ * raw abs source that addresses an axis a mapped semantic source already
+ * consumes (e.g. abs.0x00.neg next to ls.left). Returns NULL or a message. */
+static const char *raw_axis_collision(const config_t *cfg, const axes_t *ax) {
+    static char msg[96];
+    for (int i = 0; i < cfg->n_raw; i++) {
+        const raw_source_t *r = &cfg->raw[i];
+        if (r->kind != RAW_ABS) continue;
+        const char *sem = NULL;
+        if (ax->ls_x.present && ax->ls_y.present && (r->code == ax->ls_x.code || r->code == ax->ls_y.code)) {
+            for (int s = SRC_LS_UP; s <= SRC_LS_RIGHT; s++) if (cfg->defined[s]) sem = "ls.*";
+        } else if (ax->rs_x.present && ax->rs_y.present && (r->code == ax->rs_x.code || r->code == ax->rs_y.code)) {
+            for (int s = SRC_RS_UP; s <= SRC_RS_RIGHT; s++) if (cfg->defined[s]) sem = "rs.*";
+        } else if (ax->lt.present && r->code == ax->lt.code) {
+            if (cfg->defined[SRC_LT]) sem = "lt";
+        } else if (ax->rt.present && r->code == ax->rt.code) {
+            if (cfg->defined[SRC_RT]) sem = "rt";
+        }
+        if (sem) {
+            snprintf(msg, sizeof(msg), "raw source '%s' collides with '%s' on this pad", r->name, sem);
+            return msg;
+        }
+    }
+    return NULL;
+}
+
 /* ---- pad detection ---- */
 
 /* Returns 0 and fills fields if fd is a readable evdev node. */
@@ -687,33 +889,55 @@ static void list_devices(void) {
     }
 }
 
-/* Scans /dev/input/event* for the Odin gamepad. Returns opened fd (O_RDWR)
- * or -1 if not found. */
-static int find_pad(char *path_out, size_t pathlen, char *name_out, size_t namelen,
-                     unsigned short *vendor_out, unsigned short *product_out) {
+/* True if `match` (a case-insensitive substring of the name, or "vvvv:pppp"
+ * hex) selects this device. */
+static bool device_matches(const char *match, const char *name, unsigned short vendor, unsigned short product) {
+    if (!match || !*match) return true;
+    unsigned v, p;
+    char tail;
+    if (sscanf(match, "%x:%x%c", &v, &p, &tail) == 2) return v == vendor && p == product;
+    size_t ml = strlen(match), nl = strlen(name);
+    for (size_t i = 0; i + ml <= nl; i++)
+        if (strncasecmp(name + i, match, ml) == 0) return true;
+    return false;
+}
+
+/* Scans /dev/input/event* for a gamepad: any node whose EV_KEY set includes
+ * BTN_SOUTH (== BTN_GAMEPAD). With several candidates the first one matching
+ * `match` wins, else the first found. Returns an opened fd or -1. */
+static int find_pad(const char *match, int open_flags, char *path_out, size_t pathlen,
+                    char *name_out, size_t namelen,
+                    unsigned short *vendor_out, unsigned short *product_out) {
     char path[64];
+    int best_fd = -1;
+    bool best_matched = false;
     for (int i = 0; i < 32; i++) {
         snprintf(path, sizeof(path), "/dev/input/event%d", i);
-        int fd = open(path, O_RDWR);
+        int fd = open(path, open_flags);
         if (fd < 0)
             continue;
         unsigned short vendor, product;
         char name[128] = {0};
         bool has_south = false;
-        if (device_info(fd, &vendor, &product, name, sizeof(name), &has_south) < 0) {
+        if (device_info(fd, &vendor, &product, name, sizeof(name), &has_south) < 0 || !has_south) {
             close(fd);
             continue;
         }
-        if (vendor == ODIN_VENDOR && has_south) {
+        bool matched = device_matches(match, name, vendor, product);
+        if (best_fd < 0 || (matched && !best_matched)) {
+            if (best_fd >= 0) close(best_fd);
+            best_fd = fd;
+            best_matched = matched;
             strncpy(path_out, path, pathlen - 1);
             strncpy(name_out, name, namelen - 1);
             *vendor_out = vendor;
             *product_out = product;
-            return fd;
+            if (matched && match && *match) break;
+        } else {
+            close(fd);
         }
-        close(fd);
     }
-    return -1;
+    return best_fd;
 }
 
 /* ---- banner formatting ---- */
@@ -747,10 +971,95 @@ static void print_banner(const char *pad_path, const char *pad_name, unsigned sh
 
 static void print_usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s --config FILE [--grab] [--list] [--device /dev/input/eventN] "
+            "usage: %s --config FILE [--grab] [--list] [--device auto|/dev/input/eventN] "
             "[--verbose] [--pidfile PATH] [--print-config]\n"
-            "       %s --profile fkeys|wasd [--grab] ...\n",
-            argv0, argv0);
+            "       %s --profile fkeys|wasd [--grab] ...\n"
+            "       %s --learn [--learn-timeout-ms N] [--config FILE] [--device ...] [--pidfile PATH]\n",
+            argv0, argv0, argv0);
+}
+
+/* ---- learn mode ---- */
+
+/* Waits (pad ungrabbed) for the first press and prints `learned <source>`:
+ * the semantic name when one exists, else key.0xNNN / abs.0xNN.neg|pos.
+ * Returns 0 on success, 3 on timeout (`learned NONE`). */
+static int learn_mode(int fd, const axes_t *ax, long long timeout_ms) {
+    /* Per-axis tri-state (-1/0/1) seeded from the CURRENT position so a
+     * trigger resting at its minimum or an off-centre stick never counts as
+     * a press; only a transition into the pressed zone does. */
+    struct { bool known; double center, half; int state; } axes[ABS_CNT];
+    memset(axes, 0, sizeof(axes));
+    unsigned long absbits[NLONGS(ABS_CNT)] = {0};
+    ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits);
+    const double dz = 0.5;
+    for (int c = 0; c < ABS_CNT; c++) {
+        if (!TEST_BIT(c, absbits)) continue;
+        struct input_absinfo info;
+        if (ioctl(fd, EVIOCGABS(c), &info) < 0) continue;
+        axes[c].known = true;
+        axes[c].center = (info.minimum + info.maximum) / 2.0;
+        axes[c].half = (info.maximum - info.minimum) / 2.0;
+        if (axes[c].half <= 0) axes[c].half = 1.0;
+        double v = (info.value - axes[c].center) / axes[c].half;
+        axes[c].state = v >= dz ? 1 : (v <= -dz ? -1 : 0);
+    }
+
+    long long deadline = now_ms() + timeout_ms;
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    char out[48] = {0};
+    while (g_running && !out[0]) {
+        long long now = now_ms();
+        if (now >= deadline) break;
+        int pr = poll(&pfd, 1, (int)(deadline - now));
+        if (pr < 0) { if (errno == EINTR) continue; break; }
+        if (pr == 0) break;
+        struct input_event ev;
+        ssize_t n = read(fd, &ev, sizeof(ev));
+        if (n != (ssize_t)sizeof(ev)) {
+            if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+            break; /* ENODEV etc. */
+        }
+        if (ev.type == EV_KEY) {
+            if (ev.value != 1) continue; /* release / autorepeat */
+            int sem = semantic_for_key(ev.code);
+            if (sem >= 0) snprintf(out, sizeof(out), "%s", SOURCE_NAMES[sem]);
+            else snprintf(out, sizeof(out), "key.0x%x", (unsigned)ev.code);
+        } else if (ev.type == EV_ABS && ev.code < ABS_CNT && axes[ev.code].known) {
+            double v = (ev.value - axes[ev.code].center) / axes[ev.code].half;
+            int st = axes[ev.code].state;
+            int ns = st == 1 ? (v >= dz - 0.1 ? 1 : 0)
+                   : st == -1 ? (v <= -(dz - 0.1) ? -1 : 0)
+                   : (v >= dz ? 1 : (v <= -dz ? -1 : 0));
+            if (ns == st) continue;
+            axes[ev.code].state = ns;
+            if (ns == 0) continue; /* return to centre is a release */
+            int sem = semantic_for_abs(ev.code, ns);
+            if (sem < 0) {
+                if (ax->ls_x.present && ax->ls_y.present && ev.code == ax->ls_x.code)
+                    sem = ns < 0 ? SRC_LS_LEFT : SRC_LS_RIGHT;
+                else if (ax->ls_x.present && ax->ls_y.present && ev.code == ax->ls_y.code)
+                    sem = ns < 0 ? SRC_LS_UP : SRC_LS_DOWN;
+                else if (ax->rs_x.present && ax->rs_y.present && ev.code == ax->rs_x.code)
+                    sem = ns < 0 ? SRC_RS_LEFT : SRC_RS_RIGHT;
+                else if (ax->rs_x.present && ax->rs_y.present && ev.code == ax->rs_y.code)
+                    sem = ns < 0 ? SRC_RS_UP : SRC_RS_DOWN;
+                else if (ax->lt.present && ev.code == ax->lt.code && ns > 0)
+                    sem = SRC_LT;
+                else if (ax->rt.present && ev.code == ax->rt.code && ns > 0)
+                    sem = SRC_RT;
+            }
+            if (sem >= 0) snprintf(out, sizeof(out), "%s", SOURCE_NAMES[sem]);
+            else snprintf(out, sizeof(out), "abs.0x%x.%s", (unsigned)ev.code, ns < 0 ? "neg" : "pos");
+        }
+    }
+    if (!out[0]) {
+        printf("learned NONE\n");
+        fflush(stdout);
+        return 3;
+    }
+    printf("learned %s\n", out);
+    fflush(stdout);
+    return 0;
 }
 
 
@@ -788,6 +1097,8 @@ int main(int argc, char **argv) {
     bool do_list = false;
     bool do_dump = false;
     bool print_config_flag = false;
+    bool do_learn = false;
+    long long learn_timeout_ms = 15000;
     const char *device_override = NULL;
     const char *pidfile = NULL;
 
@@ -801,8 +1112,11 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--verbose") == 0) g_verbose = true;
         else if (strcmp(argv[i], "--pidfile") == 0 && i + 1 < argc) pidfile = argv[++i];
         else if (strcmp(argv[i], "--print-config") == 0) print_config_flag = true;
+        else if (strcmp(argv[i], "--learn") == 0) do_learn = true;
+        else if (strcmp(argv[i], "--learn-timeout-ms") == 0 && i + 1 < argc) learn_timeout_ms = atoll(argv[++i]);
         else { print_usage(argv[0]); return 1; }
     }
+    if (device_override && strcmp(device_override, "auto") == 0) device_override = NULL;
 
     if (do_dump) {
         struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_handler = on_signal;
@@ -819,8 +1133,9 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    config_t cfg;
+    static config_t cfg;
     if (config_path) load_config_file(config_path, &cfg);
+    else if (do_learn && !profile_name) init_config(&cfg); /* learn needs no mapping, only device.match */
     else load_profile(&cfg, profile_name ? profile_name : "fkeys");
 
     if (print_config_flag) {
@@ -845,10 +1160,15 @@ int main(int argc, char **argv) {
     unsigned short vendor = 0, product = 0;
     axes_t ax;
 
+    /* learn never grabs and never writes, so a read-only open suffices there */
+    int open_flags = do_learn ? O_RDONLY : O_RDWR;
+    long long find_deadline = do_learn ? now_ms() + learn_timeout_ms : -1;
+
     if (device_override) {
-        g_pad_fd = open(device_override, O_RDWR);
+        g_pad_fd = open(device_override, open_flags);
         if (g_pad_fd < 0) {
             perror("open device");
+            if (do_learn) { printf("learned NONE\n"); return 3; }
             return 1;
         }
         strncpy(pad_path, device_override, sizeof(pad_path) - 1);
@@ -857,12 +1177,18 @@ int main(int argc, char **argv) {
     } else {
         bool warned = false;
         while (g_running) {
-            g_pad_fd = find_pad(pad_path, sizeof(pad_path), pad_name, sizeof(pad_name), &vendor, &product);
+            g_pad_fd = find_pad(cfg.device_match, open_flags, pad_path, sizeof(pad_path),
+                                pad_name, sizeof(pad_name), &vendor, &product);
             if (g_pad_fd >= 0)
                 break;
             if (!warned) {
-                fprintf(stderr, "waiting for Odin controller device...\n");
+                fprintf(stderr, "waiting for a gamepad device%s%s...\n",
+                        cfg.device_match[0] ? " matching " : "", cfg.device_match);
                 warned = true;
+            }
+            if (find_deadline >= 0 && now_ms() >= find_deadline) {
+                printf("learned NONE\n");
+                return 3;
             }
             struct timespec ts = { 0, 500 * 1000 * 1000 };
             nanosleep(&ts, NULL);
@@ -871,6 +1197,30 @@ int main(int argc, char **argv) {
             return 0;
     }
     detect_axes(g_pad_fd, &ax);
+
+    if (do_learn) {
+        if (pidfile) {
+            FILE *f = fopen(pidfile, "w");
+            if (f) { fprintf(f, "%d\n", getpid()); fclose(f); }
+        }
+        fprintf(stderr, "dpadkeys: learn pad=%s name=\"%s\" vid=0x%04x pid=0x%04x timeout=%lldms\n",
+                pad_path, pad_name, vendor, product, learn_timeout_ms);
+        long long remaining = find_deadline - now_ms();
+        int rc = learn_mode(g_pad_fd, &ax, remaining > 0 ? remaining : 0);
+        close(g_pad_fd);
+        if (pidfile) unlink(pidfile);
+        return rc;
+    }
+
+    raw_query_axes(g_pad_fd, &cfg);
+    {
+        const char *coll = raw_axis_collision(&cfg, &ax);
+        if (coll) {
+            fprintf(stderr, "dpadkeys: %s\n", coll);
+            close(g_pad_fd);
+            return 2;
+        }
+    }
 
     g_uinput_fd = open_uinput(&cfg);
     if (g_uinput_fd < 0) {
@@ -963,8 +1313,8 @@ int main(int argc, char **argv) {
                     }
                 } else {
                     while (g_running &&
-                           (g_pad_fd = find_pad(pad_path, sizeof(pad_path), pad_name,
-                                                 sizeof(pad_name), &vendor, &product)) < 0) {
+                           (g_pad_fd = find_pad(cfg.device_match, O_RDWR, pad_path, sizeof(pad_path),
+                                                 pad_name, sizeof(pad_name), &vendor, &product)) < 0) {
                         struct timespec ts = { 0, 500 * 1000 * 1000 };
                         nanosleep(&ts, NULL);
                     }
@@ -985,6 +1335,7 @@ int main(int argc, char **argv) {
                     g_grabbed = true;
                 }
                 detect_axes(g_pad_fd, &ax);
+                raw_query_axes(g_pad_fd, &cfg);
                 fprintf(stderr, "dpadkeys: reacquired pad=%s name=\"%s\"\n", pad_path, pad_name);
                 print_banner(pad_path, pad_name, vendor, product, &ax, &cfg);
                 pfd.fd = g_pad_fd;
@@ -1001,6 +1352,7 @@ int main(int argc, char **argv) {
         if (ev.type == EV_KEY) {
             if (ev.value == 2)
                 continue; /* ignore autorepeat */
+            handle_raw_key(&cfg, ev.code, ev.value != 0);
             for (int i = 0; i < BTN_MAP_LEN; i++) {
                 if (BTN_MAP[i].code == ev.code) {
                     update_source(&cfg, BTN_MAP[i].src, ev.value != 0);
@@ -1008,6 +1360,7 @@ int main(int argc, char **argv) {
                 }
             }
         } else if (ev.type == EV_ABS) {
+            handle_raw_abs(&cfg, ev.code, ev.value);
             if (ev.code == ABS_HAT0X) {
                 update_source(&cfg, SRC_HAT_LEFT, ev.value < 0);
                 update_source(&cfg, SRC_HAT_RIGHT, ev.value > 0);

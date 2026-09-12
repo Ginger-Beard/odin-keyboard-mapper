@@ -14,38 +14,49 @@ object Sources {
     const val MENU = "Menu"
 
     val ALL: List<Source> = listOf(
-        Source("hat.up", "D-pad Up", DPAD),
-        Source("hat.down", "D-pad Down", DPAD),
-        Source("hat.left", "D-pad Left", DPAD),
-        Source("hat.right", "D-pad Right", DPAD),
+        Source("hat.up", "D-pad up", DPAD),
+        Source("hat.down", "D-pad down", DPAD),
+        Source("hat.left", "D-pad left", DPAD),
+        Source("hat.right", "D-pad right", DPAD),
         Source("btn.south", "A (south)", FACE),
         Source("btn.east", "B (east)", FACE),
         Source("btn.north", "Y (north)", FACE),
         Source("btn.west", "X (west)", FACE),
         Source("btn.tl", "L1", SHOULDER),
         Source("btn.tr", "R1", SHOULDER),
-        Source("btn.tl2", "L2 (button)", SHOULDER),
-        Source("btn.tr2", "R2 (button)", SHOULDER),
-        Source("lt", "L2 (trigger axis)", SHOULDER),
-        Source("rt", "R2 (trigger axis)", SHOULDER),
+        Source("btn.tl2", "L2 button", SHOULDER),
+        Source("btn.tr2", "R2 button", SHOULDER),
+        Source("lt", "L2 trigger", SHOULDER),
+        Source("rt", "R2 trigger", SHOULDER),
         Source("btn.m1", "Back M1", BACK),
         Source("btn.m2", "Back M2", BACK),
-        Source("ls.up", "Left stick Up", STICKS),
-        Source("ls.down", "Left stick Down", STICKS),
-        Source("ls.left", "Left stick Left", STICKS),
-        Source("ls.right", "Left stick Right", STICKS),
-        Source("rs.up", "Right stick Up", STICKS),
-        Source("rs.down", "Right stick Down", STICKS),
-        Source("rs.left", "Right stick Left", STICKS),
-        Source("rs.right", "Right stick Right", STICKS),
+        Source("ls.up", "Left stick up", STICKS),
+        Source("ls.down", "Left stick down", STICKS),
+        Source("ls.left", "Left stick left", STICKS),
+        Source("ls.right", "Left stick right", STICKS),
+        Source("rs.up", "Right stick up", STICKS),
+        Source("rs.down", "Right stick down", STICKS),
+        Source("rs.left", "Right stick left", STICKS),
+        Source("rs.right", "Right stick right", STICKS),
         Source("btn.thumbl", "L3", STICKS),
         Source("btn.thumbr", "R3", STICKS),
-        Source("btn.select", "Select / View", MENU),
-        Source("btn.start", "Start / Menu", MENU),
-        Source("btn.mode", "Home / Guide", MENU),
+        Source("btn.select", "Select/View", MENU),
+        Source("btn.start", "Start/Menu", MENU),
+        Source("btn.mode", "Home/Guide", MENU),
     )
     val GROUPS: List<String> = listOf(DPAD, FACE, SHOULDER, BACK, STICKS, MENU)
     val IDS: Set<String> = ALL.map { it.id }.toSet()
+    private val ORDER: Map<String, Int> = ALL.mapIndexed { i, s -> s.id to i }.toMap()
+
+    /** Sources.ALL order first, then unknown (raw) names alphabetically. */
+    val comparator: Comparator<String> = compareBy<String>({ ORDER[it] ?: Int.MAX_VALUE }, { it })
+}
+
+/** Source-name validation and labelling for both semantic (`hat.up`) and raw (`key.0x130`, `abs.0x12.pos`) names. */
+object SourceNames {
+    val RAW = Regex("^(key\\.0x[0-9a-fA-F]{1,3}|abs\\.0x[0-9a-fA-F]{1,2}\\.(neg|pos))$")
+    fun isValid(id: String): Boolean = id in Sources.IDS || RAW.matches(id)
+    fun label(id: String): String = Sources.ALL.firstOrNull { it.id == id }?.label ?: id
 }
 
 /** A key the user can pick: UI label <-> daemon KEY_ name. */
@@ -54,8 +65,8 @@ data class KeyDef(val label: String, val keyName: String, val other: Boolean = f
 object Keys {
     const val NONE = "NONE"
 
+    /** "OSRS keys": the keys a typical OSRS mobile profile needs. */
     val PRIMARY: List<KeyDef> = buildList {
-        add(KeyDef("None", NONE))
         for (i in 1..12) add(KeyDef("F$i", "KEY_F$i"))
         for (i in 0..9) add(KeyDef("$i", "KEY_$i"))
         add(KeyDef("Up", "KEY_UP"))
@@ -68,15 +79,19 @@ object Keys {
         add(KeyDef("Wheel up", "WHEEL_UP"))
         add(KeyDef("Wheel down", "WHEEL_DOWN"))
     }
-    val OTHER: List<KeyDef> = listOf(
+    /** "Letters": A-Z plus the horizontal wheel. */
+    val OTHER: List<KeyDef> = ('A'..'Z').map { KeyDef("$it", "KEY_$it", other = true) } + listOf(
         KeyDef("Wheel left", "HWHEEL_LEFT", other = true),
         KeyDef("Wheel right", "HWHEEL_RIGHT", other = true),
-    ) + ('A'..'Z').map { KeyDef("$it", "KEY_$it", other = true) }
+    )
     val ALL: List<KeyDef> = PRIMARY + OTHER
     private val byName = ALL.associateBy { it.keyName }
 
-    fun label(keyName: String?): String = if (keyName == null) "None" else (byName[keyName]?.label ?: keyName)
-    fun isValid(keyName: String): Boolean = byName.containsKey(keyName)
+    fun label(keyName: String?): String = when (keyName) {
+        null, NONE -> "None"
+        else -> byName[keyName]?.label ?: keyName
+    }
+    fun isValid(keyName: String): Boolean = keyName == NONE || byName.containsKey(keyName)
 }
 
 @Serializable
@@ -87,36 +102,65 @@ data class Profile(
     val deadzone: Float = 0.5f,
     val lsInvertY: Boolean = false,
     val rsInvertY: Boolean = false,
-    /** source id of the btn.* control that acts as the modifier, or null for none. */
+    /** source id of the control that acts as the modifier, or null for none. */
     val modifier: String? = null,
     /** source id -> KEY_ name, WHEEL_ target, or "NONE"; active only while [modifier] is held. Missing entries fall through to [map]. */
     val modBindings: Map<String, String> = emptyMap(),
     val wheelRepeatMs: Int = 120,
 ) {
     fun key(source: String): String = map[source] ?: Keys.NONE
-    fun withKey(source: String, keyName: String): Profile = copy(map = map + (source to keyName))
 
-    /** null = "same as base" (not present in modBindings). */
-    fun modKey(source: String): String? = modBindings[source]
-    fun withModKey(source: String, keyName: String?): Profile =
-        copy(modBindings = if (keyName == null) modBindings - source else modBindings + (source to keyName))
+    // ---- key-first accessors (base layer) ----
 
-    /** Exact daemon config text: source/target lines, deadzone, invert flags, mod+ layer, wheel repeat. */
+    /** Sources bound to [key] in the base layer, Sources.ALL order then raw names alphabetically. */
+    fun sourcesFor(key: String): List<String> =
+        map.filterValues { it == key }.keys.filter { it != modifier }.sortedWith(Sources.comparator)
+
+    /** Binds [src] to [key]; a source maps to exactly one key, so any previous binding of [src] is replaced. */
+    fun bind(src: String, key: String): Profile =
+        copy(map = map + (src to key), modifier = if (src == modifier) null else modifier)
+
+    fun unbind(src: String): Profile = copy(map = map - src)
+
+    // ---- key-first accessors (modifier layer) ----
+
+    fun modSourcesFor(key: String): List<String> =
+        modBindings.filterValues { it == key }.keys.filter { it != modifier }.sortedWith(Sources.comparator)
+
+    fun bindMod(src: String, key: String): Profile =
+        copy(modBindings = modBindings + (src to key), modifier = if (src == modifier) null else modifier)
+
+    fun unbindMod(src: String): Profile = copy(modBindings = modBindings - src)
+
+    /** Sets the modifier control; that source can no longer carry a key in either layer. */
+    fun withModifier(src: String?): Profile =
+        copy(modifier = src, map = if (src == null) map else map - src, modBindings = if (src == null) modBindings else modBindings - src)
+
+    private fun keyOrNone(k: String?): String = if (k != null && Keys.isValid(k)) k else Keys.NONE
+
+    /** Exact daemon config text: source/target lines (semantic then raw, as stored), deadzone, invert flags, mod+ layer, wheel repeat. */
     fun toConfigText(): String = buildString {
         append("# generated by Odin DPad Keys for profile \"").append(name.replace('\n', ' ')).append("\"\n")
         for (s in Sources.ALL) {
-            val tgt = if (s.id == modifier) "MOD" else key(s.id).let { if (Keys.isValid(it)) it else Keys.NONE }
+            val tgt = if (s.id == modifier) "MOD" else keyOrNone(map[s.id])
             append(s.id).append(' ').append(tgt).append('\n')
+        }
+        val rawSources = map.keys.filter { it !in Sources.IDS && SourceNames.RAW.matches(it) }.sorted()
+        for (src in rawSources) {
+            val tgt = if (src == modifier) "MOD" else keyOrNone(map[src])
+            append(src).append(' ').append(tgt).append('\n')
+        }
+        val m = modifier
+        if (m != null && m !in Sources.IDS && m !in rawSources && SourceNames.RAW.matches(m)) {
+            append(m).append(" MOD\n")
         }
         append("deadzone ").append(String.format(java.util.Locale.ROOT, "%.2f", deadzone.coerceIn(0.2f, 0.8f))).append('\n')
         append("ls.invert_y ").append(if (lsInvertY) 1 else 0).append('\n')
         append("rs.invert_y ").append(if (rsInvertY) 1 else 0).append('\n')
-        if (modifier != null) {
-            for (s in Sources.ALL) {
-                if (s.id == modifier) continue
-                val k = modBindings[s.id] ?: continue
-                val tgt = if (Keys.isValid(k)) k else Keys.NONE
-                append("mod+").append(s.id).append(' ').append(tgt).append('\n')
+        if (m != null) {
+            for ((src, k) in modBindings.entries.sortedWith(compareBy(Sources.comparator) { it.key })) {
+                if (src == m || !SourceNames.isValid(src)) continue
+                append("mod+").append(src).append(' ').append(keyOrNone(k)).append('\n')
             }
         }
         append("wheel_repeat_ms ").append(wheelRepeatMs.coerceIn(60, 400)).append('\n')

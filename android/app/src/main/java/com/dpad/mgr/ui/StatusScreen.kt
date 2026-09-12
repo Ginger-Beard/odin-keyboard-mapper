@@ -55,14 +55,14 @@ fun StatusScreen(modifier: Modifier = Modifier) {
                 Text(priv.detail, style = MaterialTheme.typography.bodySmall)
                 Text("Daemon: ${daemon.label}")
                 Text("Binary: ${bin ?: "n/a"}", style = MaterialTheme.typography.bodySmall)
-                Text("Pad device: ${pad.name ?: "missing"}")
+                Text("Pad device: " + (pad.name?.let { "$it (${pad.idText})" } ?: "missing"))
                 Text("Foreground: ${fg ?: "none / launcher"}", style = MaterialTheme.typography.bodySmall)
                 if (pad.warn) {
                     Spacer(Modifier.height(4.dp))
                     Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFB00020))) {
                         Text(
-                            if (pad.missing) "Pad device missing. Set AYN Controller Style for this app to Xbox."
-                            else "Pad is \"None Controller\". Set AYN Controller Style for this app to Xbox.",
+                            if (pad.missing) "No gamepad device found (on the Odin 2, set AYN Controller Style to Xbox for this app)"
+                            else "Pad is \"None Controller\" — on the Odin 2, set AYN Controller Style for this app to Xbox.",
                             Modifier.padding(12.dp), color = Color.White,
                         )
                     }

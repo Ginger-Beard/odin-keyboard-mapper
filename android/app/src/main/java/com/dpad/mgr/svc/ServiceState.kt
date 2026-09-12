@@ -11,7 +11,7 @@ object ServiceState {
     val serviceRunning = MutableStateFlow(false)
     val priv = MutableStateFlow(PrivState())
     val daemon = MutableStateFlow<DaemonState>(DaemonState.Idle)
-    val pad = MutableStateFlow(PadInfo(null, null, "not checked"))
+    val pad = MutableStateFlow(PadInfo(null, null, null, "not checked"))
     val foreground = MutableStateFlow<String?>(null)
     val binaryPath = MutableStateFlow<String?>(null)
     val message = MutableStateFlow<String?>(null)

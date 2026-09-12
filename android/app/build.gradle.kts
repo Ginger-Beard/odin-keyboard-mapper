@@ -13,8 +13,8 @@ android {
         applicationId = "com.dpad.mgr"
         minSdk = 33
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = 2
+        versionName = "0.2"
         ndk { abiFilters += "arm64-v8a" }
     }
 
