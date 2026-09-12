@@ -10,6 +10,7 @@ interface IUserService {
     boolean isAlive(int pid);
     int exitCode(int pid);
     boolean writeFile(String path, String content);
+    boolean setPointerIconType(int type);
     void startTail(ILineCallback cb);
     void stopTail();
     void destroy();

@@ -56,6 +56,7 @@ class Supervisor(
     @Volatile private var suspended = false
 
     private var running: Triple<Int, String, Target>? = null // pid, configText, target
+    private var pointerRefreshJob: Job? = null
     private var startedAt = 0L
     private var fastFailures = 0
     private var attempt = 0
@@ -163,6 +164,32 @@ class Supervisor(
         }
     }
 
+    /**
+     * Starts a coroutine that re-applies setPointerHidden(true) every 700ms while a wheel
+     * profile's daemon is running. Android resets the pointer icon back to the arrow on the
+     * first mouse event delivered to a newly-focused window, so a single call at spawn time
+     * isn't enough -- the first wheel notch would show (and leave visible) the cursor.
+     */
+    private fun startPointerRefresh(shell: PrivShell) {
+        pointerRefreshJob?.cancel()
+        pointerRefreshJob = scope.launch {
+            runCatching { shell.setPointerHidden(true) }
+            Log.i(TAG, "pointer: hidden")
+            while (isActive) {
+                delay(700)
+                runCatching { shell.setPointerHidden(true) }
+            }
+        }
+    }
+
+    /** Unconditionally attempts to restore the pointer; harmless/no-op if it wasn't hidden or the channel doesn't support it. */
+    private suspend fun restorePointer(shell: PrivShell?) {
+        pointerRefreshJob?.cancel()
+        pointerRefreshJob = null
+        runCatching { shell?.setPointerHidden(false) }
+        Log.i(TAG, "pointer: restored")
+    }
+
     private suspend fun reconcile() {
         if (suspended) {
             val cur = running
@@ -170,6 +197,7 @@ class Supervisor(
                 Log.i(TAG, "supervisor: stopping daemon (suspended) pid=${cur.first}")
                 shellProvider()?.kill(cur.first)
                 running = null
+                restorePointer(shellProvider())
             }
             fastFailures = 0; attempt = 0; backoffUntil = 0
             _state.value = DaemonState.Idle
@@ -184,6 +212,7 @@ class Supervisor(
                 Log.i(TAG, "supervisor: stopping daemon pid=${cur.first}")
                 shell?.kill(cur.first)
                 running = null
+                restorePointer(shell)
             }
             fastFailures = 0; attempt = 0; backoffUntil = 0
             if (_state.value !is DaemonState.Failed || !failedLatched) _state.value = DaemonState.Idle
@@ -205,6 +234,7 @@ class Supervisor(
                 }
                 val ec = shell.exitCode(cur.first)
                 running = null
+                restorePointer(shell)
                 if (ec == 6) {
                     val prof = cur.third.profile
                     Log.i(TAG, "supervisor: panic chord → touch offset disabled for ${prof.name}")
@@ -221,6 +251,7 @@ class Supervisor(
                 Log.i(TAG, "supervisor: profile change ${cur.third.profile.name} -> ${want.profile.name}; restarting")
                 shell.kill(cur.first)
                 running = null
+                restorePointer(shell)
                 delay(150)
             }
         }
@@ -249,6 +280,9 @@ class Supervisor(
             running = Triple(pid, conf, want)
             attempt = 0
             _state.value = DaemonState.Running(want.pkg, want.profile.name, pid)
+            if (want.profile.usesWheel()) {
+                startPointerRefresh(shell)
+            }
         } else {
             onFailure("daemon did not start (pid=$pid): ${lastLogLine(shell)}", fast = true)
         }

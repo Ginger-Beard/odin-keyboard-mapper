@@ -114,6 +114,12 @@ data class Profile(
 ) {
     fun key(source: String): String = map[source] ?: Keys.NONE
 
+    /** True if any binding (base layer or the mod+ layer) targets a scroll-wheel key. */
+    fun usesWheel(): Boolean {
+        val wheelTargets = setOf("WHEEL_UP", "WHEEL_DOWN", "HWHEEL_LEFT", "HWHEEL_RIGHT")
+        return map.values.any { it in wheelTargets } || modBindings.values.any { it in wheelTargets }
+    }
+
     // ---- key-first accessors (base layer) ----
 
     /** Sources bound to [key] in the base layer, Sources.ALL order then raw names alphabetically. */

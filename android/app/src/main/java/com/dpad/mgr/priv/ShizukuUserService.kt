@@ -9,6 +9,7 @@ import java.io.InputStreamReader
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 import kotlin.system.exitProcess
+import org.lsposed.hiddenapibypass.HiddenApiBypass
 
 /**
  * Runs inside Shizuku's privileged process (uid 2000 shell, or root if Shizuku was
@@ -113,6 +114,106 @@ class ShizukuUserService() : IUserService.Stub() {
         true
     } catch (e: Exception) {
         Log.w(TAG, "userservice: writeFile $path failed: $e"); false
+    }
+
+    @Volatile private var hiddenApiExempted = false
+
+    private fun ensureHiddenApiExemption() {
+        if (hiddenApiExempted) return
+        hiddenApiExempted = true
+        try {
+            HiddenApiBypass.addHiddenApiExemptions("")
+        } catch (e: Exception) {
+            Log.w(TAG, "userservice: HiddenApiBypass exemption failed: $e")
+        }
+    }
+
+    // Cached reflection handles for setPointerIconType, resolved once and reused on every call
+    // thereafter (this is polled every 700ms by the Supervisor while a wheel profile's daemon is
+    // running, so re-resolving via Class.forName/getMethod on every tick would be wasteful).
+    @Volatile private var pointerImInstance: Any? = null
+    @Volatile private var pointerImMethod: java.lang.reflect.Method? = null
+    @Volatile private var pointerIimInstance: Any? = null
+    @Volatile private var pointerIimMethod: java.lang.reflect.Method? = null
+    @Volatile private var pointerLoggedSuccess = false
+
+    /**
+     * Hides (type=0, PointerIcon.TYPE_NULL) or restores (type=1000, PointerIcon.TYPE_ARROW) the
+     * mouse pointer sprite, via InputManager.getInstance().setPointerIconType(type) (hidden API),
+     * falling back to IInputManager via ServiceManager if InputManager.getInstance() is absent.
+     * The resolved Method/instance are cached after the first successful call; only the first
+     * success and any failure are logged, not every tick.
+     */
+    override fun setPointerIconType(type: Int): Boolean {
+        ensureHiddenApiExemption()
+
+        pointerImMethod?.let { m ->
+            try {
+                m.invoke(pointerImInstance, type)
+                if (!pointerLoggedSuccess) {
+                    pointerLoggedSuccess = true
+                    Log.i(TAG, "userservice: setPointerIconType via InputManager ok (cached)")
+                }
+                return true
+            } catch (e: Exception) {
+                Log.w(TAG, "userservice: cached InputManager.setPointerIconType($type) failed: $e")
+                pointerImInstance = null
+                pointerImMethod = null
+            }
+        }
+        pointerIimMethod?.let { m ->
+            try {
+                m.invoke(pointerIimInstance, type)
+                if (!pointerLoggedSuccess) {
+                    pointerLoggedSuccess = true
+                    Log.i(TAG, "userservice: setPointerIconType via IInputManager ok (cached)")
+                }
+                return true
+            } catch (e: Exception) {
+                Log.w(TAG, "userservice: cached IInputManager.setPointerIconType($type) failed: $e")
+                pointerIimInstance = null
+                pointerIimMethod = null
+            }
+        }
+
+        try {
+            val imClass = Class.forName("android.hardware.input.InputManager")
+            val im = imClass.getMethod("getInstance").invoke(null)
+            if (im != null) {
+                val m = imClass.getMethod("setPointerIconType", Int::class.javaPrimitiveType)
+                m.invoke(im, type)
+                pointerImInstance = im
+                pointerImMethod = m
+                if (!pointerLoggedSuccess) {
+                    pointerLoggedSuccess = true
+                    Log.i(TAG, "userservice: setPointerIconType($type) via InputManager ok")
+                }
+                return true
+            }
+            throw IllegalStateException("InputManager.getInstance() returned null")
+        } catch (e: Exception) {
+            Log.w(TAG, "userservice: InputManager.setPointerIconType($type) failed: $e; trying IInputManager")
+        }
+        return try {
+            val smClass = Class.forName("android.os.ServiceManager")
+            val binder = smClass.getMethod("getService", String::class.java).invoke(null, "input") as? android.os.IBinder
+                ?: throw IllegalStateException("ServiceManager.getService(\"input\") returned null")
+            val stubClass = Class.forName("android.hardware.input.IInputManager\$Stub")
+            val iim = stubClass.getMethod("asInterface", android.os.IBinder::class.java).invoke(null, binder)
+            val iimClass = Class.forName("android.hardware.input.IInputManager")
+            val m = iimClass.getMethod("setPointerIconType", Int::class.javaPrimitiveType)
+            m.invoke(iim, type)
+            pointerIimInstance = iim
+            pointerIimMethod = m
+            if (!pointerLoggedSuccess) {
+                pointerLoggedSuccess = true
+                Log.i(TAG, "userservice: setPointerIconType($type) via IInputManager ok")
+            }
+            true
+        } catch (e2: Exception) {
+            Log.w(TAG, "userservice: IInputManager.setPointerIconType($type) failed: $e2")
+            false
+        }
     }
 
     override fun startTail(cb: ILineCallback) {

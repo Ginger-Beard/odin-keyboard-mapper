@@ -38,6 +38,10 @@ interface PrivShell {
     /** Write content to path (created 0644). */
     suspend fun writeFile(path: String, content: String): Boolean
 
+    /** Hide (true) or restore (false, TYPE_ARROW) the mouse pointer sprite. Only meaningful over
+     *  Shizuku (see [ShizukuShell]); other channels keep the default (unsupported, returns false). */
+    suspend fun setPointerHidden(hidden: Boolean): Boolean = false
+
     /** Tail `logcat -b events` for activity-resume lines; cb is invoked per line on an arbitrary thread. */
     suspend fun startTail(cb: (String) -> Unit)
 

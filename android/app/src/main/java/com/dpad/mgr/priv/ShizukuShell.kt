@@ -128,6 +128,10 @@ class ShizukuShell(ctx: Context) : PrivShell {
         runCatching { svc()?.writeFile(path, content) ?: false }.getOrDefault(false)
     }
 
+    override suspend fun setPointerHidden(hidden: Boolean): Boolean = withContext(Dispatchers.IO) {
+        runCatching { svc()?.setPointerIconType(if (hidden) 0 else 1000) ?: false }.getOrDefault(false)
+    }
+
     override suspend fun startTail(cb: (String) -> Unit) {
         withContext(Dispatchers.IO) {
             runCatching {
