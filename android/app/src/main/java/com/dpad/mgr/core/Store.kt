@@ -70,6 +70,22 @@ object Store {
         d.copy(profiles = list, assignments = assigns)
     }
 
+    /**
+     * Field-level merge: applies [fn] to whatever profile is CURRENTLY stored under [name] (never
+     * to a caller-held copy that might be stale) and writes the result back, clamping offsets.
+     * A no-op if [name] isn't found (e.g. it was deleted or renamed concurrently). This is the only
+     * way editor UI should persist a single-field change -- it can never clobber a concurrent
+     * writer's edit to some other field (e.g. CalibrateActivity's touch offset) the way writing a
+     * whole locally-held draft Profile back can.
+     */
+    fun updateProfile(name: String, fn: (Profile) -> Profile) = update { d ->
+        val idx = d.profiles.indexOfFirst { it.name == name }
+        if (idx < 0) return@update d
+        val list = d.profiles.toMutableList()
+        list[idx] = clampOffsets(fn(list[idx]))
+        d.copy(profiles = list)
+    }
+
     fun deleteProfile(name: String) = update { d ->
         d.copy(profiles = d.profiles.filterNot { it.name == name },
             assignments = d.assignments.filterValues { it != name })

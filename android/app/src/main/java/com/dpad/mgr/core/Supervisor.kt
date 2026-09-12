@@ -277,6 +277,7 @@ class Supervisor(
         delay(400)
         if (pid > 1 && shell.isAlive(pid)) {
             Log.i(TAG, "supervisor: running pid=$pid profile=${want.profile.name} pkg=${want.pkg}")
+            Log.i(TAG, spawnLogLine(want.profile.name, conf))
             running = Triple(pid, conf, want)
             attempt = 0
             _state.value = DaemonState.Running(want.pkg, want.profile.name, pid)
@@ -290,6 +291,29 @@ class Supervisor(
 
     private suspend fun lastLogLine(shell: PrivShell): String =
         shell.exec(listOf("tail", "-n", "2", LOG)).out.trim().lines().lastOrNull()?.take(160) ?: ""
+
+    /** One-line spawn summary ("supervisor: spawn profile=OSRS touch=on -2 -10 keys=18"), parsed
+     *  straight out of the exact config text handed to the daemon -- so it's diagnosable from
+     *  logcat whether touch.offset made it into the config a given process actually started with. */
+    private fun spawnLogLine(profile: String, conf: String): String {
+        val directives = setOf(
+            "deadzone", "ls.invert_y", "ls.invert_x", "rs.invert_y", "rs.invert_x", "wheel_repeat_ms", "touch.offset",
+        )
+        var touch = "off"
+        var keys = 0
+        for (raw in conf.lineSequence()) {
+            val line = raw.trim()
+            if (line.isEmpty() || line.startsWith("#")) continue
+            val parts = line.split(Regex("\\s+"))
+            val key = parts.getOrNull(0) ?: continue
+            when {
+                key == "touch.offset" -> touch = "on ${parts.getOrNull(1) ?: "?"} ${parts.getOrNull(2) ?: "?"}"
+                key in directives -> {}
+                parts.size >= 2 && parts[1] != "NONE" -> keys++
+            }
+        }
+        return "supervisor: spawn profile=$profile touch=$touch keys=$keys"
+    }
 
     private fun onFailure(reason: String, fast: Boolean) {
         lastReason = reason

@@ -164,6 +164,7 @@ private fun fmtSigned(v: Float): String {
 }
 
 private const val VERIFY_MARKER_CAP = 12
+private const val TAG = "DpadMgr"
 
 @Composable
 private fun CalibrateScreen(
@@ -274,6 +275,12 @@ private fun CalibrateScreen(
             dragTrail = emptyList()
             liveDragPos = null
             lastResidualVerify = null
+            // Re-read from the Store (not any locally-held copy) right before starting the test
+            // daemon, so this is diagnosable from logcat if some other writer raced us here.
+            val verifyProfile = Store.data.value.profile(profileName)
+            val enabled = verifyProfile?.touchOffsetEnabled ?: false
+            Log.i(TAG, "calibrate: verify start touch=$enabled ${verifyProfile?.touchDx ?: 0} ${verifyProfile?.touchDy ?: 0}")
+            if (!enabled) Log.w(TAG, "calibrate: verify start touch offset unexpectedly disabled for '$profileName'")
             DpadService.send(ctx, DpadService.ACTION_TEST, profile = profileName, seconds = 0)
             onVerifyStarted(previous)
         }

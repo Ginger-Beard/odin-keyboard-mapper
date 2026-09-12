@@ -40,6 +40,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import android.content.Intent
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -52,7 +53,10 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.focusTarget
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.dpad.mgr.core.DaemonState
 import com.dpad.mgr.core.KeyDef
@@ -140,6 +144,17 @@ private fun builtinDefault(name: String?): Profile? = when (name) {
  * instead key off [persistedName] below, which tracks whatever name the draft is currently saved
  * under and is updated in place on every successful save (including renames and Duplicate) --
  * this editor composable is never re-created (no re-keying) for any of that to happen.
+ *
+ * `draft` is a pure VIEW derived from [Store.data] (the profile currently stored under
+ * [persistedName]) -- this editor never holds its own authoritative copy of the profile, so it can
+ * never write a stale field back over a concurrent writer's change (notably CalibrateActivity's
+ * touch offset). Every edit -- bind/unbind, a switch, a slider, a rename, Duplicate, Reset to
+ * default -- persists as a field-level merge onto whatever's currently in the Store, via
+ * [Store.updateProfile] (or [Store.saveProfile] for the rename/Duplicate/create cases that need its
+ * name-keyed/assignment-remapping behavior), never as a whole-draft overwrite. The only local state
+ * is transient: `nameText`/`deadzoneLocal`/`wheelLocal` hold in-progress values for the three
+ * debounced fields while their save is still pending, so typing/dragging stays responsive; they're
+ * cleared the moment the debounced write lands.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -149,16 +164,13 @@ fun ProfileEditor(
 ) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
-    var draft by remember { mutableStateOf(initial) }
     var persistedName by remember { mutableStateOf(original) } // name draft is currently saved under in the Store, if any
     var binding by remember { mutableStateOf<String?>(null) } // target key name being bound
     var showLetters by remember { mutableStateOf(false) }
     var showSwallowed by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
     var showSaved by remember { mutableStateOf(false) }
-    var pendingJob by remember { mutableStateOf<Job?>(null) } // debounced text/slider save in flight
     var savedFlashJob by remember { mutableStateOf<Job?>(null) }
-    val nameClash = draft.name.isBlank() || (draft.name != persistedName && draft.name in existingNames)
     val snackbarHostState = remember { SnackbarHostState() }
 
     // A non-visual focus sink: claims focus once on entry so that later, when LearnDialog (a
@@ -167,57 +179,111 @@ fun ProfileEditor(
     // search, and would drag the scroll position up to it in the process.
     val rootFocusRequester = remember { FocusRequester() }
 
+    // The pure view: whatever's stored under persistedName right now (or `initial`, for the one
+    // frame before the brand-new-profile LaunchedEffect below has persisted it), with transient
+    // local overrides layered on top for the three debounced fields while their save is pending.
+    val storeData by Store.data.collectAsStateWithLifecycle()
+    val stored = storeData.profile(persistedName) ?: initial
+    var nameText by remember { mutableStateOf<String?>(null) }
+    var nameJob by remember { mutableStateOf<Job?>(null) }
+    var deadzoneLocal by remember { mutableStateOf<Float?>(null) }
+    var deadzoneJob by remember { mutableStateOf<Job?>(null) }
+    var wheelLocal by remember { mutableStateOf<Int?>(null) }
+    var wheelJob by remember { mutableStateOf<Job?>(null) }
+    val draft = stored.copy(
+        name = nameText ?: stored.name,
+        deadzone = deadzoneLocal ?: stored.deadzone,
+        wheelRepeatMs = wheelLocal ?: stored.wheelRepeatMs,
+    )
+    val nameClash = draft.name.isBlank() || (draft.name != persistedName && draft.name in existingNames)
+
     fun flashSaved() {
         showSaved = true
         savedFlashJob?.cancel()
         savedFlashJob = scope.launch { delay(1000); showSaved = false }
     }
 
-    /** Writes [p] to the Store (skipping a blank/duplicate name -- same guard the old Save button's
-     *  `enabled` used) and, if [live] and this profile is the one currently Running in the daemon,
-     *  nudges it live via updateConfigLive. That path only actually live-reloads touch.offset (via
-     *  SIGUSR1); everything else there is a no-op signal, so binding/invert/deadzone/wheel changes
-     *  are deliberately NOT pushed live here -- DpadService's own Store.data collector notices the
-     *  config text changed for the running profile and restarts the daemon through the Supervisor. */
-    fun persistNow(p: Profile, live: Boolean) {
-        if (p.name.isBlank() || (p.name != persistedName && p.name in existingNames)) return
-        Store.saveProfile(p, persistedName)
-        persistedName = p.name
+    /** Immediate field-level merge onto the CURRENTLY stored profile (never the draft) via
+     *  [Store.updateProfile] -- used for every non-debounced edit: bind/unbind, invert switches,
+     *  and (from the Stylus card only) the touch-offset Enabled switch / Disable button. If [live]
+     *  and this profile is the one currently Running in the daemon, nudges it live via
+     *  updateConfigLive; that path only actually live-reloads touch.offset (via SIGUSR1), so it's
+     *  only passed true from the Stylus card -- binding/invert/deadzone/wheel changes rely on
+     *  DpadService's own Store.data collector noticing the config text changed and restarting the
+     *  daemon through the Supervisor. */
+    fun changeNow(live: Boolean = false, mutate: (Profile) -> Profile) {
+        val name = persistedName ?: return
+        Store.updateProfile(name, mutate)
         flashSaved()
         if (live) {
             val d = ServiceState.daemon.value
-            if (d is DaemonState.Running && d.profile == p.name) {
-                DpadService.send(ctx, DpadService.ACTION_UPDATE_CONFIG_LIVE, profile = p.name)
+            if (d is DaemonState.Running && d.profile == name) {
+                DpadService.send(ctx, DpadService.ACTION_UPDATE_CONFIG_LIVE, profile = name)
             }
         }
     }
 
-    fun change(debounceMs: Long = 0, live: Boolean = false, mutate: (Profile) -> Profile) {
-        draft = mutate(draft)
-        val snapshot = draft
-        pendingJob?.cancel()
-        pendingJob = if (debounceMs <= 0) {
-            persistNow(snapshot, live)
-            null
-        } else {
-            scope.launch { delay(debounceMs); persistNow(snapshot, live) }
-        }
+    /** Commits a debounced rename: builds the renamed profile from whatever's CURRENTLY in the
+     *  Store (not the draft), skipping a blank/duplicate name -- same guard the old Save button's
+     *  `enabled` used. Renames go through [Store.saveProfile] (not [Store.updateProfile]) since a
+     *  rename also has to remap [AppData.assignments] entries pointing at the old name. */
+    fun commitName(text: String) {
+        val name = persistedName ?: return
+        val cur = Store.data.value.profile(name) ?: return
+        val renamed = cur.copy(name = text)
+        if (renamed.name.isBlank() || (renamed.name != name && renamed.name in existingNames)) return
+        Store.saveProfile(renamed, name)
+        persistedName = renamed.name
+        nameText = null
+        flashSaved()
+    }
+
+    fun commitDeadzone(v: Float) {
+        val name = persistedName ?: return
+        Store.updateProfile(name) { p -> p.copy(deadzone = v) }
+        deadzoneLocal = null
+        flashSaved()
+    }
+
+    fun commitWheel(v: Int) {
+        val name = persistedName ?: return
+        Store.updateProfile(name) { p -> p.copy(wheelRepeatMs = v) }
+        wheelLocal = null
+        flashSaved()
+    }
+
+    /** Cancels and immediately runs any pending debounced field commit. Called before Calibrate
+     *  and Duplicate (so they read a fully up-to-date stored profile) and on ON_PAUSE (so a pending
+     *  edit can't land AFTER CalibrateActivity underneath has written its own fields, per the old
+     *  race -- see the class doc comment). */
+    fun flushPending() {
+        nameJob?.cancel(); nameJob = null
+        nameText?.let { commitName(it) }
+        deadzoneJob?.cancel(); deadzoneJob = null
+        deadzoneLocal?.let { commitDeadzone(it) }
+        wheelJob?.cancel(); wheelJob = null
+        wheelLocal?.let { commitWheel(it) }
     }
 
     // Brand-new profile: persist it as soon as the editor opens so it exists in the Store (and
-    // Delete/Duplicate/rename bookkeeping below have something to key off) right away.
+    // Delete/Duplicate/rename bookkeeping below have something to key off) right away. This is a
+    // whole-profile create (there's nothing stored yet to merge onto), not an edit.
     LaunchedEffect(Unit) {
-        if (persistedName == null) persistNow(draft, live = false)
+        if (persistedName == null) {
+            Store.saveProfile(initial)
+            persistedName = initial.name
+            flashSaved()
+        }
         rootFocusRequester.requestFocus()
     }
 
-    // CalibrateActivity saves straight to the Store; pick up its touch-offset result here.
-    val storeData by Store.data.collectAsStateWithLifecycle()
-    LaunchedEffect(storeData) {
-        val latest = storeData.profile(draft.name) ?: return@LaunchedEffect
-        if (latest.touchOffsetEnabled != draft.touchOffsetEnabled || latest.touchDx != draft.touchDx || latest.touchDy != draft.touchDy) {
-            draft = draft.copy(touchOffsetEnabled = latest.touchOffsetEnabled, touchDx = latest.touchDx, touchDy = latest.touchDy)
-        }
+    // Flush pending debounced edits before this editor is paused (e.g. CalibrateActivity is about
+    // to start on top of it) so they can't land later and overwrite whatever Calibrate writes.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event -> if (event == Lifecycle.Event.ON_PAUSE) flushPending() }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     Box(modifier.fillMaxSize().focusRequester(rootFocusRequester).focusTarget()) {
@@ -230,7 +296,11 @@ fun ProfileEditor(
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(
                         draft.name,
-                        { text -> change(debounceMs = 300) { d -> d.copy(name = text) } },
+                        { text ->
+                            nameText = text
+                            nameJob?.cancel()
+                            nameJob = scope.launch { delay(300); commitName(text) }
+                        },
                         Modifier.fillMaxWidth(),
                         label = { Text("Profile name") }, isError = nameClash, singleLine = true,
                     )
@@ -240,17 +310,17 @@ fun ProfileEditor(
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         val def = builtinDefault(original)
                         if (def != null) {
-                            OutlinedButton(modifier = Modifier.heightIn(min = 48.dp), onClick = { change { def } }) {
+                            OutlinedButton(modifier = Modifier.heightIn(min = 48.dp), onClick = { changeNow { def } }) {
                                 Text("Reset to default")
                             }
                         }
                         OutlinedButton(
                             modifier = Modifier.heightIn(min = 48.dp),
                             onClick = {
-                                val dup = draft.copy(name = uniqueName("${draft.name} copy", existingNames))
-                                pendingJob?.cancel()
+                                flushPending()
+                                val base = persistedName?.let { Store.data.value.profile(it) } ?: draft
+                                val dup = base.copy(name = uniqueName("${base.name} copy", existingNames))
                                 Store.saveProfile(dup)
-                                draft = dup
                                 persistedName = dup.name
                                 flashSaved()
                             },
@@ -279,7 +349,7 @@ fun ProfileEditor(
                     for (k in Keys.PRIMARY) {
                         KeyRow(
                             k, draft.sourcesFor(k.keyName),
-                            onUnbind = { src -> change { d -> d.unbind(src) } },
+                            onUnbind = { src -> changeNow { d -> d.unbind(src) } },
                             onBind = { binding = k.keyName },
                         )
                     }
@@ -291,7 +361,7 @@ fun ProfileEditor(
                         for (k in Keys.OTHER) {
                             KeyRow(
                                 k, draft.sourcesFor(k.keyName),
-                                onUnbind = { src -> change { d -> d.unbind(src) } },
+                                onUnbind = { src -> changeNow { d -> d.unbind(src) } },
                                 onBind = { binding = k.keyName },
                             )
                         }
@@ -303,23 +373,32 @@ fun ProfileEditor(
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     StickRow(
-                        "Left stick", draft.lsInvertY, { v -> change { d -> d.copy(lsInvertY = v) } },
-                        draft.lsInvertX, { v -> change { d -> d.copy(lsInvertX = v) } },
+                        "Left stick", draft.lsInvertY, { v -> changeNow { d -> d.copy(lsInvertY = v) } },
+                        draft.lsInvertX, { v -> changeNow { d -> d.copy(lsInvertX = v) } },
                     )
                     StickRow(
-                        "Right stick", draft.rsInvertY, { v -> change { d -> d.copy(rsInvertY = v) } },
-                        draft.rsInvertX, { v -> change { d -> d.copy(rsInvertX = v) } },
+                        "Right stick", draft.rsInvertY, { v -> changeNow { d -> d.copy(rsInvertY = v) } },
+                        draft.rsInvertX, { v -> changeNow { d -> d.copy(rsInvertX = v) } },
                     )
                     Text("Deadzone: ${"%.2f".format(draft.deadzone)}", style = MaterialTheme.typography.bodyMedium)
                     Slider(
                         value = draft.deadzone,
-                        onValueChange = { v -> change(debounceMs = 300) { d -> d.copy(deadzone = v) } },
+                        onValueChange = { v ->
+                            deadzoneLocal = v
+                            deadzoneJob?.cancel()
+                            deadzoneJob = scope.launch { delay(300); commitDeadzone(v) }
+                        },
                         valueRange = 0.2f..0.8f, steps = 11,
                     )
                     Text("Wheel repeat: ${draft.wheelRepeatMs} ms", style = MaterialTheme.typography.bodyMedium)
                     Slider(
                         value = draft.wheelRepeatMs.toFloat(),
-                        onValueChange = { v -> change(debounceMs = 300) { d -> d.copy(wheelRepeatMs = v.toInt()) } },
+                        onValueChange = { v ->
+                            val iv = v.toInt()
+                            wheelLocal = iv
+                            wheelJob?.cancel()
+                            wheelJob = scope.launch { delay(300); commitWheel(iv) }
+                        },
                         valueRange = 60f..400f, steps = 32,
                     )
                 }
@@ -333,12 +412,12 @@ fun ProfileEditor(
                         Text("Enabled", Modifier.weight(1f))
                         Switch(
                             checked = draft.touchOffsetEnabled,
-                            onCheckedChange = { v -> change(live = true) { d -> d.copy(touchOffsetEnabled = v) } },
+                            onCheckedChange = { v -> changeNow(live = true) { d -> d.copy(touchOffsetEnabled = v) } },
                         )
                         Spacer(Modifier.width(8.dp))
                         OutlinedButton(
                             modifier = Modifier.heightIn(min = 48.dp),
-                            onClick = { change(live = true) { d -> d.copy(touchOffsetEnabled = false, touchDx = 0, touchDy = 0) } },
+                            onClick = { changeNow(live = true) { d -> d.copy(touchOffsetEnabled = false, touchDx = 0, touchDy = 0) } },
                         ) { Text("Disable") }
                     }
                     Text(
@@ -352,8 +431,7 @@ fun ProfileEditor(
                             // Flush any pending debounced edit first so calibration (a separate
                             // activity) has a fully up-to-date saved profile to read and write
                             // touch offset fields on.
-                            pendingJob?.cancel()
-                            persistNow(draft, live = false)
+                            flushPending()
                             ctx.startActivity(Intent(ctx, CalibrateActivity::class.java).putExtra(CalibrateActivity.EXTRA_PROFILE, draft.name))
                         },
                     ) { Text("Calibrate…") }
@@ -392,7 +470,7 @@ fun ProfileEditor(
             title = Keys.label(keyName),
             onLearned = { src ->
                 val oldKey = draft.map[src]
-                change { d -> d.bind(src, keyName) }
+                changeNow { d -> d.bind(src, keyName) }
                 binding = null
                 if (oldKey != null && oldKey != keyName) {
                     val msg = "Moved from ${Keys.label(oldKey)}"
