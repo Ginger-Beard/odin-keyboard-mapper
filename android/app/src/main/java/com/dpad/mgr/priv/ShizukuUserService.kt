@@ -19,6 +19,10 @@ class ShizukuUserService() : IUserService.Stub() {
     constructor(context: Context) : this()
 
     @Volatile private var tailProc: Process? = null
+    /** pid -> Process for children started via [spawn], so we can wait() for their exit code. */
+    private val spawned = java.util.concurrent.ConcurrentHashMap<Int, Process>()
+    /** pid -> exit code, filled in by the waiter thread once a spawned child has died. */
+    private val spawnedExit = java.util.concurrent.ConcurrentHashMap<Int, Int>()
 
     init {
         // Safety net: a previous instance of this user service can die (Shizuku rebind,
@@ -48,10 +52,31 @@ class ShizukuUserService() : IUserService.Stub() {
         return b
     }
 
-    override fun spawn(argv: Array<String>, pidfile: String): Int {
-        val cmd = "nohup ${argv.joinToString(" ")} < /dev/null > $LOG 2>&1 & echo \$!"
-        val r = exec(arrayOf("sh", "-c", cmd))
-        return r.getString("out")?.trim()?.lines()?.lastOrNull()?.trim()?.toIntOrNull() ?: -1
+    /**
+     * Starts argv detached, keeping the [Process] handle (rather than the previous
+     * `nohup ... & echo $!` shell trick) so a waiter thread can capture its real exit code
+     * once it dies -- see [exitCode]. Stdio matches the old behaviour: input from /dev/null,
+     * stdout+stderr merged and truncated to [LOG] (same as the prior `> LOG 2>&1`).
+     */
+    override fun spawn(argv: Array<String>, pidfile: String): Int = try {
+        val pb = ProcessBuilder(argv.toList())
+        pb.redirectErrorStream(true)
+        pb.redirectOutput(File(LOG))
+        pb.redirectInput(File("/dev/null"))
+        val p: Process = pb.start()
+        val pid = pidOf(p)
+        if (pid <= 1) throw IllegalStateException("could not read pid of spawned process")
+        spawned[pid] = p
+        thread(name = "dpad-wait-$pid", isDaemon = true) {
+            val rc = try { p.waitFor() } catch (e: Exception) { -1 }
+            spawnedExit[pid] = rc
+            spawned.remove(pid)
+            Log.i(TAG, "userservice: pid=$pid exited rc=$rc")
+        }
+        pid
+    } catch (e: Exception) {
+        Log.w(TAG, "userservice: spawn failed: $e")
+        -1
     }
 
     override fun kill(pid: Int) {
@@ -61,6 +86,24 @@ class ShizukuUserService() : IUserService.Stub() {
     override fun isAlive(pid: Int): Boolean {
         if (pid <= 1) return false
         return File("/proc/$pid").exists() || exec(arrayOf("kill", "-0", pid.toString())).getInt("rc") == 0
+    }
+
+    /** Exit code of a pid previously started via [spawn]; -1 while still running or unknown. */
+    override fun exitCode(pid: Int): Int = spawnedExit[pid] ?: -1
+
+    /**
+     * The real OS pid of a just-started [Process]. `Process.pid()` (Java 9+) isn't used here: on
+     * this toolchain it fails to resolve against the Android SDK stub jar at compile time, so we
+     * fall back to the traditional reflection trick (a private `pid` int field on the JVM's
+     * concrete Process implementation) that predates that API and still works on Android.
+     */
+    private fun pidOf(p: Process): Int = try {
+        val f = p.javaClass.getDeclaredField("pid")
+        f.isAccessible = true
+        f.getInt(p)
+    } catch (e: Exception) {
+        Log.w(TAG, "userservice: could not read pid via reflection: $e")
+        -1
     }
 
     override fun writeFile(path: String, content: String): Boolean = try {

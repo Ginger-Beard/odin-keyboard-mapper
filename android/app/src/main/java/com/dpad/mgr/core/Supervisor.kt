@@ -18,6 +18,9 @@ sealed class DaemonState {
     data class Running(val pkg: String?, val profile: String, val pid: Int) : DaemonState()
     data class Backoff(val profile: String, val attempt: Int, val untilMs: Long, val reason: String) : DaemonState()
     data class Failed(val reason: String) : DaemonState()
+    /** The daemon exited via the panic chord (exit code 6): touch offset was disabled and the
+     *  daemon will not be restarted for [profile] until the target changes or Re-check runs. */
+    data class PanicStopped(val profile: String) : DaemonState()
 
     val label: String
         get() = when (this) {
@@ -26,6 +29,7 @@ sealed class DaemonState {
             is Running -> "running ($profile, pid $pid)"
             is Backoff -> "retrying ($profile, attempt $attempt): $reason"
             is Failed -> "failed: $reason"
+            is PanicStopped -> "touch offset disabled by panic chord ($profile)"
         }
 }
 
@@ -40,6 +44,7 @@ class Supervisor(
     private val shellProvider: () -> PrivShell?,
     private val installer: BinaryInstaller,
     private val onFailed: (String) -> Unit,
+    private val onPanic: (profileName: String) -> Unit = {},
 ) {
     private val _state = MutableStateFlow<DaemonState>(DaemonState.Idle)
     val state: StateFlow<DaemonState> get() = _state
@@ -48,6 +53,7 @@ class Supervisor(
     @Volatile private var desired: Target? = null
     @Volatile private var override: Target? = null
     private var overrideJob: Job? = null
+    @Volatile private var suspended = false
 
     private var running: Triple<Int, String, Target>? = null // pid, configText, target
     private var startedAt = 0L
@@ -78,19 +84,31 @@ class Supervisor(
     }
 
     /** Manual test: run [profile] now for [seconds], then return to the assigned target. */
-    fun test(profile: Profile, seconds: Int = 30) {
+    fun test(profile: Profile, seconds: Int = 30) = startTest(profile, seconds)
+
+    /** Test [profile] now. [timeoutSec] <= 0 means no auto-stop; call [stopTest] to end it. */
+    fun startTest(profile: Profile, timeoutSec: Int = 0) {
         overrideJob?.cancel()
         override = Target(null, profile)
         failedLatched = false
         fastFailures = 0
-        Log.i(TAG, "supervisor: test profile=${profile.name} for ${seconds}s")
+        Log.i(TAG, "supervisor: test profile=${profile.name} timeoutSec=$timeoutSec")
         wake.trySend(Unit)
-        overrideJob = scope.launch {
-            delay(seconds * 1000L)
-            override = null
-            Log.i(TAG, "supervisor: test window over")
-            wake.trySend(Unit)
-        }
+        overrideJob = if (timeoutSec > 0) {
+            scope.launch {
+                delay(timeoutSec * 1000L)
+                override = null
+                Log.i(TAG, "supervisor: test window over")
+                wake.trySend(Unit)
+            }
+        } else null
+    }
+
+    /** Ends a running test override (started via [test]/[startTest]) without touching [desired]. */
+    fun stopTest() {
+        overrideJob?.cancel(); override = null
+        fastFailures = 0; attempt = 0; backoffUntil = 0; failedLatched = false
+        wake.trySend(Unit)
     }
 
     /** Manual stop: clears any test override and the current target until the next foreground change. */
@@ -107,7 +125,56 @@ class Supervisor(
         wake.trySend(Unit)
     }
 
+    /** Stops any running daemon and ignores target changes until [resume] (used during calibration). */
+    fun suspend() {
+        overrideJob?.cancel(); override = null
+        suspended = true
+        Log.i(TAG, "supervisor: suspended")
+        wake.trySend(Unit)
+    }
+
+    fun resume() {
+        suspended = false
+        Log.i(TAG, "supervisor: resumed")
+        wake.trySend(Unit)
+    }
+
+    /**
+     * Writes [profile]'s config and, if a daemon is running (test or otherwise), signals it to
+     * re-read touch.offset live via SIGUSR1 instead of restarting. Updates local bookkeeping so
+     * the watchdog doesn't see a "profile change" and restart the daemon on the next tick.
+     */
+    suspend fun updateConfigLive(profile: Profile) {
+        val shell = shellProvider() ?: return
+        val conf = profile.toConfigText()
+        if (!shell.writeFile(CONF, conf)) { Log.w(TAG, "supervisor: updateConfigLive: write failed"); return }
+        override = override?.copy(profile = profile)
+        desired = desired?.copy(profile = profile)
+        val cur = running
+        if (cur != null) {
+            running = Triple(cur.first, conf, cur.third.copy(profile = profile))
+            val pid = runCatching { shell.exec(listOf("cat", PIDFILE)).out.trim().toIntOrNull() }.getOrNull()
+            if (pid != null && pid > 1) {
+                shell.exec(listOf("kill", "-USR1", pid.toString()))
+                Log.i(TAG, "supervisor: live-updated pid=$pid dx=${profile.touchDx} dy=${profile.touchDy}")
+            } else {
+                Log.w(TAG, "supervisor: updateConfigLive: no pid to signal")
+            }
+        }
+    }
+
     private suspend fun reconcile() {
+        if (suspended) {
+            val cur = running
+            if (cur != null) {
+                Log.i(TAG, "supervisor: stopping daemon (suspended) pid=${cur.first}")
+                shellProvider()?.kill(cur.first)
+                running = null
+            }
+            fastFailures = 0; attempt = 0; backoffUntil = 0
+            _state.value = DaemonState.Idle
+            return
+        }
         val want = override ?: desired
         val cur = running
         val shell = shellProvider()
@@ -136,8 +203,18 @@ class Supervisor(
                     if (s !is DaemonState.Running || s.pkg != want.pkg) _state.value = DaemonState.Running(want.pkg, want.profile.name, cur.first)
                     return
                 }
-                Log.w(TAG, "supervisor: daemon pid=${cur.first} died")
+                val ec = shell.exitCode(cur.first)
                 running = null
+                if (ec == 6) {
+                    val prof = cur.third.profile
+                    Log.i(TAG, "supervisor: panic chord → touch offset disabled for ${prof.name}")
+                    Store.saveProfile(prof.copy(touchOffsetEnabled = false), prof.name)
+                    failedLatched = true
+                    _state.value = DaemonState.PanicStopped(prof.name)
+                    onPanic(prof.name)
+                    return
+                }
+                Log.w(TAG, "supervisor: daemon pid=${cur.first} died")
                 onFailure("daemon exited: ${lastLogLine(shell)}", fast = System.currentTimeMillis() - startedAt < 10_000)
                 if (failedLatched) return
             } else {

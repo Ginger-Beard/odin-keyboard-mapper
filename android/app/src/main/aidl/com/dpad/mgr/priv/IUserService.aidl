@@ -8,6 +8,7 @@ interface IUserService {
     int spawn(in String[] argv, String pidfile);
     void kill(int pid);
     boolean isAlive(int pid);
+    int exitCode(int pid);
     boolean writeFile(String path, String content);
     void startTail(ILineCallback cb);
     void stopTail();

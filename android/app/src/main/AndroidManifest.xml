@@ -24,6 +24,13 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".ui.CalibrateActivity"
+            android:exported="true"
+            android:screenOrientation="sensorLandscape"
+            android:theme="@style/Theme.OdinDpadKeys"
+            android:excludeFromRecents="true" />
+
         <service
             android:name=".svc.DpadService"
             android:exported="false"

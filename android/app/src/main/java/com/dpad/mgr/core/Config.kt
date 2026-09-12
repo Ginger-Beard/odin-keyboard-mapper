@@ -107,6 +107,10 @@ data class Profile(
     /** source id -> KEY_ name, WHEEL_ target, or "NONE"; active only while [modifier] is held. Missing entries fall through to [map]. */
     val modBindings: Map<String, String> = emptyMap(),
     val wheelRepeatMs: Int = 120,
+    /** Stylus/touch offset, calibrated via CalibrateActivity. Panel units (natural/portrait orientation). */
+    val touchOffsetEnabled: Boolean = false,
+    val touchDx: Int = 0,
+    val touchDy: Int = 0,
 ) {
     fun key(source: String): String = map[source] ?: Keys.NONE
 
@@ -164,6 +168,9 @@ data class Profile(
             }
         }
         append("wheel_repeat_ms ").append(wheelRepeatMs.coerceIn(60, 400)).append('\n')
+        if (touchOffsetEnabled) {
+            append("touch.offset ").append(touchDx).append(' ').append(touchDy).append('\n')
+        }
     }
 
     companion object {

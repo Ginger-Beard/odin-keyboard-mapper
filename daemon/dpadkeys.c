@@ -30,6 +30,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <math.h>
 #include <poll.h>
@@ -49,6 +50,12 @@
 #define BITS_PER_LONG (sizeof(long) * 8)
 #define NLONGS(x) (((x) + BITS_PER_LONG - 1) / BITS_PER_LONG)
 #define TEST_BIT(bit, arr) ((arr[(bit) / BITS_PER_LONG] >> ((bit) % BITS_PER_LONG)) & 1)
+
+/* Tag stamped on our virtual touchscreen (UI_SET_PHYS, and UI_SET_UNIQ if a
+ * kernel ever grows one) so the daemon can recognise its own device. */
+#define TOUCH_SELF_TAG "dpadkeys-touch"
+
+static bool evdev_is_virtual(const char *devpath);
 
 /* ---- config sources ---- */
 
@@ -167,6 +174,12 @@ typedef struct {
     int n_raw;             /* raw sources in use (slots SRC_COUNT..SRC_COUNT+n_raw-1) */
     raw_source_t raw[MAX_RAW];
     char device_match[128]; /* substring of the pad name, or "vvvv:pppp" hex; empty = any */
+
+    /* touch pass-through: absent touch.offset means the daemon never opens
+     * or touches the panel at all. */
+    bool touch_offset_set;
+    int touch_dx, touch_dy;
+    char touch_device[64]; /* explicit /dev/input/eventN, or empty = auto */
 } config_t;
 
 static volatile sig_atomic_t g_running = 1;
@@ -182,9 +195,35 @@ static int g_wheel_count[WHEEL_COUNT] = {0};
 static long long g_wheel_next_due_ms[WHEEL_COUNT] = {0};
 static int g_wheel_repeat_ms = 120;
 
+/* touch pass-through state: the virtual touchscreen is created once at
+ * startup and kept alive across panel re-detects (like the keyboard). */
+static volatile sig_atomic_t g_reload_offset = 0; /* SIGUSR1 */
+static int g_touch_fd = -1;
+static int g_touch_uinput_fd = -1;
+static bool g_touch_grabbed = false;
+static char g_touch_path[64] = {0};
+static char g_touch_name[128] = {0};
+static struct input_absinfo g_touch_mtx_info, g_touch_mty_info, g_touch_x_info, g_touch_y_info;
+static bool g_touch_has_mtx = false, g_touch_has_mty = false, g_touch_has_x = false, g_touch_has_y = false;
+
+/* Panic chord: while a touch offset is active and the panel is grabbed,
+ * holding both back buttons (raw BTN_C/BTN_Z on the pad) for
+ * PANIC_CHORD_MS disables the touch offset by tearing down touch
+ * pass-through and exiting(6) so the supervisor can restart without it. */
+typedef enum { PANIC_CHORD_NONE, PANIC_CHORD_M1M2 } panic_chord_t;
+#define PANIC_CHORD_MS 1000
+static panic_chord_t g_panic_chord = PANIC_CHORD_M1M2;
+static bool g_chord_m1_held = false, g_chord_m2_held = false;
+static long long g_chord_start_ms = -1; /* -1 = not both held */
+
 static void on_signal(int sig) {
     (void)sig;
     g_running = 0;
+}
+
+static void on_usr1(int sig) {
+    (void)sig;
+    g_reload_offset = 1;
 }
 
 static void init_config(config_t *cfg) {
@@ -201,6 +240,10 @@ static void init_config(config_t *cfg) {
     cfg->wheel_repeat_ms = 120;
     cfg->n_raw = 0;
     cfg->device_match[0] = '\0';
+    cfg->touch_offset_set = false;
+    cfg->touch_dx = 0;
+    cfg->touch_dy = 0;
+    cfg->touch_device[0] = '\0';
 }
 
 static int n_sources(const config_t *cfg) { return SRC_COUNT + cfg->n_raw; }
@@ -307,6 +350,26 @@ static const char *key_name(int code) {
     return "?";
 }
 
+#define TOUCH_OFFSET_MIN -200
+#define TOUCH_OFFSET_MAX 200
+
+/* Clamps cfg->touch_dx/dy to [TOUCH_OFFSET_MIN, TOUCH_OFFSET_MAX], logging a
+ * warning (tagged with `context`, e.g. a config path or "SIGUSR1") if either
+ * value was out of range. No-op if touch.offset isn't set. */
+static void clamp_touch_offset(config_t *cfg, const char *context) {
+    if (!cfg->touch_offset_set) return;
+    int dx = cfg->touch_dx, dy = cfg->touch_dy;
+    if (dx < TOUCH_OFFSET_MIN) cfg->touch_dx = TOUCH_OFFSET_MIN;
+    else if (dx > TOUCH_OFFSET_MAX) cfg->touch_dx = TOUCH_OFFSET_MAX;
+    if (dy < TOUCH_OFFSET_MIN) cfg->touch_dy = TOUCH_OFFSET_MIN;
+    else if (dy > TOUCH_OFFSET_MAX) cfg->touch_dy = TOUCH_OFFSET_MAX;
+    if (cfg->touch_dx != dx || cfg->touch_dy != dy) {
+        fprintf(stderr, "dpadkeys: %s: touch.offset %d %d out of range, clamped to %d %d\n",
+                context, dx, dy, cfg->touch_dx, cfg->touch_dy);
+        fflush(stderr);
+    }
+}
+
 static void load_config_file(const char *path, config_t *cfg) {
     FILE *f = fopen(path, "r");
     if (!f) {
@@ -336,6 +399,27 @@ static void load_config_file(const char *path, config_t *cfg) {
         }
         if (strcmp(tok1, "wheel_repeat_ms") == 0) {
             cfg->wheel_repeat_ms = atoi(tok2);
+            continue;
+        }
+        if (strcmp(tok1, "touch.offset") == 0) {
+            if (strcmp(tok2, "off") == 0 || strcmp(tok2, "none") == 0) {
+                cfg->touch_offset_set = false;
+                cfg->touch_dx = cfg->touch_dy = 0;
+                continue;
+            }
+            char *tok3 = strtok_r(NULL, " \t\r\n", &save);
+            if (!tok3) {
+                fprintf(stderr, "dpadkeys: %s:%d: touch.offset needs two values (dx dy)\n", path, lineno);
+                exit(2);
+            }
+            cfg->touch_dx = atoi(tok2);
+            cfg->touch_dy = atoi(tok3);
+            cfg->touch_offset_set = true;
+            continue;
+        }
+        if (strcmp(tok1, "touch.device") == 0) {
+            if (strcmp(tok2, "auto") == 0) cfg->touch_device[0] = '\0';
+            else snprintf(cfg->touch_device, sizeof(cfg->touch_device), "%s", tok2);
             continue;
         }
         if (strcmp(tok1, "device.match") == 0) {
@@ -399,6 +483,7 @@ static void load_config_file(const char *path, config_t *cfg) {
         cfg->target[src] = target;
     }
     fclose(f);
+    clamp_touch_offset(cfg, path);
 }
 
 static void load_profile(config_t *cfg, const char *name) {
@@ -437,6 +522,11 @@ static void print_config(const config_t *cfg, FILE *out) {
         fprintf(out, "%-12s %s\n", name, key_name(cfg->mod_target[i]));
     }
     fprintf(out, "%-12s %d\n", "wheel_repeat_ms", cfg->wheel_repeat_ms);
+    if (cfg->touch_offset_set)
+        fprintf(out, "%-12s %d %d\n", "touch.offset", cfg->touch_dx, cfg->touch_dy);
+    else
+        fprintf(out, "%-12s %s\n", "touch.offset", "off");
+    fprintf(out, "%-12s %s\n", "touch.device", cfg->touch_device[0] ? cfg->touch_device : "auto");
 }
 
 /* ---- uinput device ---- */
@@ -879,12 +969,21 @@ static void list_devices(void) {
         device_info(fd, &vendor, &product, name, sizeof(name), &has_south);
         axes_t ax;
         detect_axes(fd, &ax);
+        unsigned long propbits[NLONGS(INPUT_PROP_CNT)] = {0};
+        unsigned long absbits[NLONGS(ABS_CNT)] = {0};
+        ioctl(fd, EVIOCGPROP(sizeof(propbits)), propbits);
+        ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits);
+        bool direct = TEST_BIT(INPUT_PROP_DIRECT, propbits);
+        bool mt = TEST_BIT(ABS_MT_POSITION_X, absbits);
+        bool virt = evdev_is_virtual(path);
         printf("%s: bus=0x%04x vendor=0x%04x product=0x%04x name=\"%s\" "
-               "BTN_SOUTH=%s hat=%s dpad_btns=%s ls=%s rs=%s lt=%s rt=%s\n",
+               "BTN_SOUTH=%s hat=%s dpad_btns=%s ls=%s rs=%s lt=%s rt=%s "
+               "DIRECT=%s MT=%s virtual=%s\n",
                path, id.bustype, vendor, product, name, has_south ? "yes" : "no",
                ax.has_hat ? "yes" : "no", ax.has_dpad_btns ? "yes" : "no",
                ax.ls_x.present ? "yes" : "no", ax.rs_x.present ? "yes" : "no",
-               ax.lt.present ? "yes" : "no", ax.rt.present ? "yes" : "no");
+               ax.lt.present ? "yes" : "no", ax.rt.present ? "yes" : "no",
+               direct ? "yes" : "no", mt ? "yes" : "no", virt ? "yes" : "no");
         close(fd);
     }
 }
@@ -940,6 +1039,433 @@ static int find_pad(const char *match, int open_flags, char *path_out, size_t pa
     return best_fd;
 }
 
+/* ---- touch pass-through ---- */
+
+/* True if /dev/input/eventN is a kernel-virtual (uinput) node.
+ *
+ * Rationale for this test: on re-detect we must not "discover" our own clone
+ * of the panel.  The obvious tag would be a uniq string, but the uinput ABI
+ * has no UI_SET_UNIQ ioctl (see linux/uinput.h: UI_SET_PHYS exists, there is
+ * no UNIQ counterpart), so a uinput device's EVIOCGUNIQ is always empty and
+ * cannot be used to mark ourselves.  EVIOCGID is no help either: the clone
+ * copies the panel's bus/vendor/product/version by design.  What *does*
+ * separate them is where the input device hangs in sysfs: the real panel is
+ * an i2c client, so /sys/class/input/eventN/device resolves under
+ * /sys/devices/platform/..., while every uinput device (ours or anyone
+ * else's) resolves under /sys/devices/virtual/input/.  That is stable,
+ * readable without any ioctl, and is what --list reports as virtual=yes/no.
+ * UI_SET_PHYS("dpadkeys-touch") is set as well and checked as a secondary
+ * tag, so the daemon still skips its own device if sysfs is unavailable. */
+static bool evdev_is_virtual(const char *devpath) {
+    const char *base = strrchr(devpath, '/');
+    base = base ? base + 1 : devpath;
+    char link[128];
+    snprintf(link, sizeof(link), "/sys/class/input/%s/device", base);
+    char resolved[PATH_MAX];
+    if (!realpath(link, resolved)) return false;
+    return strncmp(resolved, "/sys/devices/virtual/", strlen("/sys/devices/virtual/")) == 0;
+}
+
+/* True if fd/path is a direct-input multitouch panel (INPUT_PROP_DIRECT and
+ * ABS_MT_POSITION_X) that isn't a virtual device. */
+static bool touch_candidate_ok(int fd, const char *path) {
+    unsigned long propbits[NLONGS(INPUT_PROP_CNT)] = {0};
+    if (ioctl(fd, EVIOCGPROP(sizeof(propbits)), propbits) < 0) return false;
+    if (!TEST_BIT(INPUT_PROP_DIRECT, propbits)) return false;
+    unsigned long absbits[NLONGS(ABS_CNT)] = {0};
+    ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits);
+    if (!TEST_BIT(ABS_MT_POSITION_X, absbits)) return false;
+    if (evdev_is_virtual(path)) return false;
+    char buf[64] = {0};
+    if (ioctl(fd, EVIOCGPHYS(sizeof(buf)), buf) == 0 && strcmp(buf, TOUCH_SELF_TAG) == 0) return false;
+    buf[0] = '\0';
+    if (ioctl(fd, EVIOCGUNIQ(sizeof(buf)), buf) == 0 && strcmp(buf, TOUCH_SELF_TAG) == 0) return false;
+    return true;
+}
+
+/* Opens the configured touch device: an explicit touch.device path, or (auto)
+ * the first /dev/input/event* passing touch_candidate_ok(). Returns an opened
+ * fd (path_out filled) or -1. Read-only and non-blocking: we never write to
+ * the panel, and the poll loop must not block inside a partial frame. */
+static int find_touch(const config_t *cfg, char *path_out, size_t pathlen) {
+    if (cfg->touch_device[0]) {
+        int fd = open(cfg->touch_device, O_RDONLY | O_NONBLOCK);
+        if (fd < 0) return -1;
+        /* An explicit path skips the DIRECT/MT heuristics, but still has to
+         * be an evdev node -- open() happily succeeds on a directory or an
+         * unrelated char device, and every ioctl below would then read junk. */
+        struct input_id probe;
+        if (ioctl(fd, EVIOCGID, &probe) < 0) {
+            fprintf(stderr, "dpadkeys: touch: '%s' is not an evdev node: %s\n",
+                    cfg->touch_device, strerror(errno));
+            close(fd);
+            return -1;
+        }
+        snprintf(path_out, pathlen, "%s", cfg->touch_device);
+        return fd;
+    }
+    for (int i = 0; i < 32; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "/dev/input/event%d", i);
+        int fd = open(path, O_RDONLY | O_NONBLOCK);
+        if (fd < 0) continue;
+        if (!touch_candidate_ok(fd, path)) { close(fd); continue; }
+        snprintf(path_out, pathlen, "%s", path);
+        return fd;
+    }
+    return -1;
+}
+
+/* Refreshes the X/Y and MT_POSITION_X/Y axis ranges used to clamp the offset
+ * touch events, from whichever real panel fd is currently open. */
+static void query_touch_axes(int fd) {
+    g_touch_has_mtx = g_touch_has_mty = g_touch_has_x = g_touch_has_y = false;
+    struct input_absinfo info;
+    if (ioctl(fd, EVIOCGABS(ABS_MT_POSITION_X), &info) == 0) { g_touch_mtx_info = info; g_touch_has_mtx = true; }
+    if (ioctl(fd, EVIOCGABS(ABS_MT_POSITION_Y), &info) == 0) { g_touch_mty_info = info; g_touch_has_mty = true; }
+    if (ioctl(fd, EVIOCGABS(ABS_X), &info) == 0) { g_touch_x_info = info; g_touch_has_x = true; }
+    if (ioctl(fd, EVIOCGABS(ABS_Y), &info) == 0) { g_touch_y_info = info; g_touch_has_y = true; }
+}
+
+/* Applies the configured offset to one event in place, clamped to that axis'
+ * reported range. Only the four position axes are touched; MAJOR, SLOT,
+ * TRACKING_ID, BTN_TOUCH, timestamps and everything else pass through. */
+static void offset_touch_event(const config_t *cfg, struct input_event *ev) {
+    if (ev->type != EV_ABS) return;
+    int delta;
+    const struct input_absinfo *info;
+    if (ev->code == ABS_MT_POSITION_X && g_touch_has_mtx) { delta = cfg->touch_dx; info = &g_touch_mtx_info; }
+    else if (ev->code == ABS_MT_POSITION_Y && g_touch_has_mty) { delta = cfg->touch_dy; info = &g_touch_mty_info; }
+    else if (ev->code == ABS_X && g_touch_has_x) { delta = cfg->touch_dx; info = &g_touch_x_info; }
+    else if (ev->code == ABS_Y && g_touch_has_y) { delta = cfg->touch_dy; info = &g_touch_y_info; }
+    else return;
+    long v = (long)ev->value + delta;
+    if (v < info->minimum) v = info->minimum;
+    if (v > info->maximum) v = info->maximum;
+    ev->value = (int)v;
+}
+
+/* Creates the virtual touchscreen once at startup, copying the real panel's
+ * EV_KEY/EV_ABS capabilities (with identical absinfo via UI_ABS_SETUP) and
+ * INPUT_PROP bits, name "fts_ts", and bus/vendor/product/version from the
+ * panel's EVIOCGID. Kept alive across panel re-detects.
+ *
+ * Android: EventHub classifies this as a second internal (bus 0x18 is neither
+ * USB nor Bluetooth, so isExternalDeviceLocked() is false) INPUT_PROP_DIRECT
+ * MT device, so InputReader instantiates a TouchInputMapper whose
+ * computeParameters() sets deviceType=TOUCH_SCREEN / hasAssociatedDisplay,
+ * and configureSurface() binds it to the internal viewport (display 0). No
+ * .idc file is needed for that. The descriptor EventHub derives from
+ * bus/vendor/product/version would collide with the real panel's, but
+ * EventHub::assignDescriptorLocked() salts duplicates with an incrementing
+ * nonce until the descriptor is unique, so both devices coexist. */
+static int open_touch_uinput(int real_fd, const struct input_id *id, const char *dev_name) {
+    int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+    if (fd < 0) {
+        perror("open /dev/uinput (touch)");
+        return -1;
+    }
+    if (ioctl(fd, UI_SET_EVBIT, EV_SYN) < 0 ||
+        ioctl(fd, UI_SET_EVBIT, EV_KEY) < 0 ||
+        ioctl(fd, UI_SET_EVBIT, EV_ABS) < 0) {
+        perror("UI_SET_EVBIT (touch)");
+        close(fd);
+        return -1;
+    }
+
+    unsigned long keybits[NLONGS(KEY_CNT)] = {0};
+    ioctl(real_fd, EVIOCGBIT(EV_KEY, sizeof(keybits)), keybits);
+    for (int c = 0; c < KEY_CNT; c++) {
+        if (TEST_BIT(c, keybits) && ioctl(fd, UI_SET_KEYBIT, c) < 0) {
+            perror("UI_SET_KEYBIT (touch)");
+            close(fd);
+            return -1;
+        }
+    }
+
+    unsigned long absbits[NLONGS(ABS_CNT)] = {0};
+    ioctl(real_fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits);
+    for (int c = 0; c < ABS_CNT; c++) {
+        if (!TEST_BIT(c, absbits)) continue;
+        struct input_absinfo info;
+        if (ioctl(real_fd, EVIOCGABS(c), &info) < 0) continue;
+        struct uinput_abs_setup as;
+        memset(&as, 0, sizeof(as));
+        as.code = (unsigned short)c;
+        as.absinfo = info;
+        /* The clone starts with no contacts down, so never inherit a live
+         * value; UI_ABS_SETUP also implies UI_SET_ABSBIT. */
+        as.absinfo.value = 0;
+        if (ioctl(fd, UI_ABS_SETUP, &as) < 0) {
+            perror("UI_ABS_SETUP (touch)");
+            close(fd);
+            return -1;
+        }
+    }
+
+    unsigned long propbits[NLONGS(INPUT_PROP_CNT)] = {0};
+    ioctl(real_fd, EVIOCGPROP(sizeof(propbits)), propbits);
+    for (int p = 0; p < INPUT_PROP_CNT; p++) {
+        if (TEST_BIT(p, propbits) && ioctl(fd, UI_SET_PROPBIT, p) < 0) {
+            perror("UI_SET_PROPBIT (touch)");
+            close(fd);
+            return -1;
+        }
+    }
+
+    /* Self-identification tag. UI_SET_UNIQ does not exist in the uinput ABI
+     * (guarded anyway in case a future kernel adds it); UI_SET_PHYS does, and
+     * the primary test is the sysfs one in evdev_is_virtual(). */
+#ifdef UI_SET_UNIQ
+    if (ioctl(fd, UI_SET_UNIQ, TOUCH_SELF_TAG) < 0)
+        perror("UI_SET_UNIQ (touch)");
+#endif
+    if (ioctl(fd, UI_SET_PHYS, TOUCH_SELF_TAG) < 0)
+        perror("UI_SET_PHYS (touch)"); /* non-fatal: secondary self-ID only */
+
+    struct uinput_setup usetup;
+    memset(&usetup, 0, sizeof(usetup));
+    usetup.id = *id;
+    strncpy(usetup.name, dev_name, sizeof(usetup.name) - 1);
+    if (ioctl(fd, UI_DEV_SETUP, &usetup) < 0) {
+        perror("UI_DEV_SETUP (touch)");
+        close(fd);
+        return -1;
+    }
+    if (ioctl(fd, UI_DEV_CREATE) < 0) {
+        perror("UI_DEV_CREATE (touch)");
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Releases both grabs, closes both real fds, destroys both uinput devices,
+ * and exits with `code`. Used for the touch-specific fatal-error contract
+ * (grab failure -> 4, uinput write failure -> 5). */
+static void touch_fatal_exit(int code) {
+    if (g_touch_grabbed) { ioctl(g_touch_fd, EVIOCGRAB, 0); g_touch_grabbed = false; }
+    if (g_touch_fd >= 0) { close(g_touch_fd); g_touch_fd = -1; }
+    if (g_grabbed) { ioctl(g_pad_fd, EVIOCGRAB, 0); g_grabbed = false; }
+    if (g_pad_fd >= 0) { close(g_pad_fd); g_pad_fd = -1; }
+    destroy_uinput(g_touch_uinput_fd);
+    destroy_uinput(g_uinput_fd);
+    exit(code);
+}
+
+/* Logs the panic trigger and reuses touch_fatal_exit's cleanup (release the
+ * panel grab, destroy the virtual touchscreen, ungrab the pad, destroy the
+ * keyboard device) to exit(6) so the supervisor can persist "touch offset
+ * disabled" and restart without it. */
+static void panic_chord_fire(void) {
+    fprintf(stderr, "dpadkeys: panic: back-button chord held, disabling touch offset\n");
+    fflush(stderr);
+    touch_fatal_exit(6);
+}
+
+/* Tracks raw BTN_C ("m1")/BTN_Z ("m2") hold state and fires the panic chord
+ * once both have been held continuously for PANIC_CHORD_MS while a touch
+ * offset is active (configured and the panel currently grabbed). Called both
+ * on every raw pad EV_KEY event (code, pressed) and, with code 0, from the
+ * poll-timeout path so the chord fires purely from elapsed time even if no
+ * further pad events arrive while both buttons are held. */
+static void check_panic_chord(const config_t *cfg, int code, bool pressed) {
+    if (g_panic_chord != PANIC_CHORD_M1M2) return;
+    if (code == BTN_C) g_chord_m1_held = pressed;
+    else if (code == BTN_Z) g_chord_m2_held = pressed;
+
+    if (!(cfg->touch_offset_set && g_touch_grabbed) || !g_chord_m1_held || !g_chord_m2_held) {
+        g_chord_start_ms = -1;
+        return;
+    }
+    long long now = now_ms();
+    if (g_chord_start_ms < 0) {
+        g_chord_start_ms = now;
+        return;
+    }
+    if (now - g_chord_start_ms >= PANIC_CHORD_MS)
+        panic_chord_fire();
+}
+
+/* Writes a batch of events to the virtual touchscreen. A write error of
+ * ENODEV/EIO means the clone is gone and the daemon cannot do its job, so it
+ * is fatal (exit 5) per the contract; a short write is logged but survivable.
+ * Returns false if nothing was written. */
+static bool touch_write(const struct input_event *evs, int n) {
+    if (n <= 0) return true;
+    ssize_t want = (ssize_t)n * (ssize_t)sizeof(struct input_event);
+    ssize_t w = write(g_touch_uinput_fd, evs, (size_t)want);
+    if (w == want) return true;
+    if (w < 0 && (errno == ENODEV || errno == EIO)) {
+        fprintf(stderr, "dpadkeys: touch: uinput write failed: %s\n", strerror(errno));
+        touch_fatal_exit(5);
+    }
+    fprintf(stderr, "dpadkeys: touch: short/failed uinput write (%zd/%zd)%s%s\n",
+            w, want, w < 0 ? ": " : "", w < 0 ? strerror(errno) : "");
+    fflush(stderr);
+    return false;
+}
+
+/* Mirrors the panel's live MT state onto the freshly created clone.
+ *
+ * At grab time a finger may already be down. The panel will then keep
+ * streaming updates for that slot without ever re-sending its
+ * ABS_MT_TRACKING_ID, and the clone (which starts with every slot empty)
+ * would drop them as belonging to no contact. EVIOCGMTSLOTS reads the
+ * panel's per-slot state, and for every slot with tracking id != -1 we emit
+ * SLOT / TRACKING_ID / POSITION_X / POSITION_Y (offset) / TOUCH_MAJOR, plus
+ * BTN_TOUCH 1, in a single synthetic frame. The current slot is restored
+ * last so the clone's implicit slot matches the panel's before the live
+ * stream resumes. Skipped (with a log line) when EVIOCGMTSLOTS is missing. */
+static void touch_sync_initial_contacts(const config_t *cfg) {
+#ifdef EVIOCGMTSLOTS
+    struct input_absinfo slotinfo;
+    if (ioctl(g_touch_fd, EVIOCGABS(ABS_MT_SLOT), &slotinfo) < 0) return;
+    int nslots = slotinfo.maximum - slotinfo.minimum + 1;
+    if (nslots <= 0) return;
+    if (nslots > 64) nslots = 64;
+
+    /* buf[0] is the requested ABS_MT_* code; buf[1..nslots] the slot values. */
+    int32_t tid[65], px[65], py[65], maj[65];
+    bool have_maj = true;
+    tid[0] = ABS_MT_TRACKING_ID;
+    px[0] = ABS_MT_POSITION_X;
+    py[0] = ABS_MT_POSITION_Y;
+    maj[0] = ABS_MT_TOUCH_MAJOR;
+    size_t sz = (size_t)(nslots + 1) * sizeof(int32_t);
+    if (ioctl(g_touch_fd, EVIOCGMTSLOTS(sz), tid) < 0) {
+        fprintf(stderr, "dpadkeys: touch: EVIOCGMTSLOTS unavailable (%s); "
+                        "a finger already down at grab time will be ignored "
+                        "until it is lifted\n", strerror(errno));
+        return;
+    }
+    if (ioctl(g_touch_fd, EVIOCGMTSLOTS(sz), px) < 0) return;
+    if (ioctl(g_touch_fd, EVIOCGMTSLOTS(sz), py) < 0) return;
+    if (ioctl(g_touch_fd, EVIOCGMTSLOTS(sz), maj) < 0) have_maj = false;
+
+    struct input_event out[5 * 64 + 3];
+    int n = 0;
+    int active = 0;
+    for (int s = 0; s < nslots; s++) {
+        if (tid[s + 1] == -1) continue;
+        active++;
+        struct input_event e[5];
+        memset(e, 0, sizeof(e));
+        int k = 0;
+        e[k].type = EV_ABS; e[k].code = ABS_MT_SLOT; e[k].value = slotinfo.minimum + s; k++;
+        e[k].type = EV_ABS; e[k].code = ABS_MT_TRACKING_ID; e[k].value = tid[s + 1]; k++;
+        e[k].type = EV_ABS; e[k].code = ABS_MT_POSITION_X; e[k].value = px[s + 1]; k++;
+        e[k].type = EV_ABS; e[k].code = ABS_MT_POSITION_Y; e[k].value = py[s + 1]; k++;
+        if (have_maj) { e[k].type = EV_ABS; e[k].code = ABS_MT_TOUCH_MAJOR; e[k].value = maj[s + 1]; k++; }
+        for (int j = 0; j < k; j++) {
+            offset_touch_event(cfg, &e[j]);
+            out[n++] = e[j];
+        }
+    }
+    if (active == 0) return;
+
+    /* Restore the panel's current slot, then BTN_TOUCH and the frame end. */
+    memset(&out[n], 0, sizeof(out[n]));
+    out[n].type = EV_ABS; out[n].code = ABS_MT_SLOT; out[n].value = slotinfo.value; n++;
+    memset(&out[n], 0, sizeof(out[n]));
+    out[n].type = EV_KEY; out[n].code = BTN_TOUCH; out[n].value = 1; n++;
+    memset(&out[n], 0, sizeof(out[n]));
+    out[n].type = EV_SYN; out[n].code = SYN_REPORT; out[n].value = 0; n++;
+
+    touch_write(out, n);
+    fprintf(stderr, "dpadkeys: touch: carried over %d contact(s) live at grab time\n", active);
+    fflush(stderr);
+#else
+    (void)cfg;
+    fprintf(stderr, "dpadkeys: touch: EVIOCGMTSLOTS not in headers; a finger "
+                    "already down at grab time will be ignored until lifted\n");
+#endif
+}
+
+/* Reads whatever the panel has queued (whole events only; evdev never returns
+ * a partial one), applies the configured X/Y offset in place, and replays the
+ * batch to the clone with a single write() so frames stay contiguous and the
+ * original timestamps/order are preserved verbatim. Loops until EAGAIN so a
+ * burst larger than the buffer is drained in-order. Returns 0 normally, or -1
+ * with errno set (notably ENODEV when the panel vanished) so the caller can
+ * re-detect. */
+static int forward_touch_batch(const config_t *cfg) {
+    struct input_event batch[128];
+    for (;;) {
+        ssize_t n = read(g_touch_fd, batch, sizeof(batch));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+            return -1;
+        }
+        if (n == 0) return 0;
+        int n_ev = (int)((size_t)n / sizeof(struct input_event));
+        if (n_ev <= 0) return 0;
+        for (int i = 0; i < n_ev; i++)
+            offset_touch_event(cfg, &batch[i]);
+        touch_write(batch, n_ev);
+        /* A full buffer means there may be more queued; anything shorter
+         * means the queue is drained. */
+        if ((size_t)n < sizeof(batch)) return 0;
+    }
+}
+
+/* Re-reads `config_path` on SIGUSR1 and applies only a new touch.offset, if
+ * present; logs the new offset. No-op if touch pass-through isn't enabled. */
+static void reload_touch_offset(const char *config_path, config_t *cfg) {
+    if (!cfg->touch_offset_set || !config_path) return;
+    FILE *f = fopen(config_path, "r");
+    if (!f) {
+        fprintf(stderr, "dpadkeys: SIGUSR1: cannot reopen config '%s': %s\n", config_path, strerror(errno));
+        fflush(stderr);
+        return;
+    }
+    char line[256];
+    int dx = cfg->touch_dx, dy = cfg->touch_dy;
+    bool found = false;
+    while (fgets(line, sizeof(line), f)) {
+        char *hash = strchr(line, '#');
+        if (hash) *hash = '\0';
+        char *save = NULL;
+        char *tok1 = strtok_r(line, " \t\r\n", &save);
+        if (!tok1 || strcmp(tok1, "touch.offset") != 0) continue;
+        char *tok2 = strtok_r(NULL, " \t\r\n", &save);
+        char *tok3 = tok2 ? strtok_r(NULL, " \t\r\n", &save) : NULL;
+        if (tok2 && tok3) { dx = atoi(tok2); dy = atoi(tok3); found = true; }
+    }
+    fclose(f);
+    if (!found) {
+        fprintf(stderr, "dpadkeys: SIGUSR1: no touch.offset in '%s'; keeping %d %d\n",
+                config_path, cfg->touch_dx, cfg->touch_dy);
+        fflush(stderr);
+        return;
+    }
+    cfg->touch_dx = dx;
+    cfg->touch_dy = dy;
+    clamp_touch_offset(cfg, "SIGUSR1");
+    fprintf(stderr, "dpadkeys: touch: offset now %d %d\n", cfg->touch_dx, cfg->touch_dy);
+    fflush(stderr);
+}
+
+static void print_touch_banner(const config_t *cfg) {
+    if (!cfg->touch_offset_set) {
+        printf("dpadkeys: touch=off\n");
+        fflush(stdout);
+        return;
+    }
+    char xb[32] = "none", yb[32] = "none";
+    if (g_touch_has_mtx) snprintf(xb, sizeof(xb), "[%d,%d]", g_touch_mtx_info.minimum, g_touch_mtx_info.maximum);
+    else if (g_touch_has_x) snprintf(xb, sizeof(xb), "[%d,%d]", g_touch_x_info.minimum, g_touch_x_info.maximum);
+    if (g_touch_has_mty) snprintf(yb, sizeof(yb), "[%d,%d]", g_touch_mty_info.minimum, g_touch_mty_info.maximum);
+    else if (g_touch_has_y) snprintf(yb, sizeof(yb), "[%d,%d]", g_touch_y_info.minimum, g_touch_y_info.maximum);
+    char panic_b[24];
+    if (g_panic_chord == PANIC_CHORD_M1M2) snprintf(panic_b, sizeof(panic_b), "m1+m2 %dms", PANIC_CHORD_MS);
+    else snprintf(panic_b, sizeof(panic_b), "none");
+    printf("dpadkeys: touch=%s \"%s\" off=(%d,%d) x=%s y=%s panic=%s\n",
+           g_touch_path, g_touch_name, cfg->touch_dx, cfg->touch_dy, xb, yb, panic_b);
+    fflush(stdout);
+}
+
 /* ---- banner formatting ---- */
 
 static void fmt_axis(char *buf, size_t n, const axis_t *a) {
@@ -972,7 +1498,7 @@ static void print_banner(const char *pad_path, const char *pad_name, unsigned sh
 static void print_usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s --config FILE [--grab] [--list] [--device auto|/dev/input/eventN] "
-            "[--verbose] [--pidfile PATH] [--print-config]\n"
+            "[--verbose] [--pidfile PATH] [--print-config] [--panic-chord none|m1+m2]\n"
             "       %s --profile fkeys|wasd [--grab] ...\n"
             "       %s --learn [--learn-timeout-ms N] [--config FILE] [--device ...] [--pidfile PATH]\n",
             argv0, argv0, argv0);
@@ -1114,6 +1640,15 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--print-config") == 0) print_config_flag = true;
         else if (strcmp(argv[i], "--learn") == 0) do_learn = true;
         else if (strcmp(argv[i], "--learn-timeout-ms") == 0 && i + 1 < argc) learn_timeout_ms = atoll(argv[++i]);
+        else if (strcmp(argv[i], "--panic-chord") == 0 && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (strcmp(v, "none") == 0) g_panic_chord = PANIC_CHORD_NONE;
+            else if (strcmp(v, "m1+m2") == 0) g_panic_chord = PANIC_CHORD_M1M2;
+            else {
+                fprintf(stderr, "dpadkeys: --panic-chord must be 'none' or 'm1+m2'\n");
+                return 2;
+            }
+        }
         else { print_usage(argv[0]); return 1; }
     }
     if (device_override && strcmp(device_override, "auto") == 0) device_override = NULL;
@@ -1145,7 +1680,8 @@ int main(int argc, char **argv) {
 
     {
         /* No SA_RESTART: a blocking read() on the pad must return EINTR so the
-         * main loop notices g_running == 0 and cleans up. */
+         * main loop notices g_running == 0 and cleans up, and SIGUSR1 must
+         * break poll() so g_reload_offset is seen on the next iteration. */
         struct sigaction sa;
         memset(&sa, 0, sizeof(sa));
         sa.sa_handler = on_signal;
@@ -1153,6 +1689,8 @@ int main(int argc, char **argv) {
         sa.sa_flags = 0;
         sigaction(SIGINT, &sa, NULL);
         sigaction(SIGTERM, &sa, NULL);
+        sa.sa_handler = on_usr1;
+        sigaction(SIGUSR1, &sa, NULL);
     }
 
     char pad_path[64] = {0};
@@ -1242,6 +1780,45 @@ int main(int argc, char **argv) {
         g_grabbed = true;
     }
 
+    /* Touch pass-through: absent touch.offset means we never open or touch
+     * the panel at all. */
+    if (cfg.touch_offset_set) {
+        g_touch_fd = find_touch(&cfg, g_touch_path, sizeof(g_touch_path));
+        if (g_touch_fd < 0) {
+            fprintf(stderr, "dpadkeys: touch: no touch panel found%s%s. Exiting.\n",
+                    cfg.touch_device[0] ? " at " : "", cfg.touch_device);
+            if (g_grabbed) ioctl(g_pad_fd, EVIOCGRAB, 0);
+            destroy_uinput(g_uinput_fd);
+            close(g_pad_fd);
+            return 1;
+        }
+        struct input_id touch_id;
+        memset(&touch_id, 0, sizeof(touch_id));
+        ioctl(g_touch_fd, EVIOCGID, &touch_id);
+        if (ioctl(g_touch_fd, EVIOCGNAME(sizeof(g_touch_name)), g_touch_name) < 0)
+            snprintf(g_touch_name, sizeof(g_touch_name), "?");
+        query_touch_axes(g_touch_fd);
+
+        g_touch_uinput_fd = open_touch_uinput(g_touch_fd, &touch_id, "fts_ts");
+        if (g_touch_uinput_fd < 0) {
+            fprintf(stderr, "dpadkeys: touch: could not create virtual touchscreen. Exiting.\n");
+            close(g_touch_fd);
+            if (g_grabbed) ioctl(g_pad_fd, EVIOCGRAB, 0);
+            destroy_uinput(g_uinput_fd);
+            close(g_pad_fd);
+            return 1;
+        }
+        fprintf(stderr, "dpadkeys: touch: created virtual touchscreen \"fts_ts\" (from %s)\n", g_touch_path);
+
+        if (ioctl(g_touch_fd, EVIOCGRAB, 1) < 0) {
+            perror("EVIOCGRAB (touch)");
+            fprintf(stderr, "dpadkeys: touch: cannot grab the panel. Exiting.\n");
+            touch_fatal_exit(4);
+        }
+        g_touch_grabbed = true;
+        touch_sync_initial_contacts(&cfg);
+    }
+
     if (pidfile) {
         FILE *pf = fopen(pidfile, "r");
         if (pf) {
@@ -1249,6 +1826,9 @@ int main(int argc, char **argv) {
             if (fscanf(pf, "%d", &oldpid) == 1 && oldpid > 0 && kill(oldpid, 0) == 0) {
                 fprintf(stderr, "dpadkeys: already running as pid %d (per %s). Exiting.\n", oldpid, pidfile);
                 fclose(pf);
+                if (g_touch_grabbed) ioctl(g_touch_fd, EVIOCGRAB, 0);
+                if (g_touch_fd >= 0) close(g_touch_fd);
+                destroy_uinput(g_touch_uinput_fd);
                 if (g_grabbed) ioctl(g_pad_fd, EVIOCGRAB, 0);
                 destroy_uinput(g_uinput_fd);
                 close(g_pad_fd);
@@ -1261,13 +1841,25 @@ int main(int argc, char **argv) {
     }
 
     print_banner(pad_path, pad_name, vendor, product, &ax, &cfg);
+    print_touch_banner(&cfg);
 
-    struct pollfd pfd = { .fd = g_pad_fd, .events = POLLIN };
     while (g_running) {
+        if (g_reload_offset) {
+            g_reload_offset = 0;
+            reload_touch_offset(config_path, &cfg);
+        }
+
         long long deadline = -1;
         for (int i = 0; i < WHEEL_COUNT; i++) {
             if (g_wheel_count[i] > 0 && (deadline < 0 || g_wheel_next_due_ms[i] < deadline))
                 deadline = g_wheel_next_due_ms[i];
+        }
+        if (g_chord_start_ms >= 0) {
+            /* Both m1/m2 already held: wake in time to fire the chord even
+             * if no further pad events arrive while they're held. */
+            long long chord_deadline = g_chord_start_ms + PANIC_CHORD_MS;
+            if (deadline < 0 || chord_deadline < deadline)
+                deadline = chord_deadline;
         }
         int timeout_ms = -1;
         if (deadline >= 0) {
@@ -1275,8 +1867,20 @@ int main(int argc, char **argv) {
             timeout_ms = (int)(deadline > now ? deadline - now : 0);
         }
 
-        pfd.fd = g_pad_fd;
-        int pr = poll(&pfd, 1, timeout_ms);
+        struct pollfd pfds[2];
+        pfds[0].fd = g_pad_fd;
+        pfds[0].events = POLLIN;
+        pfds[0].revents = 0;
+        pfds[1].revents = 0;
+        int nfds = 1;
+        int touch_slot = -1;
+        if (cfg.touch_offset_set && g_touch_fd >= 0) {
+            pfds[1].fd = g_touch_fd;
+            pfds[1].events = POLLIN;
+            touch_slot = 1;
+            nfds = 2;
+        }
+        int pr = poll(pfds, nfds, timeout_ms);
         if (pr < 0) {
             if (errno == EINTR)
                 continue;
@@ -1284,7 +1888,10 @@ int main(int argc, char **argv) {
             break;
         }
         if (pr == 0) {
-            /* Nothing readable: fire any wheel repeats that came due. */
+            /* Nothing readable: fire any wheel repeats that came due, and
+             * check whether the panic chord's hold time has elapsed. */
+            if (g_chord_start_ms >= 0)
+                check_panic_chord(&cfg, 0, true); /* code 0: re-check elapsed time only */
             long long now = now_ms();
             for (int i = 0; i < WHEEL_COUNT; i++) {
                 if (g_wheel_count[i] > 0 && now >= g_wheel_next_due_ms[i]) {
@@ -1294,6 +1901,46 @@ int main(int argc, char **argv) {
             }
             continue;
         }
+
+        if (touch_slot >= 0 && (pfds[touch_slot].revents & POLLIN)) {
+            if (forward_touch_batch(&cfg) < 0) {
+                if (errno == ENODEV) {
+                    fprintf(stderr, "dpadkeys: touch: panel disconnected, re-detecting...\n");
+                    if (g_touch_grabbed) { ioctl(g_touch_fd, EVIOCGRAB, 0); g_touch_grabbed = false; }
+                    close(g_touch_fd);
+                    g_touch_fd = -1;
+                    while (g_running && (g_touch_fd = find_touch(&cfg, g_touch_path, sizeof(g_touch_path))) < 0) {
+                        struct timespec ts = { 0, 500 * 1000 * 1000 };
+                        nanosleep(&ts, NULL);
+                    }
+                    if (g_running && g_touch_fd >= 0) {
+                        query_touch_axes(g_touch_fd);
+                        /* Freshly recreated node: retry briefly before giving up. */
+                        bool got = false;
+                        for (int tries = 0; g_running && tries < 20 && !got; tries++) {
+                            if (ioctl(g_touch_fd, EVIOCGRAB, 1) == 0) got = true;
+                            else usleep(100000);
+                        }
+                        if (!got) {
+                            if (!g_running) break;
+                            fprintf(stderr, "dpadkeys: touch: could not re-grab the panel. Exiting.\n");
+                            touch_fatal_exit(4);
+                        }
+                        g_touch_grabbed = true;
+                        touch_sync_initial_contacts(&cfg);
+                        fprintf(stderr, "dpadkeys: touch: reacquired %s\n", g_touch_path);
+                        fflush(stderr);
+                    }
+                } else if (errno != EAGAIN) {
+                    perror("read touch");
+                }
+            }
+        }
+
+        if (!g_running)
+            break;
+        if (!(pfds[0].revents & POLLIN))
+            continue;
 
         struct input_event ev;
         ssize_t n = read(g_pad_fd, &ev, sizeof(ev));
@@ -1338,7 +1985,6 @@ int main(int argc, char **argv) {
                 raw_query_axes(g_pad_fd, &cfg);
                 fprintf(stderr, "dpadkeys: reacquired pad=%s name=\"%s\"\n", pad_path, pad_name);
                 print_banner(pad_path, pad_name, vendor, product, &ax, &cfg);
-                pfd.fd = g_pad_fd;
                 continue;
             }
             if (errno == EAGAIN)
@@ -1352,6 +1998,10 @@ int main(int argc, char **argv) {
         if (ev.type == EV_KEY) {
             if (ev.value == 2)
                 continue; /* ignore autorepeat */
+            /* Raw check ahead of (and independent of) whatever btn.m1/btn.m2
+             * are mapped to in this config; mapping still happens below. */
+            if (ev.code == BTN_C || ev.code == BTN_Z)
+                check_panic_chord(&cfg, ev.code, ev.value != 0);
             handle_raw_key(&cfg, ev.code, ev.value != 0);
             for (int i = 0; i < BTN_MAP_LEN; i++) {
                 if (BTN_MAP[i].code == ev.code) {
@@ -1384,6 +2034,12 @@ int main(int argc, char **argv) {
             }
         }
     }
+
+    if (g_touch_grabbed)
+        ioctl(g_touch_fd, EVIOCGRAB, 0);
+    if (g_touch_fd >= 0)
+        close(g_touch_fd);
+    destroy_uinput(g_touch_uinput_fd);
 
     if (g_grabbed)
         ioctl(g_pad_fd, EVIOCGRAB, 0);

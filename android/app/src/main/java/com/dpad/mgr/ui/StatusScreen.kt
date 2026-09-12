@@ -28,6 +28,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.dpad.mgr.core.DaemonState
 import com.dpad.mgr.core.Store
 import com.dpad.mgr.svc.DpadService
 import com.dpad.mgr.svc.ServiceState
@@ -57,6 +58,11 @@ fun StatusScreen(modifier: Modifier = Modifier) {
                 Text("Binary: ${bin ?: "n/a"}", style = MaterialTheme.typography.bodySmall)
                 Text("Pad device: " + (pad.name?.let { "$it (${pad.idText})" } ?: "missing"))
                 Text("Foreground: ${fg ?: "none / launcher"}", style = MaterialTheme.typography.bodySmall)
+                val runningProfile = (daemon as? DaemonState.Running)?.let { data.profile(it.profile) }
+                if (runningProfile?.touchOffsetEnabled == true) {
+                    Text("Touch offset: ${runningProfile.touchDx},${runningProfile.touchDy}", style = MaterialTheme.typography.bodySmall)
+                    Text("Panic: hold both back buttons 1 s", style = MaterialTheme.typography.bodySmall)
+                }
                 if (pad.warn) {
                     Spacer(Modifier.height(4.dp))
                     Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFB00020))) {

@@ -27,8 +27,15 @@ object Store {
             Log.w(TAG, "store: failed to read ${file.path}: $e; using defaults")
             AppData()
         }.let { d -> if (d.profiles.isEmpty()) d.copy(profiles = Profile.DEFAULTS) else d }
+            .let { d -> d.copy(profiles = d.profiles.map(::clampOffsets)) }
         loaded = true
     }
+
+    /** Hard clamp on touchDx/touchDy (Calibration.MAX_OFFSET); applied on load and on every save. */
+    private fun clampOffsets(p: Profile): Profile = p.copy(
+        touchDx = p.touchDx.coerceIn(-Calibration.MAX_OFFSET, Calibration.MAX_OFFSET),
+        touchDy = p.touchDy.coerceIn(-Calibration.MAX_OFFSET, Calibration.MAX_OFFSET),
+    )
 
     @Synchronized
     fun update(fn: (AppData) -> AppData) {
@@ -42,6 +49,7 @@ object Store {
     }
 
     fun saveProfile(p: Profile, originalName: String? = null) = update { d ->
+        val p = clampOffsets(p)
         val list = d.profiles.toMutableList()
         val idx = list.indexOfFirst { it.name == (originalName ?: p.name) }
         if (idx >= 0) list[idx] = p else list.add(p)

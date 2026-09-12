@@ -18,6 +18,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.Button
+import androidx.compose.material3.Card
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.InputChip
@@ -29,13 +30,16 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import android.content.Intent
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.dpad.mgr.core.KeyDef
@@ -119,12 +123,22 @@ fun ProfileEditor(
     original: String?, initial: Profile, existingNames: List<String>,
     onSave: (Profile) -> Unit, onCancel: () -> Unit, modifier: Modifier = Modifier,
 ) {
+    val ctx = LocalContext.current
     var draft by remember { mutableStateOf(initial) }
     var binding by remember { mutableStateOf<BindTarget?>(null) }
     var showLetters by remember { mutableStateOf(false) }
     var showModLetters by remember { mutableStateOf(false) }
     val nameClash = draft.name.isBlank() || (draft.name != original && draft.name in existingNames)
     val swallow = KeyDef("Swallow (no key)", Keys.NONE)
+
+    // CalibrateActivity saves straight to the Store; pick up its touch-offset result here.
+    val storeData by Store.data.collectAsStateWithLifecycle()
+    LaunchedEffect(storeData) {
+        val latest = storeData.profile(draft.name) ?: return@LaunchedEffect
+        if (latest.touchOffsetEnabled != draft.touchOffsetEnabled || latest.touchDx != draft.touchDx || latest.touchDy != draft.touchDy) {
+            draft = draft.copy(touchOffsetEnabled = latest.touchOffsetEnabled, touchDx = latest.touchDx, touchDy = latest.touchDy)
+        }
+    }
 
     Column(modifier.padding(12.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         OutlinedTextField(draft.name, { draft = draft.copy(name = it) }, Modifier.fillMaxWidth(), label = { Text("Profile name") },
@@ -144,6 +158,30 @@ fun ProfileEditor(
         Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("Invert right stick vertical", Modifier.weight(1f))
             Switch(checked = draft.rsInvertY, onCheckedChange = { draft = draft.copy(rsInvertY = it) })
+        }
+
+        Spacer(Modifier.height(4.dp))
+        Text("Stylus / touch offset", style = MaterialTheme.typography.titleMedium)
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Enabled", Modifier.weight(1f))
+                    Switch(checked = draft.touchOffsetEnabled, onCheckedChange = { draft = draft.copy(touchOffsetEnabled = it) })
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedButton(onClick = { draft = draft.copy(touchOffsetEnabled = false, touchDx = 0, touchDy = 0) }) { Text("Disable") }
+                }
+                Text(
+                    "Only active while the assigned game is in front. To turn it off from inside the game, hold both back buttons for 1 second.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Text("Offset: dx=${draft.touchDx}, dy=${draft.touchDy} (panel units)", style = MaterialTheme.typography.bodySmall)
+                OutlinedButton(onClick = {
+                    // Persist the draft first so calibration (a separate activity) has a saved
+                    // profile to read and write touch offset fields on.
+                    Store.saveProfile(draft, original)
+                    ctx.startActivity(Intent(ctx, CalibrateActivity::class.java).putExtra(CalibrateActivity.EXTRA_PROFILE, draft.name))
+                }) { Text("Calibrate…") }
+            }
         }
 
         Spacer(Modifier.height(4.dp))

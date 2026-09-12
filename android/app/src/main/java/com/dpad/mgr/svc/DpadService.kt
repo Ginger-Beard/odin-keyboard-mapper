@@ -53,7 +53,11 @@ class DpadService : Service() {
         probe = PrivProbe(this)
         installer = BinaryInstaller(this)
         watcher = ForegroundWatcher(this, scope)
-        supervisor = Supervisor(scope, { probe.state.value.shell }, installer) { reason -> notifyFailed(reason) }
+        supervisor = Supervisor(
+            scope, { probe.state.value.shell }, installer,
+            onFailed = { reason -> notifyFailed(reason) },
+            onPanic = { profile -> notifyPanic(profile) },
+        )
         ServiceState.serviceRunning.value = true
 
         scope.launch { probe.state.collect { ServiceState.priv.value = it } }
@@ -94,6 +98,27 @@ class DpadService : Service() {
                     watcher.stop()
                     watcherStartedFor = null
                     stopSelf()
+                }
+            }
+            ACTION_STOP_TEST -> {
+                Log.i(TAG, "action: stop test")
+                supervisor.stopTest()
+            }
+            ACTION_SUSPEND -> {
+                Log.i(TAG, "action: suspend (calibration)")
+                supervisor.suspend()
+            }
+            ACTION_RESUME -> {
+                Log.i(TAG, "action: resume (calibration done)")
+                supervisor.resume()
+            }
+            ACTION_UPDATE_CONFIG_LIVE -> {
+                val name = intent.getStringExtra(EXTRA_PROFILE)
+                val p = name?.let { Store.data.value.profile(it) }
+                if (p == null) {
+                    Log.w(TAG, "action: updateConfigLive: profile '$name' not found")
+                } else {
+                    scope.launch { supervisor.updateConfigLive(p) }
                 }
             }
         }
@@ -174,16 +199,35 @@ class DpadService : Service() {
         runCatching { getSystemService(NotificationManager::class.java).notify(NOTIF_FAIL_ID, n) }
     }
 
+    private fun notifyPanic(profile: String) {
+        val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        val text = "Touch offset disabled by panic chord (hold both back buttons). Re-enable in the app."
+        val n = Notification.Builder(this, CH_ALERT)
+            .setSmallIcon(android.R.drawable.stat_notify_error)
+            .setContentTitle("Touch offset disabled by panic chord")
+            .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText("$text\nProfile: $profile"))
+            .setContentIntent(pi)
+            .setAutoCancel(true)
+            .build()
+        runCatching { getSystemService(NotificationManager::class.java).notify(NOTIF_PANIC_ID, n) }
+    }
+
     companion object {
         private const val TAG = "DpadMgr"
         const val CH_STATUS = "status"
         const val CH_ALERT = "alert"
         const val NOTIF_ID = 1
         const val NOTIF_FAIL_ID = 2
+        const val NOTIF_PANIC_ID = 3
         const val ACTION_START = "com.dpad.mgr.action.START"
         const val ACTION_RECHECK = "com.dpad.mgr.action.RECHECK"
         const val ACTION_STOP_DAEMON = "com.dpad.mgr.action.STOP_DAEMON"
         const val ACTION_TEST = "com.dpad.mgr.action.TEST"
+        const val ACTION_STOP_TEST = "com.dpad.mgr.action.STOP_TEST"
+        const val ACTION_SUSPEND = "com.dpad.mgr.action.SUSPEND"
+        const val ACTION_RESUME = "com.dpad.mgr.action.RESUME"
+        const val ACTION_UPDATE_CONFIG_LIVE = "com.dpad.mgr.action.UPDATE_CONFIG_LIVE"
         const val ACTION_STOP_SERVICE = "com.dpad.mgr.action.STOP_SERVICE"
         const val EXTRA_PROFILE = "profile"
         const val EXTRA_SECONDS = "seconds"

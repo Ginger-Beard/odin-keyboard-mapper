@@ -30,6 +30,11 @@ interface PrivShell {
 
     suspend fun isAlive(pid: Int): Boolean
 
+    /** Exit code of a pid started via [spawn], once it has died; -1 while running or unknown.
+     *  Only meaningful where the channel actually tracks the child (see [ShizukuShell]); other
+     *  implementations keep the default (always -1, i.e. "unknown"). */
+    suspend fun exitCode(pid: Int): Int = -1
+
     /** Write content to path (created 0644). */
     suspend fun writeFile(path: String, content: String): Boolean
 

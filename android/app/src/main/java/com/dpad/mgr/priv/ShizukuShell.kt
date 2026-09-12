@@ -120,6 +120,10 @@ class ShizukuShell(ctx: Context) : PrivShell {
         runCatching { svc()?.isAlive(pid) ?: false }.getOrDefault(false)
     }
 
+    override suspend fun exitCode(pid: Int): Int = withContext(Dispatchers.IO) {
+        runCatching { svc()?.exitCode(pid) ?: -1 }.getOrDefault(-1)
+    }
+
     override suspend fun writeFile(path: String, content: String): Boolean = withContext(Dispatchers.IO) {
         runCatching { svc()?.writeFile(path, content) ?: false }.getOrDefault(false)
     }
