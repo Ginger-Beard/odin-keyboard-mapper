@@ -162,13 +162,31 @@ static bool target_is_wheel(int t) { return wheel_idx_from_target(t) >= 0; }
 
 /* ---- config ---- */
 
+/* Generalized chords: `<hold>+<src> T` fires T for <src> while <hold> is
+ * held. <hold> may be any button-like source (see source_can_be_hold());
+ * <src> may be anything, including another hold. Several chords may share a
+ * <src>; resolve_target() picks among the ones whose hold is currently held,
+ * most-recently-pressed hold wins (see update_source()/resolve_target()). */
+#define MAX_CHORDS 64
+typedef struct {
+    int hold;   /* source slot that must be held */
+    int src;    /* source slot the chord applies to */
+    int target; /* KEY_* code, TARGET_WHEEL_*, or TARGET_NONE */
+} chord_t;
+
 typedef struct {
     int target[MAX_SOURCES]; /* KEY_* code, TARGET_WHEEL_*, or TARGET_NONE */
-    int mod_target[MAX_SOURCES];   /* layer active while the modifier is held */
-    bool mod_defined[MAX_SOURCES]; /* true if a mod+<src> line set mod_target */
     bool defined[MAX_SOURCES];     /* any config line referenced this source */
-    int modifier_src;      /* source slot of the "MOD" source, or -1 if none */
+    chord_t chords[MAX_CHORDS];
+    int n_chords;
+    int modifier_src;      /* legacy staging: source slot of a "MOD" line, or -1 */
+    /* legacy staging for `mod+<src> T` lines, resolved into chords against
+     * modifier_src once the whole file has been read (see load_config_file);
+     * a `mod+<src>` line may appear before or after the `<src> MOD` line. */
+    int legacy_mod_target[MAX_SOURCES];
+    bool legacy_mod_set[MAX_SOURCES];
     double deadzone;       /* fraction of half-range that counts as pressed */
+    bool ls_invert_x, rs_invert_x; /* flip stick left/right */
     bool ls_invert_y, rs_invert_y; /* flip stick up/down */
     int wheel_repeat_ms;   /* repeat interval for held wheel targets */
     int n_raw;             /* raw sources in use (slots SRC_COUNT..SRC_COUNT+n_raw-1) */
@@ -189,7 +207,8 @@ static bool g_grabbed = false;
 static bool g_verbose = false;
 static bool g_source_pressed[MAX_SOURCES] = {0};
 static int g_key_count[KEY_CNT] = {0};
-static bool g_modifier_held = false;
+static long long g_press_seq = 0;
+static long long g_source_press_seq[MAX_SOURCES] = {0}; /* bumped on every press, for "most recently pressed hold" */
 static int g_resolved_target[MAX_SOURCES] = {0}; /* target used at press, replayed at release */
 static int g_wheel_count[WHEEL_COUNT] = {0};
 static long long g_wheel_next_due_ms[WHEEL_COUNT] = {0};
@@ -230,12 +249,14 @@ static void init_config(config_t *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     for (int i = 0; i < MAX_SOURCES; i++) {
         cfg->target[i] = TARGET_NONE;
-        cfg->mod_target[i] = TARGET_NONE;
-        cfg->mod_defined[i] = false;
         cfg->defined[i] = false;
+        cfg->legacy_mod_target[i] = TARGET_NONE;
+        cfg->legacy_mod_set[i] = false;
     }
+    cfg->n_chords = 0;
     cfg->modifier_src = -1;
     cfg->deadzone = 0.5;
+    cfg->ls_invert_x = false; cfg->rs_invert_x = false;
     cfg->ls_invert_y = false; cfg->rs_invert_y = false;
     cfg->wheel_repeat_ms = 120;
     cfg->n_raw = 0;
@@ -350,6 +371,61 @@ static const char *key_name(int code) {
     return "?";
 }
 
+/* A hold in `<hold>+<src>` must be a source with a plain pressed/released
+ * state: btn.*, hat.*, lt, rt, key.0xNNN, abs.0xNN.neg|pos. Stick directions
+ * (ls.* / rs.*) are continuous/derived and may not be held. SRC_LS_UP..
+ * SRC_RS_RIGHT is one contiguous run in the source_id_t enum. */
+static bool source_can_be_hold(int slot) {
+    return !(slot >= SRC_LS_UP && slot <= SRC_RS_RIGHT);
+}
+
+/* Resolves (adding a raw slot on first use) and registers a source name from
+ * a config line, exiting(2) with a message on any error -- unknown name,
+ * raw/semantic collision, etc. Shared by plain lines and both sides of a
+ * `<hold>+<src>` chord line. */
+static int resolve_source(config_t *cfg, const char *name, const char *path, int lineno) {
+    const char *err = NULL;
+    int src = lookup_or_add_source(cfg, name, &err);
+    if (src < 0) {
+        if (err) fprintf(stderr, "dpadkeys: %s:%d: %s\n", path, lineno, err);
+        else fprintf(stderr, "dpadkeys: %s:%d: unknown source '%s'\n", path, lineno, name);
+        exit(2);
+    }
+    if (src < SRC_COUNT && !cfg->defined[src]) {
+        const char *raw = semantic_collides_with_raw(cfg, src);
+        if (raw) {
+            fprintf(stderr, "dpadkeys: %s:%d: source '%s' collides with raw source '%s'\n",
+                    path, lineno, name, raw);
+            exit(2);
+        }
+    }
+    cfg->defined[src] = true;
+    return src;
+}
+
+/* Resolves a target token, exiting(2) with a message if it's not a known
+ * target name (KEY_*, WHEEL_* / HWHEEL_*, or NONE). */
+static int resolve_target_tok(const char *tok, const char *path, int lineno) {
+    int target = lookup_target(tok);
+    if (target == TARGET_UNKNOWN) {
+        fprintf(stderr, "dpadkeys: %s:%d: unknown target '%s'\n", path, lineno, tok);
+        exit(2);
+    }
+    return target;
+}
+
+/* Appends a chord, exiting(2) if the table is full. */
+static void add_chord(config_t *cfg, int hold, int src, int target, const char *path, int lineno) {
+    if (cfg->n_chords >= MAX_CHORDS) {
+        fprintf(stderr, "dpadkeys: %s:%d: too many chords (max %d)\n", path, lineno, MAX_CHORDS);
+        exit(2);
+    }
+    cfg->chords[cfg->n_chords].hold = hold;
+    cfg->chords[cfg->n_chords].src = src;
+    cfg->chords[cfg->n_chords].target = target;
+    cfg->n_chords++;
+}
+
 #define TOUCH_OFFSET_MIN -200
 #define TOUCH_OFFSET_MAX 200
 
@@ -391,6 +467,8 @@ static void load_config_file(const char *path, config_t *cfg) {
             fprintf(stderr, "dpadkeys: %s:%d: missing value for '%s'\n", path, lineno, tok1);
             exit(2);
         }
+        if (strcmp(tok1, "ls.invert_x") == 0) { cfg->ls_invert_x = atoi(tok2) != 0; continue; }
+        if (strcmp(tok1, "rs.invert_x") == 0) { cfg->rs_invert_x = atoi(tok2) != 0; continue; }
         if (strcmp(tok1, "ls.invert_y") == 0) { cfg->ls_invert_y = atoi(tok2) != 0; continue; }
         if (strcmp(tok1, "rs.invert_y") == 0) { cfg->rs_invert_y = atoi(tok2) != 0; continue; }
         if (strcmp(tok1, "deadzone") == 0) {
@@ -435,35 +513,34 @@ static void load_config_file(const char *path, config_t *cfg) {
             continue;
         }
 
-        bool is_mod_line = strncmp(tok1, "mod+", 4) == 0;
-        const char *src_name = is_mod_line ? tok1 + 4 : tok1;
-        const char *err = NULL;
-        int src = lookup_or_add_source(cfg, src_name, &err);
-        if (src < 0) {
-            if (err) fprintf(stderr, "dpadkeys: %s:%d: %s\n", path, lineno, err);
-            else fprintf(stderr, "dpadkeys: %s:%d: unknown source '%s'\n", path, lineno, src_name);
-            exit(2);
-        }
-        if (src < SRC_COUNT && !cfg->defined[src]) {
-            const char *raw = semantic_collides_with_raw(cfg, src);
-            if (raw) {
-                fprintf(stderr, "dpadkeys: %s:%d: source '%s' collides with raw source '%s'\n",
-                        path, lineno, src_name, raw);
+        /* `<hold>+<src> T`: either the new generalized-chord syntax, or the
+         * legacy `mod+<src> T` spelling (deferred below since the `<src>
+         * MOD` line naming the modifier may come before or after it). */
+        char *plus = strchr(tok1, '+');
+        if (plus) {
+            *plus = '\0';
+            const char *hold_name = tok1;
+            const char *src_name = plus + 1;
+            if (strcmp(hold_name, "mod") == 0) {
+                int src = resolve_source(cfg, src_name, path, lineno);
+                int target = resolve_target_tok(tok2, path, lineno);
+                cfg->legacy_mod_set[src] = true;
+                cfg->legacy_mod_target[src] = target;
+                continue;
+            }
+            int hold = resolve_source(cfg, hold_name, path, lineno);
+            if (!source_can_be_hold(hold)) {
+                fprintf(stderr, "dpadkeys: %s:%d: '%s' cannot be used as a hold "
+                                "(stick directions can't be held)\n", path, lineno, hold_name);
                 exit(2);
             }
-        }
-        cfg->defined[src] = true;
-
-        if (is_mod_line) {
-            int target = lookup_target(tok2);
-            if (target == TARGET_UNKNOWN) {
-                fprintf(stderr, "dpadkeys: %s:%d: unknown target '%s'\n", path, lineno, tok2);
-                exit(2);
-            }
-            cfg->mod_defined[src] = true;
-            cfg->mod_target[src] = target;
+            int src = resolve_source(cfg, src_name, path, lineno);
+            int target = resolve_target_tok(tok2, path, lineno);
+            add_chord(cfg, hold, src, target, path, lineno);
             continue;
         }
+
+        int src = resolve_source(cfg, tok1, path, lineno);
 
         if (strcmp(tok2, "MOD") == 0) {
             if (cfg->modifier_src != -1) {
@@ -475,14 +552,24 @@ static void load_config_file(const char *path, config_t *cfg) {
             continue;
         }
 
-        int target = lookup_target(tok2);
-        if (target == TARGET_UNKNOWN) {
-            fprintf(stderr, "dpadkeys: %s:%d: unknown target '%s'\n", path, lineno, tok2);
-            exit(2);
-        }
-        cfg->target[src] = target;
+        cfg->target[src] = resolve_target_tok(tok2, path, lineno);
     }
     fclose(f);
+
+    /* Resolve legacy `<src> MOD` + `mod+<src> T` lines into chords now that
+     * the whole file has been read. A hold declared this way always swallows
+     * its own plain press (the old modifier always did, regardless of any
+     * target the source itself had), and mod+ lines with no `MOD` line ever
+     * declared are silently unreachable, exactly as before. */
+    if (cfg->modifier_src != -1) {
+        int hold = cfg->modifier_src;
+        cfg->target[hold] = TARGET_NONE;
+        for (int i = 0; i < n_sources(cfg); i++) {
+            if (!cfg->legacy_mod_set[i]) continue;
+            add_chord(cfg, hold, i, cfg->legacy_mod_target[i], path, lineno);
+        }
+    }
+
     clamp_touch_offset(cfg, path);
 }
 
@@ -507,19 +594,22 @@ static void load_profile(config_t *cfg, const char *name) {
 static void print_config(const config_t *cfg, FILE *out) {
     fprintf(out, "# effective dpadkeys config\n");
     if (cfg->device_match[0]) fprintf(out, "%-12s %s\n", "device.match", cfg->device_match);
-    /* semantic sources are always listed; raw ones exactly as they were given */
-    for (int i = 0; i < n_sources(cfg); i++) {
-        const char *tgt = (i == cfg->modifier_src) ? "MOD" : key_name(cfg->target[i]);
-        fprintf(out, "%-12s %s\n", source_name(cfg, i), tgt);
-    }
+    /* semantic sources are always listed; raw ones exactly as they were given.
+     * A source used as a hold prints its plain target here (NONE unless it
+     * also has its own binding) and its chords below in canonical
+     * `<hold>+<src>` form -- there is no more standalone "MOD" target. */
+    for (int i = 0; i < n_sources(cfg); i++)
+        fprintf(out, "%-12s %s\n", source_name(cfg, i), key_name(cfg->target[i]));
     fprintf(out, "%-12s %.2f\n", "deadzone", cfg->deadzone);
+    fprintf(out, "%-12s %d\n", "ls.invert_x", cfg->ls_invert_x ? 1 : 0);
     fprintf(out, "%-12s %d\n", "ls.invert_y", cfg->ls_invert_y ? 1 : 0);
+    fprintf(out, "%-12s %d\n", "rs.invert_x", cfg->rs_invert_x ? 1 : 0);
     fprintf(out, "%-12s %d\n", "rs.invert_y", cfg->rs_invert_y ? 1 : 0);
-    for (int i = 0; i < n_sources(cfg); i++) {
-        if (!cfg->mod_defined[i]) continue;
-        char name[48];
-        snprintf(name, sizeof(name), "mod+%s", source_name(cfg, i));
-        fprintf(out, "%-12s %s\n", name, key_name(cfg->mod_target[i]));
+    for (int i = 0; i < cfg->n_chords; i++) {
+        char name[80];
+        snprintf(name, sizeof(name), "%s+%s",
+                 source_name(cfg, cfg->chords[i].hold), source_name(cfg, cfg->chords[i].src));
+        fprintf(out, "%-12s %s\n", name, key_name(cfg->chords[i].target));
     }
     fprintf(out, "%-12s %d\n", "wheel_repeat_ms", cfg->wheel_repeat_ms);
     if (cfg->touch_offset_set)
@@ -574,10 +664,11 @@ static int open_uinput(const config_t *cfg) {
         return -1;
     }
     bool used[KEY_CNT] = {0};
-    for (int i = 0; i < n_sources(cfg); i++) {
+    for (int i = 0; i < n_sources(cfg); i++)
         if (cfg->target[i] >= 0 && cfg->target[i] < KEY_CNT) used[cfg->target[i]] = true;
-        if (cfg->mod_defined[i] && cfg->mod_target[i] >= 0 && cfg->mod_target[i] < KEY_CNT)
-            used[cfg->mod_target[i]] = true;
+    for (int i = 0; i < cfg->n_chords; i++) {
+        int t = cfg->chords[i].target;
+        if (t >= 0 && t < KEY_CNT) used[t] = true;
     }
     for (int c = 0; c < KEY_CNT; c++) {
         if (used[c] && ioctl(fd, UI_SET_KEYBIT, c) < 0) {
@@ -588,10 +679,10 @@ static int open_uinput(const config_t *cfg) {
     }
 
     bool uses_wheel = false;
-    for (int i = 0; i < n_sources(cfg); i++) {
+    for (int i = 0; i < n_sources(cfg); i++)
         if (target_is_wheel(cfg->target[i])) uses_wheel = true;
-        if (cfg->mod_defined[i] && target_is_wheel(cfg->mod_target[i])) uses_wheel = true;
-    }
+    for (int i = 0; i < cfg->n_chords; i++)
+        if (target_is_wheel(cfg->chords[i].target)) uses_wheel = true;
     if (uses_wheel) {
         if (ioctl(fd, UI_SET_EVBIT, EV_REL) < 0 ||
             ioctl(fd, UI_SET_RELBIT, REL_WHEEL) < 0 ||
@@ -681,23 +772,38 @@ static void apply_target_release(int target) {
     if (g_wheel_count[w] > 0) g_wheel_count[w]--;
 }
 
-/* Layer resolution happens at PRESS time and is cached in g_resolved_target so
- * RELEASE always targets the same key/wheel even if the modifier changed in
- * between (no stuck keys). Toggling the modifier itself never re-evaluates
- * sources that are already held. */
+/* Chord resolution for a source about to be pressed: among the chords whose
+ * `src` matches, pick the one whose `hold` is currently held, preferring
+ * whichever such hold was pressed most recently (g_source_press_seq); fall
+ * back to the source's own plain target, else NONE. A hold with no plain
+ * binding of its own therefore resolves to NONE when pressed alone -- it is
+ * "swallowed" simply because nothing set its target. */
+static int resolve_target(const config_t *cfg, int src) {
+    int best_target = TARGET_UNKNOWN;
+    long long best_seq = -1;
+    for (int i = 0; i < cfg->n_chords; i++) {
+        const chord_t *c = &cfg->chords[i];
+        if (c->src != src || !g_source_pressed[c->hold]) continue;
+        if (g_source_press_seq[c->hold] > best_seq) {
+            best_seq = g_source_press_seq[c->hold];
+            best_target = c->target;
+        }
+    }
+    if (best_target != TARGET_UNKNOWN) return best_target;
+    return cfg->target[src];
+}
+
+/* Chord/layer resolution happens at PRESS time and is cached in
+ * g_resolved_target so RELEASE always targets the same key/wheel even if the
+ * holds involved changed in between (no stuck keys). Releasing a hold does
+ * NOT release keys already down from a chord it enabled. */
 static void update_source(const config_t *cfg, int src, bool pressed) {
     if (g_source_pressed[src] == pressed) return;
     g_source_pressed[src] = pressed;
 
-    if (src == cfg->modifier_src) {
-        g_modifier_held = pressed;
-        if (g_verbose)
-            fprintf(stderr, "dpadkeys: %s -> %s (modifier)\n", source_name(cfg, src), pressed ? "down" : "up");
-        return;
-    }
-
     if (pressed) {
-        int target = (g_modifier_held && cfg->mod_defined[src]) ? cfg->mod_target[src] : cfg->target[src];
+        g_source_press_seq[src] = ++g_press_seq;
+        int target = resolve_target(cfg, src);
         g_resolved_target[src] = target;
         apply_target_press(target);
     } else {
@@ -818,11 +924,13 @@ static bool classify_trigger(int raw, const axis_t *a, double deadzone) {
  * then the angle picks one of eight 45-degree sectors; diagonal sectors press
  * two keys. A 4-degree hysteresis on sector boundaries avoids chatter. */
 static void handle_stick_2d(const config_t *cfg, const axis_t *ax, const axis_t *ay,
-                            int rx, int ry, bool *active, unsigned *dirs, double deadzone, bool invert_y,
+                            int rx, int ry, bool *active, unsigned *dirs, double deadzone,
+                            bool invert_x, bool invert_y,
                             source_id_t up, source_id_t down, source_id_t left, source_id_t right) {
     static const unsigned SECT[8] = { DIR_R, DIR_R|DIR_U, DIR_U, DIR_U|DIR_L,
                                       DIR_L, DIR_L|DIR_D, DIR_D, DIR_D|DIR_R };
     double nx = (rx - ax->center) / ax->half;
+    if (invert_x) nx = -nx;
     double ny = (ry - ay->center) / ay->half;
     if (invert_y) ny = -ny;
     double mag = sqrt(nx * nx + ny * ny);
@@ -1500,16 +1608,107 @@ static void print_usage(const char *argv0) {
             "usage: %s --config FILE [--grab] [--list] [--device auto|/dev/input/eventN] "
             "[--verbose] [--pidfile PATH] [--print-config] [--panic-chord none|m1+m2]\n"
             "       %s --profile fkeys|wasd [--grab] ...\n"
-            "       %s --learn [--learn-timeout-ms N] [--config FILE] [--device ...] [--pidfile PATH]\n",
+            "       %s --learn [--learn-timeout-ms N] [--learn-hold-ms N] [--config FILE] [--device ...] [--pidfile PATH]\n"
+            "\n"
+            "--learn reports a single press as \"learned <source>\", e.g. \"learned hat.up\".\n"
+            "Holding one button-like control (btn.*, hat.*, lt, rt, key.0x.., abs.0x..) and\n"
+            "then triggering another reports a chord, e.g. hold btn.thumbl and push the left\n"
+            "stick up -> \"learned btn.thumbl+ls.up\"; hold btn.tl and press hat up ->\n"
+            "\"learned btn.tl+hat.up\". --learn-hold-ms (default 150) is how long a lone\n"
+            "control must still be held, with nothing else pressed yet, before it is a\n"
+            "candidate hold for a later chord; release it first with nothing else having\n"
+            "happened and it is reported as a plain \"learned btn.thumbl\" instead.\n",
             argv0, argv0, argv0);
 }
 
 /* ---- learn mode ---- */
 
-/* Waits (pad ungrabbed) for the first press and prints `learned <source>`:
- * the semantic name when one exists, else key.0xNNN / abs.0xNN.neg|pos.
- * Returns 0 on success, 3 on timeout (`learned NONE`). */
-static int learn_mode(int fd, const axes_t *ax, long long timeout_ms) {
+/* Tracks which button-like controls (see source_can_be_hold()) are currently
+ * held during --learn, by canonical name, so a trigger can be prefixed by
+ * "the most recently pressed currently-held" one -- see learn_mode(). */
+#define LEARN_MAX_HELD 48
+typedef struct {
+    bool valid;
+    bool held;
+    long long since;
+    char name[48];
+} learn_held_t;
+
+static learn_held_t *learn_find(learn_held_t *tbl, int n, const char *name) {
+    for (int i = 0; i < n; i++)
+        if (tbl[i].valid && strcmp(tbl[i].name, name) == 0) return &tbl[i];
+    return NULL;
+}
+
+static learn_held_t *learn_find_or_add(learn_held_t *tbl, int n, const char *name) {
+    learn_held_t *e = learn_find(tbl, n, name);
+    if (e) return e;
+    for (int i = 0; i < n; i++) {
+        if (!tbl[i].valid) {
+            tbl[i].valid = true;
+            tbl[i].held = false;
+            snprintf(tbl[i].name, sizeof(tbl[i].name), "%s", name);
+            return &tbl[i];
+        }
+    }
+    return NULL; /* table full: vanishingly unlikely given real pads */
+}
+
+/* Most-recently-pressed control that is both currently held and has been
+ * held for at least `hold_ms` -- the "currently-held" hold a fresh trigger
+ * chords with. A too-recent hold doesn't count yet, so two controls pressed
+ * within hold_ms of each other read as near-simultaneous rather than a
+ * hold+trigger chord. */
+static learn_held_t *learn_best_hold(learn_held_t *tbl, int n, long long now, long long hold_ms) {
+    learn_held_t *best = NULL;
+    for (int i = 0; i < n; i++) {
+        if (!tbl[i].valid || !tbl[i].held) continue;
+        if (now - tbl[i].since < hold_ms) continue;
+        if (!best || tbl[i].since > best->since) best = &tbl[i];
+    }
+    return best;
+}
+
+static void learn_key_name(int code, char *out, size_t outsz) {
+    int sem = semantic_for_key(code);
+    if (sem >= 0) snprintf(out, outsz, "%s", SOURCE_NAMES[sem]);
+    else snprintf(out, outsz, "key.0x%x", (unsigned)code);
+}
+
+/* Name for a non-stick abs axis direction (hat, lt/rt, or a raw axis) --
+ * these are button-like/hold-eligible. Stick axes are named separately by
+ * learn_stick_name() and are never hold-eligible. */
+static void learn_abs_name(const axes_t *ax, int code, int sign, char *out, size_t outsz) {
+    int sem = semantic_for_abs(code, sign); /* hat only */
+    if (sem < 0) {
+        if (ax->lt.present && code == ax->lt.code && sign > 0) sem = SRC_LT;
+        else if (ax->rt.present && code == ax->rt.code && sign > 0) sem = SRC_RT;
+    }
+    if (sem >= 0) snprintf(out, outsz, "%s", SOURCE_NAMES[sem]);
+    else snprintf(out, outsz, "abs.0x%x.%s", (unsigned)code, sign < 0 ? "neg" : "pos");
+}
+
+static bool learn_is_stick_axis(const axes_t *ax, int code) {
+    return (ax->ls_x.present && code == ax->ls_x.code) || (ax->ls_y.present && code == ax->ls_y.code) ||
+           (ax->rs_x.present && code == ax->rs_x.code) || (ax->rs_y.present && code == ax->rs_y.code);
+}
+
+static void learn_stick_name(const axes_t *ax, int code, int sign, char *out, size_t outsz) {
+    int sem = -1;
+    if (ax->ls_x.present && code == ax->ls_x.code) sem = sign < 0 ? SRC_LS_LEFT : SRC_LS_RIGHT;
+    else if (ax->ls_y.present && code == ax->ls_y.code) sem = sign < 0 ? SRC_LS_UP : SRC_LS_DOWN;
+    else if (ax->rs_x.present && code == ax->rs_x.code) sem = sign < 0 ? SRC_RS_LEFT : SRC_RS_RIGHT;
+    else if (ax->rs_y.present && code == ax->rs_y.code) sem = sign < 0 ? SRC_RS_UP : SRC_RS_DOWN;
+    if (sem >= 0) snprintf(out, outsz, "%s", SOURCE_NAMES[sem]);
+    else snprintf(out, outsz, "abs.0x%x.%s", (unsigned)code, sign < 0 ? "neg" : "pos");
+}
+
+/* Waits (pad ungrabbed) for the first trigger and prints `learned <source>`
+ * or, if a button-like control (btn.*, hat.*, lt, rt, key.0x.., abs.0x..) was
+ * already held when the trigger happened, `learned <hold>+<source>` -- see
+ * print_usage() for examples and --learn-hold-ms. Returns 0 on success, 3 on
+ * timeout (`learned NONE`). */
+static int learn_mode(int fd, const axes_t *ax, long long timeout_ms, long long hold_ms) {
     /* Per-axis tri-state (-1/0/1) seeded from the CURRENT position so a
      * trigger resting at its minimum or an off-centre stick never counts as
      * a press; only a transition into the pressed zone does. */
@@ -1530,9 +1729,13 @@ static int learn_mode(int fd, const axes_t *ax, long long timeout_ms) {
         axes[c].state = v >= dz ? 1 : (v <= -dz ? -1 : 0);
     }
 
+    static learn_held_t held[LEARN_MAX_HELD];
+    memset(held, 0, sizeof(held));
+
     long long deadline = now_ms() + timeout_ms;
     struct pollfd pfd = { .fd = fd, .events = POLLIN };
-    char out[48] = {0};
+    char out[96] = {0};
+
     while (g_running && !out[0]) {
         long long now = now_ms();
         if (now >= deadline) break;
@@ -1545,37 +1748,68 @@ static int learn_mode(int fd, const axes_t *ax, long long timeout_ms) {
             if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
             break; /* ENODEV etc. */
         }
+        now = now_ms();
+
         if (ev.type == EV_KEY) {
-            if (ev.value != 1) continue; /* release / autorepeat */
-            int sem = semantic_for_key(ev.code);
-            if (sem >= 0) snprintf(out, sizeof(out), "%s", SOURCE_NAMES[sem]);
-            else snprintf(out, sizeof(out), "key.0x%x", (unsigned)ev.code);
-        } else if (ev.type == EV_ABS && ev.code < ABS_CNT && axes[ev.code].known) {
-            double v = (ev.value - axes[ev.code].center) / axes[ev.code].half;
-            int st = axes[ev.code].state;
-            int ns = st == 1 ? (v >= dz - 0.1 ? 1 : 0)
-                   : st == -1 ? (v <= -(dz - 0.1) ? -1 : 0)
-                   : (v >= dz ? 1 : (v <= -dz ? -1 : 0));
-            if (ns == st) continue;
-            axes[ev.code].state = ns;
-            if (ns == 0) continue; /* return to centre is a release */
-            int sem = semantic_for_abs(ev.code, ns);
-            if (sem < 0) {
-                if (ax->ls_x.present && ax->ls_y.present && ev.code == ax->ls_x.code)
-                    sem = ns < 0 ? SRC_LS_LEFT : SRC_LS_RIGHT;
-                else if (ax->ls_x.present && ax->ls_y.present && ev.code == ax->ls_y.code)
-                    sem = ns < 0 ? SRC_LS_UP : SRC_LS_DOWN;
-                else if (ax->rs_x.present && ax->rs_y.present && ev.code == ax->rs_x.code)
-                    sem = ns < 0 ? SRC_RS_LEFT : SRC_RS_RIGHT;
-                else if (ax->rs_x.present && ax->rs_y.present && ev.code == ax->rs_y.code)
-                    sem = ns < 0 ? SRC_RS_UP : SRC_RS_DOWN;
-                else if (ax->lt.present && ev.code == ax->lt.code && ns > 0)
-                    sem = SRC_LT;
-                else if (ax->rt.present && ev.code == ax->rt.code && ns > 0)
-                    sem = SRC_RT;
+            if (ev.value == 2) continue; /* autorepeat */
+            char name[48];
+            learn_key_name(ev.code, name, sizeof(name));
+            if (ev.value == 1) {
+                learn_held_t *best = learn_best_hold(held, LEARN_MAX_HELD, now, hold_ms);
+                if (best) { snprintf(out, sizeof(out), "%s+%s", best->name, name); break; }
+                learn_held_t *e = learn_find_or_add(held, LEARN_MAX_HELD, name);
+                if (e) { e->held = true; e->since = now; }
+            } else {
+                learn_held_t *e = learn_find(held, LEARN_MAX_HELD, name);
+                if (e) e->held = false;
+                if (!out[0]) { snprintf(out, sizeof(out), "%s", name); break; }
             }
-            if (sem >= 0) snprintf(out, sizeof(out), "%s", SOURCE_NAMES[sem]);
-            else snprintf(out, sizeof(out), "abs.0x%x.%s", (unsigned)ev.code, ns < 0 ? "neg" : "pos");
+            continue;
+        }
+
+        if (ev.type != EV_ABS || ev.code >= ABS_CNT || !axes[ev.code].known) continue;
+        double v = (ev.value - axes[ev.code].center) / axes[ev.code].half;
+        int st = axes[ev.code].state;
+        int ns = st == 1 ? (v >= dz - 0.1 ? 1 : 0)
+               : st == -1 ? (v <= -(dz - 0.1) ? -1 : 0)
+               : (v >= dz ? 1 : (v <= -dz ? -1 : 0));
+        if (ns == st) continue;
+        axes[ev.code].state = ns;
+
+        if (learn_is_stick_axis(ax, ev.code)) {
+            /* stick directions are never hold-eligible: a release is not a
+             * trigger, and a fresh press is a trigger with no press/release
+             * bookkeeping of its own. */
+            if (ns == 0) continue;
+            char name[48];
+            learn_stick_name(ax, ev.code, ns, name, sizeof(name));
+            learn_held_t *best = learn_best_hold(held, LEARN_MAX_HELD, now, hold_ms);
+            if (best) snprintf(out, sizeof(out), "%s+%s", best->name, name);
+            else snprintf(out, sizeof(out), "%s", name);
+            break;
+        }
+
+        /* hat / trigger / raw abs axis: button-like, so track press+release
+         * like an EV_KEY control. A direct sign flip (-1 <-> 1, e.g. a hat
+         * snapping past centre in one event) is a release of the old
+         * direction followed by a press of the new one. */
+        if (st != 0) {
+            char name[48];
+            learn_abs_name(ax, ev.code, st, name, sizeof(name));
+            learn_held_t *e = learn_find(held, LEARN_MAX_HELD, name);
+            if (e) e->held = false;
+            /* A pure release (back to centre) may itself be the plain report;
+             * a direct sign flip (st and ns both nonzero) falls through to
+             * report the new direction's press instead. */
+            if (ns == 0 && !out[0]) { snprintf(out, sizeof(out), "%s", name); break; }
+        }
+        if (ns != 0) {
+            char name[48];
+            learn_abs_name(ax, ev.code, ns, name, sizeof(name));
+            learn_held_t *best = learn_best_hold(held, LEARN_MAX_HELD, now, hold_ms);
+            if (best) { snprintf(out, sizeof(out), "%s+%s", best->name, name); break; }
+            learn_held_t *e = learn_find_or_add(held, LEARN_MAX_HELD, name);
+            if (e) { e->held = true; e->since = now; }
         }
     }
     if (!out[0]) {
@@ -1625,6 +1859,7 @@ int main(int argc, char **argv) {
     bool print_config_flag = false;
     bool do_learn = false;
     long long learn_timeout_ms = 15000;
+    long long learn_hold_ms = 150;
     const char *device_override = NULL;
     const char *pidfile = NULL;
 
@@ -1640,6 +1875,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--print-config") == 0) print_config_flag = true;
         else if (strcmp(argv[i], "--learn") == 0) do_learn = true;
         else if (strcmp(argv[i], "--learn-timeout-ms") == 0 && i + 1 < argc) learn_timeout_ms = atoll(argv[++i]);
+        else if (strcmp(argv[i], "--learn-hold-ms") == 0 && i + 1 < argc) learn_hold_ms = atoll(argv[++i]);
         else if (strcmp(argv[i], "--panic-chord") == 0 && i + 1 < argc) {
             const char *v = argv[++i];
             if (strcmp(v, "none") == 0) g_panic_chord = PANIC_CHORD_NONE;
@@ -1744,7 +1980,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "dpadkeys: learn pad=%s name=\"%s\" vid=0x%04x pid=0x%04x timeout=%lldms\n",
                 pad_path, pad_name, vendor, product, learn_timeout_ms);
         long long remaining = find_deadline - now_ms();
-        int rc = learn_mode(g_pad_fd, &ax, remaining > 0 ? remaining : 0);
+        int rc = learn_mode(g_pad_fd, &ax, remaining > 0 ? remaining : 0, learn_hold_ms);
         close(g_pad_fd);
         if (pidfile) unlink(pidfile);
         return rc;
@@ -2021,12 +2257,14 @@ int main(int argc, char **argv) {
                        (ev.code == ax.ls_x.code || ev.code == ax.ls_y.code)) {
                 if (ev.code == ax.ls_x.code) ax.ls_rx = ev.value; else ax.ls_ry = ev.value;
                 handle_stick_2d(&cfg, &ax.ls_x, &ax.ls_y, ax.ls_rx, ax.ls_ry, &ax.ls_active, &ax.ls_dirs,
-                                cfg.deadzone, cfg.ls_invert_y, SRC_LS_UP, SRC_LS_DOWN, SRC_LS_LEFT, SRC_LS_RIGHT);
+                                cfg.deadzone, cfg.ls_invert_x, cfg.ls_invert_y,
+                                SRC_LS_UP, SRC_LS_DOWN, SRC_LS_LEFT, SRC_LS_RIGHT);
             } else if (ax.rs_x.present && ax.rs_y.present &&
                        (ev.code == ax.rs_x.code || ev.code == ax.rs_y.code)) {
                 if (ev.code == ax.rs_x.code) ax.rs_rx = ev.value; else ax.rs_ry = ev.value;
                 handle_stick_2d(&cfg, &ax.rs_x, &ax.rs_y, ax.rs_rx, ax.rs_ry, &ax.rs_active, &ax.rs_dirs,
-                                cfg.deadzone, cfg.rs_invert_y, SRC_RS_UP, SRC_RS_DOWN, SRC_RS_LEFT, SRC_RS_RIGHT);
+                                cfg.deadzone, cfg.rs_invert_x, cfg.rs_invert_y,
+                                SRC_RS_UP, SRC_RS_DOWN, SRC_RS_LEFT, SRC_RS_RIGHT);
             } else if (ax.lt.present && ev.code == ax.lt.code) {
                 handle_trigger_axis(&cfg, &ax.lt, ev.value, SRC_LT, cfg.deadzone);
             } else if (ax.rt.present && ev.code == ax.rt.code) {

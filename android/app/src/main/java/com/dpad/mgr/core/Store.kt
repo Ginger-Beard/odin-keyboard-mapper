@@ -27,8 +27,20 @@ object Store {
             Log.w(TAG, "store: failed to read ${file.path}: $e; using defaults")
             AppData()
         }.let { d -> if (d.profiles.isEmpty()) d.copy(profiles = Profile.DEFAULTS) else d }
-            .let { d -> d.copy(profiles = d.profiles.map(::clampOffsets)) }
+            .let { d -> d.copy(profiles = d.profiles.map(::migrateModifier).map(::clampOffsets)) }
         loaded = true
+    }
+
+    /**
+     * Migrates the deprecated `modifier` / `modBindings` fields (old `btn.X MOD` / `mod+src`
+     * config syntax) into chord entries (`<modifier>+<src>`) in [Profile.map], then clears them.
+     * No code path writes modifier/modBindings after this runs.
+     */
+    private fun migrateModifier(p: Profile): Profile {
+        val m = p.modifier ?: return if (p.modBindings.isEmpty()) p else p.copy(modBindings = emptyMap())
+        val merged = p.map.toMutableMap()
+        for ((src, target) in p.modBindings) merged["$m+$src"] = target
+        return p.copy(map = merged, modifier = null, modBindings = emptyMap())
     }
 
     /** Hard clamp on touchDx/touchDy (Calibration.MAX_OFFSET); applied on load and on every save. */

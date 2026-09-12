@@ -55,8 +55,33 @@ object Sources {
 /** Source-name validation and labelling for both semantic (`hat.up`) and raw (`key.0x130`, `abs.0x12.pos`) names. */
 object SourceNames {
     val RAW = Regex("^(key\\.0x[0-9a-fA-F]{1,3}|abs\\.0x[0-9a-fA-F]{1,2}\\.(neg|pos))$")
-    fun isValid(id: String): Boolean = id in Sources.IDS || RAW.matches(id)
-    fun label(id: String): String = Sources.ALL.firstOrNull { it.id == id }?.label ?: id
+
+    /** Button-like sources that may act as a chord's hold control: btn.*, key.0x…, hat.*, lt, rt. */
+    private val HOLD = Regex("^(btn\\.[a-zA-Z0-9_]+|key\\.0x[0-9a-fA-F]{1,3}|hat\\.(up|down|left|right)|lt|rt)$")
+
+    /** True if [id] is a chord (`<hold>+<src>`). */
+    fun isChord(id: String): Boolean = id.indexOf('+') >= 0
+
+    private fun isPlainValid(id: String): Boolean = id in Sources.IDS || RAW.matches(id)
+
+    fun isValid(id: String): Boolean {
+        val plus = id.indexOf('+')
+        if (plus < 0) return isPlainValid(id)
+        val hold = id.substring(0, plus)
+        val rest = id.substring(plus + 1)
+        return HOLD.matches(hold) && !isChord(rest) && isPlainValid(rest)
+    }
+
+    private fun plainLabel(id: String): String = Sources.ALL.firstOrNull { it.id == id }?.label ?: id
+
+    /** Chords render as "Hold <hold label> + <src label>"; everything else as its plain label. */
+    fun label(id: String): String {
+        val plus = id.indexOf('+')
+        if (plus < 0) return plainLabel(id)
+        val hold = id.substring(0, plus)
+        val rest = id.substring(plus + 1)
+        return "Hold ${plainLabel(hold)} + ${plainLabel(rest)}"
+    }
 }
 
 /** A key the user can pick: UI label <-> daemon KEY_ name. */
@@ -97,14 +122,19 @@ object Keys {
 @Serializable
 data class Profile(
     val name: String,
-    /** source id -> KEY_* name or "NONE". Missing entries mean NONE. */
+    /** source id (plain or `<hold>+<src>` chord) -> KEY_* name or "NONE". Missing entries mean NONE. */
     val map: Map<String, String> = emptyMap(),
     val deadzone: Float = 0.5f,
     val lsInvertY: Boolean = false,
     val rsInvertY: Boolean = false,
-    /** source id of the control that acts as the modifier, or null for none. */
+    val lsInvertX: Boolean = false,
+    val rsInvertX: Boolean = false,
+    /**
+     * Deprecated pre-chord modifier fields. Kept only so old stored JSON still deserializes;
+     * [Store] migrates them into [map] as `<modifier>+<src>` chords on load and clears them.
+     * Never populated by any code path after that.
+     */
     val modifier: String? = null,
-    /** source id -> KEY_ name, WHEEL_ target, or "NONE"; active only while [modifier] is held. Missing entries fall through to [map]. */
     val modBindings: Map<String, String> = emptyMap(),
     val wheelRepeatMs: Int = 120,
     /** Stylus/touch offset, calibrated via CalibrateActivity. Panel units (natural/portrait orientation). */
@@ -114,65 +144,40 @@ data class Profile(
 ) {
     fun key(source: String): String = map[source] ?: Keys.NONE
 
-    /** True if any binding (base layer or the mod+ layer) targets a scroll-wheel key. */
+    /** True if any binding targets a scroll-wheel key. */
     fun usesWheel(): Boolean {
         val wheelTargets = setOf("WHEEL_UP", "WHEEL_DOWN", "HWHEEL_LEFT", "HWHEEL_RIGHT")
-        return map.values.any { it in wheelTargets } || modBindings.values.any { it in wheelTargets }
+        return map.values.any { it in wheelTargets }
     }
 
-    // ---- key-first accessors (base layer) ----
+    // ---- key-first accessors ----
 
-    /** Sources bound to [key] in the base layer, Sources.ALL order then raw names alphabetically. */
+    /** Sources (plain or chord) bound to [key], Sources.ALL order then raw/chord names alphabetically. */
     fun sourcesFor(key: String): List<String> =
-        map.filterValues { it == key }.keys.filter { it != modifier }.sortedWith(Sources.comparator)
+        map.filterValues { it == key }.keys.sortedWith(Sources.comparator)
 
     /** Binds [src] to [key]; a source maps to exactly one key, so any previous binding of [src] is replaced. */
-    fun bind(src: String, key: String): Profile =
-        copy(map = map + (src to key), modifier = if (src == modifier) null else modifier)
+    fun bind(src: String, key: String): Profile = copy(map = map + (src to key))
 
     fun unbind(src: String): Profile = copy(map = map - src)
 
-    // ---- key-first accessors (modifier layer) ----
-
-    fun modSourcesFor(key: String): List<String> =
-        modBindings.filterValues { it == key }.keys.filter { it != modifier }.sortedWith(Sources.comparator)
-
-    fun bindMod(src: String, key: String): Profile =
-        copy(modBindings = modBindings + (src to key), modifier = if (src == modifier) null else modifier)
-
-    fun unbindMod(src: String): Profile = copy(modBindings = modBindings - src)
-
-    /** Sets the modifier control; that source can no longer carry a key in either layer. */
-    fun withModifier(src: String?): Profile =
-        copy(modifier = src, map = if (src == null) map else map - src, modBindings = if (src == null) modBindings else modBindings - src)
-
     private fun keyOrNone(k: String?): String = if (k != null && Keys.isValid(k)) k else Keys.NONE
 
-    /** Exact daemon config text: source/target lines (semantic then raw, as stored), deadzone, invert flags, mod+ layer, wheel repeat. */
+    /** Exact daemon config text: source/target lines (semantic then raw/chord, as stored), deadzone, invert flags, wheel repeat. */
     fun toConfigText(): String = buildString {
         append("# generated by Odin DPad Keys for profile \"").append(name.replace('\n', ' ')).append("\"\n")
         for (s in Sources.ALL) {
-            val tgt = if (s.id == modifier) "MOD" else keyOrNone(map[s.id])
-            append(s.id).append(' ').append(tgt).append('\n')
+            append(s.id).append(' ').append(keyOrNone(map[s.id])).append('\n')
         }
-        val rawSources = map.keys.filter { it !in Sources.IDS && SourceNames.RAW.matches(it) }.sorted()
-        for (src in rawSources) {
-            val tgt = if (src == modifier) "MOD" else keyOrNone(map[src])
-            append(src).append(' ').append(tgt).append('\n')
-        }
-        val m = modifier
-        if (m != null && m !in Sources.IDS && m !in rawSources && SourceNames.RAW.matches(m)) {
-            append(m).append(" MOD\n")
+        val extra = map.keys.filter { it !in Sources.IDS && SourceNames.isValid(it) }.sortedWith(Sources.comparator)
+        for (src in extra) {
+            append(src).append(' ').append(keyOrNone(map[src])).append('\n')
         }
         append("deadzone ").append(String.format(java.util.Locale.ROOT, "%.2f", deadzone.coerceIn(0.2f, 0.8f))).append('\n')
         append("ls.invert_y ").append(if (lsInvertY) 1 else 0).append('\n')
+        append("ls.invert_x ").append(if (lsInvertX) 1 else 0).append('\n')
         append("rs.invert_y ").append(if (rsInvertY) 1 else 0).append('\n')
-        if (m != null) {
-            for ((src, k) in modBindings.entries.sortedWith(compareBy(Sources.comparator) { it.key })) {
-                if (src == m || !SourceNames.isValid(src)) continue
-                append("mod+").append(src).append(' ').append(keyOrNone(k)).append('\n')
-            }
-        }
+        append("rs.invert_x ").append(if (rsInvertX) 1 else 0).append('\n')
         append("wheel_repeat_ms ").append(wheelRepeatMs.coerceIn(60, 400)).append('\n')
         if (touchOffsetEnabled) {
             append("touch.offset ").append(touchDx).append(' ').append(touchDy).append('\n')
@@ -185,14 +190,11 @@ data class Profile(
             map = mapOf(
                 "hat.up" to "KEY_F1", "hat.down" to "KEY_F2", "hat.left" to "KEY_F3", "hat.right" to "KEY_F4",
                 "ls.up" to "KEY_UP", "ls.down" to "KEY_DOWN", "ls.left" to "KEY_LEFT", "ls.right" to "KEY_RIGHT",
+                "btn.thumbl+ls.up" to "WHEEL_UP", "btn.thumbl+ls.down" to "WHEEL_DOWN",
+                "btn.thumbl+ls.left" to Keys.NONE, "btn.thumbl+ls.right" to Keys.NONE,
             ),
             deadzone = 0.5f,
             lsInvertY = true,
-            modifier = "btn.thumbl",
-            modBindings = mapOf(
-                "ls.up" to "WHEEL_UP", "ls.down" to "WHEEL_DOWN",
-                "ls.left" to "NONE", "ls.right" to "NONE",
-            ),
             wheelRepeatMs = 120,
         )
         val WASD = Profile(
