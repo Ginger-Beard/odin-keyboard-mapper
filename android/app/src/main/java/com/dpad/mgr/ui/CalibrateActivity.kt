@@ -1,6 +1,8 @@
 package com.dpad.mgr.ui
 
 import android.app.Activity
+import android.graphics.Color as AndroidColor
+import android.graphics.Paint as AndroidPaint
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -14,6 +16,8 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.Button
@@ -31,10 +35,13 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
@@ -50,6 +57,7 @@ import com.dpad.mgr.core.Store
 import com.dpad.mgr.svc.DpadService
 import kotlinx.coroutines.delay
 import kotlin.math.hypot
+import kotlin.math.roundToInt
 
 /**
  * Calibrates the stylus/touch offset for one profile: step 1 ("drag to align") shows one target
@@ -65,7 +73,7 @@ import kotlin.math.hypot
  * Safety: the verify step (step 2) is confirm-or-revert. The profile's touch offset as it stood
  * BEFORE this calibration session ("previous") is remembered as soon as verify starts. Unless the
  * user explicitly taps "Keep", the offset reverts to that previous value -- either automatically
- * after a 20s countdown, or when the screen is left any other way (Back/Home -> onStop).
+ * after a 45s countdown, or when the screen is left any other way (Back/Home -> onStop).
  */
 class CalibrateActivity : ComponentActivity() {
     private var profileName: String = ""
@@ -131,11 +139,18 @@ class CalibrateActivity : ComponentActivity() {
     companion object {
         private const val TAG = "DpadMgr"
         const val EXTRA_PROFILE = "profile"
-        const val VERIFY_COUNTDOWN_S = 20
+        const val VERIFY_COUNTDOWN_S = 45
     }
 }
 
 private enum class Phase { DRAG, RESULT, VERIFY }
+
+/** One verify-phase touch: [pos] is the corrected touch position (local canvas px, updated live
+ *  while dragging), [target] is the nearest verify-grid target, [residual] is target-pos in px. */
+private data class VerifyMarker(val pos: Offset, val target: Offset, val residual: Offset)
+
+private fun nearestTarget(p: Offset, targets: List<Offset>): Offset =
+    targets.minByOrNull { (it - p).getDistance() } ?: p
 
 @Composable
 private fun CalibrateScreen(
@@ -183,16 +198,22 @@ private fun CalibrateScreen(
     var resultDx by remember { mutableIntStateOf(0) }
     var resultDy by remember { mutableIntStateOf(0) }
     var spreadPx by remember { mutableStateOf(0f) }
-    var verifyTap by remember { mutableStateOf<Offset?>(null) } // window coords
-    var residual by remember { mutableStateOf<Offset?>(null) }
+
+    // Verify phase: every touch leaves a marker (local canvas coords), capped at 30 oldest-dropped.
+    var markers by remember { mutableStateOf(listOf<VerifyMarker>()) }
+    var dragTrail by remember { mutableStateOf(listOf<Offset>()) } // local coords, in-progress drag only
+    var liveDragPos by remember { mutableStateOf<Offset?>(null) } // local coords, live crosshair while dragging
+    var lastResidualVerify by remember { mutableStateOf<Offset?>(null) }
+    val markerLabelPaint = remember {
+        AndroidPaint().apply {
+            color = AndroidColor.WHITE
+            textSize = 30f
+            isAntiAlias = true
+        }
+    }
 
     var kept by remember { mutableStateOf(false) }
     var countdown by remember { mutableIntStateOf(CalibrateActivity.VERIFY_COUNTDOWN_S) }
-
-    val dotCenter = Offset(
-        boxSize.width / 2f + viewOffsetX,
-        boxSize.height / 2f + viewOffsetY,
-    )
 
     // The five positions the drag-align dot cycles through, in canvas-local and window (screen)
     // coordinates. Corners are inset 12% of the window width/height from their respective edges.
@@ -206,6 +227,10 @@ private fun CalibrateScreen(
         Offset(boxSize.width - insetX, boxSize.height - insetY),
     )
     val targetsScreen = targetsLocal.map { Offset(it.x + viewOffsetX, it.y + viewOffsetY) }
+
+    // Verify phase: a 3x3 grid of targets at 15/50/85% of width and height, in local canvas coords.
+    val verifyGridFracs = listOf(0.15f, 0.5f, 0.85f)
+    val targetsVerifyLocal = verifyGridFracs.flatMap { fy -> verifyGridFracs.map { fx -> Offset(boxSize.width * fx, boxSize.height * fy) } }
 
     fun currentProfile() = data.profile(profileName)
 
@@ -230,13 +255,10 @@ private fun CalibrateScreen(
         dragP0 = null
         dragRaw = null
         lastResidual = null
-        verifyTap = null
-        residual = null
-    }
-
-    fun handleVerifyTap(sx: Float, sy: Float) {
-        verifyTap = Offset(sx, sy)
-        residual = Offset(dotCenter.x - sx, dotCenter.y - sy)
+        markers = emptyList()
+        dragTrail = emptyList()
+        liveDragPos = null
+        lastResidualVerify = null
     }
 
     // Starts the verify test run once, the moment this phase is entered, and remembers the
@@ -245,6 +267,10 @@ private fun CalibrateScreen(
         if (phase == Phase.VERIFY) {
             countdown = CalibrateActivity.VERIFY_COUNTDOWN_S
             kept = false
+            markers = emptyList()
+            dragTrail = emptyList()
+            liveDragPos = null
+            lastResidualVerify = null
             DpadService.send(ctx, DpadService.ACTION_TEST, profile = profileName, seconds = 0)
             onVerifyStarted(previous)
         }
@@ -300,8 +326,35 @@ private fun CalibrateScreen(
                         }
                     }
                     Phase.VERIFY -> awaitEachGesture {
+                        // ACTION_DOWN immediately drops a marker at the (already offset-corrected)
+                        // touch position; while held, the same marker follows the finger (live
+                        // crosshair + drag trail) and its position is finalized on ACTION_UP. Taps
+                        // never touch the countdown/kept state -- only nudges and Clear marks do.
                         val down = awaitFirstDown(requireUnconsumed = false)
-                        handleVerifyTap(down.position.x + viewOffsetX, down.position.y + viewOffsetY)
+                        val downTarget = nearestTarget(down.position, targetsVerifyLocal)
+                        val downResidual = Offset(downTarget.x - down.position.x, downTarget.y - down.position.y)
+                        markers = (markers + VerifyMarker(down.position, downTarget, downResidual))
+                            .let { if (it.size > 30) it.takeLast(30) else it }
+                        lastResidualVerify = downResidual
+                        dragTrail = listOf(down.position)
+                        liveDragPos = down.position
+                        val id = down.id
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val change = event.changes.firstOrNull { it.id == id } ?: break
+                            val t = nearestTarget(change.position, targetsVerifyLocal)
+                            val r = Offset(t.x - change.position.x, t.y - change.position.y)
+                            markers = markers.dropLast(1) + VerifyMarker(change.position, t, r)
+                            lastResidualVerify = r
+                            if (change.pressed) {
+                                dragTrail = (dragTrail + change.position).let { if (it.size > 300) it.takeLast(300) else it }
+                                liveDragPos = change.position
+                            } else {
+                                dragTrail = emptyList()
+                                liveDragPos = null
+                                break
+                            }
+                        }
                     }
                     else -> {}
                 }
@@ -321,13 +374,37 @@ private fun CalibrateScreen(
                     }
                 }
                 Phase.VERIFY -> {
-                    val center = Offset(size.width / 2f, size.height / 2f)
-                    drawCircle(color = Color.Red, radius = 6.dp.toPx(), center = center)
-                    verifyTap?.let { t ->
-                        val p = Offset(t.x - viewOffsetX, t.y - viewOffsetY)
-                        val len = 14.dp.toPx()
-                        drawLine(Color.Green, Offset(p.x - len, p.y), Offset(p.x + len, p.y), strokeWidth = 3f)
-                        drawLine(Color.Green, Offset(p.x, p.y - len), Offset(p.x, p.y + len), strokeWidth = 3f)
+                    val dotR = 2.dp.toPx()
+                    val ringR = 8.dp.toPx()
+                    val ringStroke = Stroke(width = 1.5.dp.toPx())
+                    val centerIdx = targetsVerifyLocal.size / 2
+                    targetsVerifyLocal.forEachIndexed { i, t ->
+                        val scale = if (i == centerIdx) 1.4f else 1f
+                        drawCircle(color = Color.White.copy(alpha = 0.35f), radius = ringR * scale, center = t, style = ringStroke)
+                        drawCircle(color = Color.Red, radius = dotR * scale, center = t)
+                    }
+                    if (dragTrail.size >= 2) {
+                        val path = Path().apply {
+                            moveTo(dragTrail.first().x, dragTrail.first().y)
+                            dragTrail.drop(1).forEach { lineTo(it.x, it.y) }
+                        }
+                        drawPath(path, color = Color.Yellow.copy(alpha = 0.8f), style = Stroke(width = 3f))
+                    }
+                    val armLen = 5.dp.toPx()
+                    markers.forEach { m ->
+                        drawLine(Color.White.copy(alpha = 0.4f), m.pos, m.target, strokeWidth = 1.5f)
+                        drawLine(Color.Cyan, Offset(m.pos.x - armLen, m.pos.y), Offset(m.pos.x + armLen, m.pos.y), strokeWidth = 3f)
+                        drawLine(Color.Cyan, Offset(m.pos.x, m.pos.y - armLen), Offset(m.pos.x, m.pos.y + armLen), strokeWidth = 3f)
+                        drawContext.canvas.nativeCanvas.drawText(
+                            "${m.residual.x.roundToInt()}, ${m.residual.y.roundToInt()}",
+                            m.pos.x + armLen + 4.dp.toPx(),
+                            m.pos.y - 4.dp.toPx(),
+                            markerLabelPaint,
+                        )
+                    }
+                    liveDragPos?.let { p ->
+                        drawLine(Color.Green, Offset(p.x - armLen, p.y), Offset(p.x + armLen, p.y), strokeWidth = 3f)
+                        drawLine(Color.Green, Offset(p.x, p.y - armLen), Offset(p.x, p.y + armLen), strokeWidth = 3f)
                     }
                 }
                 else -> {}
@@ -379,37 +456,34 @@ private fun CalibrateScreen(
                     Button(onClick = { phase = Phase.VERIFY }) { Text("Continue to verify") }
                 }
                 Phase.VERIFY -> {
-                    Text("Step 2: verify — tap the dot again", color = Color.White)
+                    Text(
+                        "Tap or drag anywhere. Marks show where touches land after the offset. " +
+                            "Nudge until marks sit on the targets, then Keep.",
+                        color = Color.White,
+                    )
                     val live = currentProfile()
-                    Text("Offset: dx=${live?.touchDx ?: 0}, dy=${live?.touchDy ?: 0} (panel units)", color = Color.White)
-                    residual?.let { r ->
-                        Text("Residual: ${"%.1f".format(r.x)}, ${"%.1f".format(r.y)} px", color = Color.White)
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        NudgeButton("X-1") { nudge(ctx, profileName, data, -1f, 0f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
-                        NudgeButton("X+1") { nudge(ctx, profileName, data, 1f, 0f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
-                        NudgeButton("Y-1") { nudge(ctx, profileName, data, 0f, -1f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
-                        NudgeButton("Y+1") { nudge(ctx, profileName, data, 0f, 1f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        OutlinedButton(onClick = {
-                            saveOffset(resultDx, resultDy, liveUpdate = true)
-                            countdown = CalibrateActivity.VERIFY_COUNTDOWN_S
-                            kept = false
-                        }) { Text("Reset") }
-                        Button(enabled = kept, onClick = onDone) { Text("Done") }
-                    }
-                    if (!kept) {
-                        Button(
-                            onClick = { kept = true; onKeep() },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
-                        ) { Text("Keep these settings ($countdown)") }
-                        Text(
-                            "Unconfirmed — reverts automatically if you don't tap Keep.",
-                            color = Color.Yellow, style = MaterialTheme.typography.bodySmall,
-                        )
-                    } else {
-                        Text("Kept. Tap Done to finish.", color = Color.Green, style = MaterialTheme.typography.bodyMedium)
+                    Column(
+                        Modifier.background(Color.Black.copy(alpha = 0.55f)).padding(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        Text("Offset: dx=${live?.touchDx ?: 0}, dy=${live?.touchDy ?: 0} (panel units)", color = Color.White, style = MaterialTheme.typography.bodySmall)
+                        lastResidualVerify?.let { r ->
+                            Text("Last residual: ${r.x.roundToInt()}, ${r.y.roundToInt()} px", color = Color.White, style = MaterialTheme.typography.bodySmall)
+                        }
+                        if (markers.isNotEmpty()) {
+                            val meanR = markers.map { hypot(it.residual.x.toDouble(), it.residual.y.toDouble()) }.average()
+                            Text("Mean residual: ${"%.1f".format(meanR)} px", color = Color.White, style = MaterialTheme.typography.bodySmall)
+                        }
+                        Text("Samples: ${markers.size}", color = Color.White, style = MaterialTheme.typography.bodySmall)
+                        OutlinedButton(
+                            modifier = Modifier.heightIn(min = 48.dp),
+                            onClick = {
+                                markers = emptyList()
+                                lastResidualVerify = null
+                                countdown = CalibrateActivity.VERIFY_COUNTDOWN_S
+                                kept = false
+                            },
+                        ) { Text("Clear marks") }
                     }
                 }
             }
@@ -425,12 +499,55 @@ private fun CalibrateScreen(
                 }
             }
         }
+
+        // Bottom-edge button bar for VERIFY so buttons never cover the target grid.
+        if (phase == Phase.VERIFY) {
+            Column(
+                Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .background(Color.Black.copy(alpha = 0.55f))
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    NudgeButton("X-1") { nudge(ctx, profileName, data, -1f, 0f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
+                    NudgeButton("X+1") { nudge(ctx, profileName, data, 1f, 0f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
+                    NudgeButton("Y-1") { nudge(ctx, profileName, data, 0f, -1f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
+                    NudgeButton("Y+1") { nudge(ctx, profileName, data, 0f, 1f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OutlinedButton(
+                        modifier = Modifier.heightIn(min = 48.dp),
+                        onClick = {
+                            saveOffset(resultDx, resultDy, liveUpdate = true)
+                            countdown = CalibrateActivity.VERIFY_COUNTDOWN_S
+                            kept = false
+                        },
+                    ) { Text("Reset") }
+                    Button(modifier = Modifier.heightIn(min = 48.dp), enabled = kept, onClick = onDone) { Text("Done") }
+                }
+                if (!kept) {
+                    Button(
+                        modifier = Modifier.heightIn(min = 48.dp).fillMaxWidth(),
+                        onClick = { kept = true; onKeep() },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
+                    ) { Text("Keep these settings ($countdown)") }
+                    Text(
+                        "Unconfirmed — reverts automatically if you don't tap Keep.",
+                        color = Color.Yellow, style = MaterialTheme.typography.bodySmall,
+                    )
+                } else {
+                    Text("Kept. Tap Done to finish.", color = Color.Green, style = MaterialTheme.typography.bodyMedium)
+                }
+            }
+        }
     }
 }
 
 @Composable
 private fun NudgeButton(label: String, onClick: () -> Unit) {
-    OutlinedButton(onClick = onClick) { Text(label) }
+    OutlinedButton(modifier = Modifier.heightIn(min = 48.dp), onClick = onClick) { Text(label) }
 }
 
 private fun nudge(
