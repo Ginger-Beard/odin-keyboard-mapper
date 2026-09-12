@@ -38,6 +38,10 @@ class DpadService : Service() {
     private lateinit var watcher: ForegroundWatcher
     private lateinit var supervisor: Supervisor
     private val probeMutex = Mutex()
+    /** The privileged shell instance the watcher is currently tailing for, or null. Used to
+     *  avoid restarting the tail (and leaking a logcat process) on every re-check when the
+     *  same privilege is still held. */
+    private var watcherStartedFor: com.dpad.mgr.priv.PrivShell? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -88,6 +92,7 @@ class DpadService : Service() {
                 scope.launch {
                     supervisor.stop()
                     watcher.stop()
+                    watcherStartedFor = null
                     stopSelf()
                 }
             }
@@ -102,9 +107,16 @@ class DpadService : Service() {
         if (shell != null) {
             val bin = installer.resolve(shell, force = why == "re-check")
             ServiceState.binaryPath.value = bin
-            runCatching { watcher.start(shell) }.onFailure { Log.w(TAG, "watcher: start failed $it") }
+            if (watcherStartedFor !== shell) {
+                runCatching { watcher.start(shell) }
+                    .onSuccess { watcherStartedFor = shell }
+                    .onFailure { Log.w(TAG, "watcher: start failed $it") }
+            } else {
+                Log.i(TAG, "watcher: already running for this privilege, skip restart")
+            }
         } else {
             runCatching { watcher.stop() }
+            watcherStartedFor = null
             ServiceState.binaryPath.value = null
             Log.i(TAG, "binary: skipped (no privileged shell)")
         }

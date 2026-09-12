@@ -56,9 +56,11 @@ object Learn {
             withContext(NonCancellable) { cancelLearn(shell) }
             throw e
         }
-        Log.i(TAG, "learn: rc=${r.rc} out=${r.out.lineSequence().firstOrNull()?.take(120) ?: ""}")
+        val lastNonEmpty = r.out.lineSequence().map { it.trim() }.lastOrNull { it.isNotEmpty() } ?: ""
+        Log.i(TAG, "learn: rc=${r.rc} out=${r.out.lineSequence().firstOrNull()?.take(120) ?: ""} last=${lastNonEmpty.take(120)}")
         val src = LEARNED.find(r.out)?.groupValues?.get(1)
-            ?: return Result.failure(LearnError("learn failed (rc=${r.rc}): ${r.out.trim().lines().lastOrNull()?.take(160) ?: ""}"))
+        Log.i(TAG, "learn: parsed source=${src ?: "no learned line"}")
+        if (src == null) return Result.failure(LearnError("learn failed (rc=${r.rc}): ${r.out.trim().lines().lastOrNull()?.take(160) ?: ""}"))
         return when {
             src == "NONE" -> Result.failure(LearnError("Nothing pressed within ${TIMEOUT_MS / 1000} s"))
             SourceNames.isValid(src) -> Result.success(src)

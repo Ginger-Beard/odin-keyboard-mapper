@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.util.Log
 import com.dpad.mgr.priv.PrivShell
+import com.dpad.mgr.priv.PrivShell.Companion.TAIL_CMD
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -44,6 +45,7 @@ class ForegroundWatcher(ctx: Context, private val scope: CoroutineScope) {
     suspend fun start(shell: PrivShell) {
         stop()
         this.shell = shell
+        Log.i(TAG, "watcher: tail cmd=$TAIL_CMD")
         shell.startTail(::onLine)
         Log.i(TAG, "watcher: tail started via ${shell.source.name}")
     }
@@ -57,6 +59,7 @@ class ForegroundWatcher(ctx: Context, private val scope: CoroutineScope) {
 
     fun onLine(line: String) {
         val m = PKG_RE.find(line) ?: return
+        val raw = m.value
         val pkg = m.groupValues[1]
         _raw.value = pkg
         val target: String? = when {
@@ -70,7 +73,11 @@ class ForegroundWatcher(ctx: Context, private val scope: CoroutineScope) {
             delay(250)
             val t = pending
             if (_foreground.value != t) {
-                Log.i(TAG, "watcher: foreground=${t ?: "<none>"}")
+                if (t != null) {
+                    Log.i(TAG, "foreground: $t (raw=$raw)")
+                } else {
+                    Log.i(TAG, "watcher: launcher/ignored entered (raw=$raw)")
+                }
                 _foreground.value = t
             }
         }

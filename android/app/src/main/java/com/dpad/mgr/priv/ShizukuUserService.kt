@@ -20,6 +20,16 @@ class ShizukuUserService() : IUserService.Stub() {
 
     @Volatile private var tailProc: Process? = null
 
+    init {
+        // Safety net: a previous instance of this user service can die (Shizuku rebind,
+        // binder death) without going through destroy()/stopTail(), orphaning its logcat
+        // child. Sweep those up whenever a new instance of this process starts.
+        runCatching {
+            val p = ProcessBuilder("pkill", "-f", "logcat -b events").redirectErrorStream(true).start()
+            p.waitFor(2, TimeUnit.SECONDS)
+        }.onFailure { Log.w(TAG, "userservice: startup pkill failed: $it") }
+    }
+
     override fun exec(argv: Array<String>): Bundle = execTimeout(argv, 20_000)
 
     override fun execTimeout(argv: Array<String>, timeoutMs: Int): Bundle {

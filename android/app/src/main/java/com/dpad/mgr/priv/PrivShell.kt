@@ -40,7 +40,10 @@ interface PrivShell {
 
     companion object {
         val SAFE_TOKEN = Regex("^[A-Za-z0-9._/~=+,:@-]+$")
-        const val TAIL_CMD = "logcat -b events -v raw -T 1 -s am_resume_activity:I wm_on_resume_called:I"
+        // wm_set_resumed_activity carries "pkg/cls" in its raw text on Android 13; am_resume_activity
+        // is kept for older Android where wm_set_resumed_activity doesn't exist. wm_on_resume_called
+        // only carries the class name (no package), so it can't be parsed and is intentionally excluded.
+        const val TAIL_CMD = "logcat -b events -v raw -T 1 -s wm_set_resumed_activity:I am_resume_activity:I"
         val TAIL_ARGV: List<String> = TAIL_CMD.split(' ')
 
         fun isSafeToken(s: String): Boolean = s.isNotEmpty() && SAFE_TOKEN.matches(s)
