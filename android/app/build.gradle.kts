@@ -13,8 +13,8 @@ android {
         applicationId = "com.dpad.mgr"
         minSdk = 33
         targetSdk = 34
-        versionCode = 2
-        versionName = "0.2"
+        versionCode = (System.getenv("VERSION_CODE") ?: "1").toInt()
+        versionName = System.getenv("VERSION_NAME") ?: "0.0.0-dev"
         ndk { abiFilters += "arm64-v8a" }
     }
 
@@ -31,9 +31,34 @@ android {
         }
     }
 
+    val keystoreFile = System.getenv("KEYSTORE_FILE") ?: findProperty("KEYSTORE_FILE") as String?
+    val keystorePassword = System.getenv("KEYSTORE_PASSWORD") ?: findProperty("KEYSTORE_PASSWORD") as String?
+    val keyAlias = System.getenv("KEY_ALIAS") ?: findProperty("KEY_ALIAS") as String?
+    val keyPassword = System.getenv("KEY_PASSWORD") ?: findProperty("KEY_PASSWORD") as String?
+    val hasSigningConfig = !keystoreFile.isNullOrBlank() &&
+        !keystorePassword.isNullOrBlank() &&
+        !keyAlias.isNullOrBlank() &&
+        !keyPassword.isNullOrBlank()
+
+    signingConfigs {
+        if (hasSigningConfig) {
+            create("release") {
+                storeFile = file(keystoreFile!!)
+                storePassword = keystorePassword
+                this.keyAlias = keyAlias
+                this.keyPassword = keyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            isShrinkResources = false
+            isDebuggable = false
+            if (hasSigningConfig) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 

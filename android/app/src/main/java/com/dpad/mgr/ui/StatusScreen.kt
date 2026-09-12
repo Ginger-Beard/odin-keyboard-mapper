@@ -1,5 +1,9 @@
 package com.dpad.mgr.ui
 
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.provider.Settings
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -30,8 +34,14 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.dpad.mgr.core.DaemonState
 import com.dpad.mgr.core.Store
+import com.dpad.mgr.priv.PrivSource
 import com.dpad.mgr.svc.DpadService
 import com.dpad.mgr.svc.ServiceState
+
+private const val SHIZUKU_PKG = "moe.shizuku.privileged.api"
+
+private fun isShizukuInstalled(pm: PackageManager): Boolean =
+    runCatching { pm.getPackageInfo(SHIZUKU_PKG, 0) }.isSuccess
 
 @Composable
 fun StatusScreen(modifier: Modifier = Modifier) {
@@ -48,6 +58,9 @@ fun StatusScreen(modifier: Modifier = Modifier) {
     var menu by remember { mutableStateOf(false) }
 
     Column(modifier.padding(16.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        if (priv.source == PrivSource.NONE) {
+            SetupCard()
+        }
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("Status", style = MaterialTheme.typography.titleMedium)
@@ -99,5 +112,85 @@ fun StatusScreen(modifier: Modifier = Modifier) {
                     style = MaterialTheme.typography.bodySmall)
             }
         }
+    }
+}
+
+@Composable
+private fun SetupCard(modifier: Modifier = Modifier) {
+    val ctx = LocalContext.current
+    val pm = ctx.packageManager
+    var shizukuInstalled by remember { mutableStateOf(isShizukuInstalled(pm)) }
+
+    Card(modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Setup", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "This app has no shell access yet. Complete these steps to enable it:",
+                style = MaterialTheme.typography.bodySmall,
+            )
+
+            SetupStep(
+                number = 1,
+                title = "Install Shizuku",
+                body = "Shizuku gives this app shell access without root.",
+                buttonLabel = if (shizukuInstalled) "Open Shizuku" else "Install Shizuku",
+                onClick = {
+                    if (shizukuInstalled) {
+                        pm.getLaunchIntentForPackage(SHIZUKU_PKG)?.let { ctx.startActivity(it) }
+                    } else {
+                        val market = Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=$SHIZUKU_PKG"))
+                        runCatching { ctx.startActivity(market) }.onFailure {
+                            val web = Intent(
+                                Intent.ACTION_VIEW,
+                                Uri.parse("https://play.google.com/store/apps/details?id=$SHIZUKU_PKG"),
+                            )
+                            ctx.startActivity(web)
+                        }
+                    }
+                    shizukuInstalled = isShizukuInstalled(pm)
+                },
+            )
+
+            SetupStep(
+                number = 2,
+                title = "Turn on Wireless debugging",
+                body = "Settings -> System -> Developer options -> Wireless debugging " +
+                    "(tap the row, not just the switch).",
+                buttonLabel = "Open Developer options",
+                onClick = { ctx.startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS)) },
+            )
+
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("3. Start Shizuku via Wireless debugging", style = MaterialTheme.typography.titleSmall)
+                Text(
+                    "In Shizuku, tap \"Start via Wireless debugging\", follow its pairing steps " +
+                        "(you'll enter a pairing code from the Wireless debugging screen), then tap Start.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+
+            SetupStep(
+                number = 4,
+                title = "Grant access",
+                body = "Requests the Shizuku permission for this app and re-checks privilege.",
+                buttonLabel = "Grant access",
+                onClick = { DpadService.send(ctx, DpadService.ACTION_RECHECK) },
+            )
+
+            Text(
+                "After a reboot, Wireless debugging turns off on most devices; turn it on again " +
+                    "and tap Start in Shizuku.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+    }
+}
+
+@Composable
+private fun SetupStep(number: Int, title: String, body: String, buttonLabel: String, onClick: () -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text("$number. $title", style = MaterialTheme.typography.titleSmall)
+        Text(body, style = MaterialTheme.typography.bodySmall)
+        Button(onClick = onClick) { Text(buttonLabel) }
     }
 }

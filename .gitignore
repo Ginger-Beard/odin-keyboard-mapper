@@ -14,3 +14,8 @@ android/local.properties
 android/.idea/
 android/*.iml
 android/.kotlin/
+# release signing / build output
+keys/
+dist/
+*.keystore
+*.jks
