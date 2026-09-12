@@ -1348,15 +1348,25 @@ static int open_touch_uinput(int real_fd, const struct input_id *id, const char 
     return fd;
 }
 
+/* Releases the panel grab, closes the panel fd, and destroys the virtual
+ * touchscreen -- the touch-only half of teardown. Shared by touch_fatal_exit(),
+ * main()'s normal shutdown, and the live SIGUSR1 disable path (see
+ * reload_touch_config). Safe to call when touch was never enabled: every
+ * step is a no-op against -1/false state. */
+static void touch_disable(void) {
+    if (g_touch_grabbed) { ioctl(g_touch_fd, EVIOCGRAB, 0); g_touch_grabbed = false; }
+    if (g_touch_fd >= 0) { close(g_touch_fd); g_touch_fd = -1; }
+    destroy_uinput(g_touch_uinput_fd);
+    g_touch_uinput_fd = -1;
+}
+
 /* Releases both grabs, closes both real fds, destroys both uinput devices,
  * and exits with `code`. Used for the touch-specific fatal-error contract
  * (grab failure -> 4, uinput write failure -> 5). */
 static void touch_fatal_exit(int code) {
-    if (g_touch_grabbed) { ioctl(g_touch_fd, EVIOCGRAB, 0); g_touch_grabbed = false; }
-    if (g_touch_fd >= 0) { close(g_touch_fd); g_touch_fd = -1; }
+    touch_disable();
     if (g_grabbed) { ioctl(g_pad_fd, EVIOCGRAB, 0); g_grabbed = false; }
     if (g_pad_fd >= 0) { close(g_pad_fd); g_pad_fd = -1; }
-    destroy_uinput(g_touch_uinput_fd);
     destroy_uinput(g_uinput_fd);
     exit(code);
 }
@@ -1490,6 +1500,55 @@ static void touch_sync_initial_contacts(const config_t *cfg) {
 #endif
 }
 
+typedef enum {
+    TOUCH_ENABLE_OK = 0,
+    TOUCH_ENABLE_ERR_NO_PANEL,
+    TOUCH_ENABLE_ERR_UINPUT,
+    TOUCH_ENABLE_ERR_GRAB,
+} touch_enable_result_t;
+
+/* Brings touch pass-through up: discovers/opens the configured panel, creates
+ * the virtual touchscreen, grabs the panel, and carries over any contacts
+ * already down. Shared by startup and the live SIGUSR1 enable path (see
+ * reload_touch_config) -- the two differ only in how they react to failure
+ * (startup exits; the live path logs and stays off), so this function never
+ * exits itself. On any failure it tears back down whatever it had partially
+ * created (via touch_disable()) and returns a code identifying the failed
+ * step; g_touch_grabbed is true if and only if it returns TOUCH_ENABLE_OK. */
+static touch_enable_result_t touch_enable(const config_t *cfg) {
+    g_touch_fd = find_touch(cfg, g_touch_path, sizeof(g_touch_path));
+    if (g_touch_fd < 0) {
+        fprintf(stderr, "dpadkeys: touch: no touch panel found%s%s\n",
+                cfg->touch_device[0] ? " at " : "", cfg->touch_device);
+        return TOUCH_ENABLE_ERR_NO_PANEL;
+    }
+    struct input_id touch_id;
+    memset(&touch_id, 0, sizeof(touch_id));
+    ioctl(g_touch_fd, EVIOCGID, &touch_id);
+    if (ioctl(g_touch_fd, EVIOCGNAME(sizeof(g_touch_name)), g_touch_name) < 0)
+        snprintf(g_touch_name, sizeof(g_touch_name), "?");
+    query_touch_axes(g_touch_fd);
+
+    g_touch_uinput_fd = open_touch_uinput(g_touch_fd, &touch_id, "fts_ts");
+    if (g_touch_uinput_fd < 0) {
+        fprintf(stderr, "dpadkeys: touch: could not create virtual touchscreen\n");
+        close(g_touch_fd);
+        g_touch_fd = -1;
+        return TOUCH_ENABLE_ERR_UINPUT;
+    }
+    fprintf(stderr, "dpadkeys: touch: created virtual touchscreen \"fts_ts\" (from %s)\n", g_touch_path);
+
+    if (ioctl(g_touch_fd, EVIOCGRAB, 1) < 0) {
+        perror("EVIOCGRAB (touch)");
+        fprintf(stderr, "dpadkeys: touch: cannot grab the panel\n");
+        touch_disable();
+        return TOUCH_ENABLE_ERR_GRAB;
+    }
+    g_touch_grabbed = true;
+    touch_sync_initial_contacts(cfg);
+    return TOUCH_ENABLE_OK;
+}
+
 /* Reads whatever the panel has queued (whole events only; evdev never returns
  * a partial one), applies the configured X/Y offset in place, and replays the
  * batch to the clone with a single write() so frames stay contiguous and the
@@ -1518,41 +1577,108 @@ static int forward_touch_batch(const config_t *cfg) {
     }
 }
 
-/* Re-reads `config_path` on SIGUSR1 and applies only a new touch.offset, if
- * present; logs the new offset. No-op if touch pass-through isn't enabled. */
-static void reload_touch_offset(const char *config_path, config_t *cfg) {
-    if (!cfg->touch_offset_set || !config_path) return;
-    FILE *f = fopen(config_path, "r");
-    if (!f) {
-        fprintf(stderr, "dpadkeys: SIGUSR1: cannot reopen config '%s': %s\n", config_path, strerror(errno));
+/* Reads just the touch.offset line out of `path` (last one wins, matching
+ * load_config_file): *out_set/out_dx/out_dy reflect what was found, with
+ * *out_set false when the line is absent or says "off"/"none". Tolerant of
+ * `path` being rewritten out from under us by whatever regenerates the
+ * config: a failed open, or a file that reads as completely empty, is
+ * retried once after 50ms before giving up. Returns false (out params
+ * untouched, errno describing the last open failure if any) only when both
+ * attempts failed. */
+static bool read_touch_offset_line(const char *path, bool *out_set, int *out_dx, int *out_dy) {
+    for (int attempt = 0; attempt < 2; attempt++) {
+        FILE *f = fopen(path, "r");
+        int open_errno = errno;
+        char line[256];
+        bool saw_any_line = false;
+        bool found = false, off = true;
+        int dx = 0, dy = 0;
+        if (f) {
+            while (fgets(line, sizeof(line), f)) {
+                saw_any_line = true;
+                char *hash = strchr(line, '#');
+                if (hash) *hash = '\0';
+                char *save = NULL;
+                char *tok1 = strtok_r(line, " \t\r\n", &save);
+                if (!tok1 || strcmp(tok1, "touch.offset") != 0) continue;
+                char *tok2 = strtok_r(NULL, " \t\r\n", &save);
+                if (!tok2) continue;
+                if (strcmp(tok2, "off") == 0 || strcmp(tok2, "none") == 0) {
+                    found = true; off = true; continue;
+                }
+                char *tok3 = strtok_r(NULL, " \t\r\n", &save);
+                if (tok3) { dx = atoi(tok2); dy = atoi(tok3); found = true; off = false; }
+            }
+            fclose(f);
+        }
+        if (f && saw_any_line) {
+            *out_set = found && !off;
+            *out_dx = dx;
+            *out_dy = dy;
+            return true;
+        }
+        if (attempt == 0) {
+            struct timespec ts = { 0, 50 * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+            continue;
+        }
+        errno = f ? 0 : open_errno;
+        return false;
+    }
+    return false;
+}
+
+/* Re-reads `config_path` on SIGUSR1 for touch.* keys only (currently just
+ * touch.offset) and brings live touch pass-through to match what was found:
+ *  - was off, file now names an offset -> touch_enable() live; on failure,
+ *    log and stay off (never exits).
+ *  - was on, file no longer names an offset (absent or "off"/"none") ->
+ *    touch_disable() live.
+ *  - was on and still on -> just update dx/dy (as before).
+ * No-op (with the previous touch config kept) if config_path is unset or the
+ * file can't be read even after read_touch_offset_line()'s retry. */
+static void reload_touch_config(const char *config_path, config_t *cfg) {
+    if (!config_path) return;
+    bool new_set; int new_dx = 0, new_dy = 0;
+    if (!read_touch_offset_line(config_path, &new_set, &new_dx, &new_dy)) {
+        if (errno) fprintf(stderr, "dpadkeys: SIGUSR1: cannot reopen config '%s': %s\n",
+                            config_path, strerror(errno));
+        else fprintf(stderr, "dpadkeys: SIGUSR1: config '%s' still empty after retry; "
+                             "keeping current touch config\n", config_path);
         fflush(stderr);
         return;
     }
-    char line[256];
-    int dx = cfg->touch_dx, dy = cfg->touch_dy;
-    bool found = false;
-    while (fgets(line, sizeof(line), f)) {
-        char *hash = strchr(line, '#');
-        if (hash) *hash = '\0';
-        char *save = NULL;
-        char *tok1 = strtok_r(line, " \t\r\n", &save);
-        if (!tok1 || strcmp(tok1, "touch.offset") != 0) continue;
-        char *tok2 = strtok_r(NULL, " \t\r\n", &save);
-        char *tok3 = tok2 ? strtok_r(NULL, " \t\r\n", &save) : NULL;
-        if (tok2 && tok3) { dx = atoi(tok2); dy = atoi(tok3); found = true; }
-    }
-    fclose(f);
-    if (!found) {
-        fprintf(stderr, "dpadkeys: SIGUSR1: no touch.offset in '%s'; keeping %d %d\n",
-                config_path, cfg->touch_dx, cfg->touch_dy);
-        fflush(stderr);
-        return;
-    }
-    cfg->touch_dx = dx;
-    cfg->touch_dy = dy;
+
+    bool was_on = cfg->touch_offset_set;
+    cfg->touch_offset_set = new_set;
+    cfg->touch_dx = new_dx;
+    cfg->touch_dy = new_dy;
     clamp_touch_offset(cfg, "SIGUSR1");
-    fprintf(stderr, "dpadkeys: touch: offset now %d %d\n", cfg->touch_dx, cfg->touch_dy);
-    fflush(stderr);
+
+    if (!was_on && new_set) {
+        if (touch_enable(cfg) == TOUCH_ENABLE_OK) {
+            fprintf(stderr, "dpadkeys: touch: enabled live path=%s off=(%d,%d)\n",
+                    g_touch_path, cfg->touch_dx, cfg->touch_dy);
+        } else {
+            fprintf(stderr, "dpadkeys: touch: failed to enable live; staying off\n");
+            cfg->touch_offset_set = false;
+        }
+        fflush(stderr);
+        return;
+    }
+
+    if (was_on && !new_set) {
+        touch_disable();
+        fprintf(stderr, "dpadkeys: touch: disabled live\n");
+        fflush(stderr);
+        return;
+    }
+
+    if (was_on && new_set) {
+        fprintf(stderr, "dpadkeys: touch: offset now %d %d\n", cfg->touch_dx, cfg->touch_dy);
+        fflush(stderr);
+    }
+    /* !was_on && !new_set: nothing changed. */
 }
 
 static void print_touch_banner(const config_t *cfg) {
@@ -2017,42 +2143,16 @@ int main(int argc, char **argv) {
     }
 
     /* Touch pass-through: absent touch.offset means we never open or touch
-     * the panel at all. */
+     * the panel at all. Startup and the live SIGUSR1 path share
+     * touch_enable(); only the failure handling differs -- startup is fatal
+     * (matching the prior per-step exit codes: 4 for a grab failure, 1 for
+     * anything else), while the live path just logs and stays off. */
     if (cfg.touch_offset_set) {
-        g_touch_fd = find_touch(&cfg, g_touch_path, sizeof(g_touch_path));
-        if (g_touch_fd < 0) {
-            fprintf(stderr, "dpadkeys: touch: no touch panel found%s%s. Exiting.\n",
-                    cfg.touch_device[0] ? " at " : "", cfg.touch_device);
-            if (g_grabbed) ioctl(g_pad_fd, EVIOCGRAB, 0);
-            destroy_uinput(g_uinput_fd);
-            close(g_pad_fd);
-            return 1;
+        touch_enable_result_t r = touch_enable(&cfg);
+        if (r != TOUCH_ENABLE_OK) {
+            fprintf(stderr, "dpadkeys: touch: startup touch init failed. Exiting.\n");
+            touch_fatal_exit(r == TOUCH_ENABLE_ERR_GRAB ? 4 : 1);
         }
-        struct input_id touch_id;
-        memset(&touch_id, 0, sizeof(touch_id));
-        ioctl(g_touch_fd, EVIOCGID, &touch_id);
-        if (ioctl(g_touch_fd, EVIOCGNAME(sizeof(g_touch_name)), g_touch_name) < 0)
-            snprintf(g_touch_name, sizeof(g_touch_name), "?");
-        query_touch_axes(g_touch_fd);
-
-        g_touch_uinput_fd = open_touch_uinput(g_touch_fd, &touch_id, "fts_ts");
-        if (g_touch_uinput_fd < 0) {
-            fprintf(stderr, "dpadkeys: touch: could not create virtual touchscreen. Exiting.\n");
-            close(g_touch_fd);
-            if (g_grabbed) ioctl(g_pad_fd, EVIOCGRAB, 0);
-            destroy_uinput(g_uinput_fd);
-            close(g_pad_fd);
-            return 1;
-        }
-        fprintf(stderr, "dpadkeys: touch: created virtual touchscreen \"fts_ts\" (from %s)\n", g_touch_path);
-
-        if (ioctl(g_touch_fd, EVIOCGRAB, 1) < 0) {
-            perror("EVIOCGRAB (touch)");
-            fprintf(stderr, "dpadkeys: touch: cannot grab the panel. Exiting.\n");
-            touch_fatal_exit(4);
-        }
-        g_touch_grabbed = true;
-        touch_sync_initial_contacts(&cfg);
     }
 
     if (pidfile) {
@@ -2062,9 +2162,7 @@ int main(int argc, char **argv) {
             if (fscanf(pf, "%d", &oldpid) == 1 && oldpid > 0 && kill(oldpid, 0) == 0) {
                 fprintf(stderr, "dpadkeys: already running as pid %d (per %s). Exiting.\n", oldpid, pidfile);
                 fclose(pf);
-                if (g_touch_grabbed) ioctl(g_touch_fd, EVIOCGRAB, 0);
-                if (g_touch_fd >= 0) close(g_touch_fd);
-                destroy_uinput(g_touch_uinput_fd);
+                touch_disable();
                 if (g_grabbed) ioctl(g_pad_fd, EVIOCGRAB, 0);
                 destroy_uinput(g_uinput_fd);
                 close(g_pad_fd);
@@ -2082,7 +2180,7 @@ int main(int argc, char **argv) {
     while (g_running) {
         if (g_reload_offset) {
             g_reload_offset = 0;
-            reload_touch_offset(config_path, &cfg);
+            reload_touch_config(config_path, &cfg);
         }
 
         long long deadline = -1;
@@ -2273,11 +2371,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (g_touch_grabbed)
-        ioctl(g_touch_fd, EVIOCGRAB, 0);
-    if (g_touch_fd >= 0)
-        close(g_touch_fd);
-    destroy_uinput(g_touch_uinput_fd);
+    touch_disable();
 
     if (g_grabbed)
         ioctl(g_pad_fd, EVIOCGRAB, 0);

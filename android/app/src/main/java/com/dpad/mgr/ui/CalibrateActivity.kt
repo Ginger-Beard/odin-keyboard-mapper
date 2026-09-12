@@ -1,8 +1,6 @@
 package com.dpad.mgr.ui
 
 import android.app.Activity
-import android.graphics.Color as AndroidColor
-import android.graphics.Paint as AndroidPaint
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -11,23 +9,28 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -37,11 +40,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
@@ -100,7 +103,9 @@ class CalibrateActivity : ComponentActivity() {
         }
 
         setContent {
-            MaterialTheme {
+            // Forced dark scheme: this screen is a full-screen black calibration canvas
+            // regardless of the app's (light) theme, so Material3 tokens read correctly on it.
+            MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface {
                     CalibrateScreen(
                         profileName,
@@ -143,7 +148,7 @@ class CalibrateActivity : ComponentActivity() {
     }
 }
 
-private enum class Phase { DRAG, RESULT, VERIFY }
+private enum class Phase { DRAG, VERIFY }
 
 /** One verify-phase touch: [pos] is the corrected touch position (local canvas px, updated live
  *  while dragging), [target] is the nearest verify-grid target, [residual] is target-pos in px. */
@@ -151,6 +156,14 @@ private data class VerifyMarker(val pos: Offset, val target: Offset, val residua
 
 private fun nearestTarget(p: Offset, targets: List<Offset>): Offset =
     targets.minByOrNull { (it - p).getDistance() } ?: p
+
+/** Formats a px delta with an explicit sign, rounded to the nearest int, for the sample chips. */
+private fun fmtSigned(v: Float): String {
+    val r = v.roundToInt()
+    return if (r >= 0) "+$r" else "$r"
+}
+
+private const val VERIFY_MARKER_CAP = 12
 
 @Composable
 private fun CalibrateScreen(
@@ -193,24 +206,15 @@ private fun CalibrateScreen(
     var samples by remember { mutableStateOf(listOf<Offset>()) } // p1-p0 deltas (screen px), all dot positions
     var dragP0 by remember { mutableStateOf<Offset?>(null) } // window coords, start of the in-progress drag
     var dragRaw by remember { mutableStateOf<Offset?>(null) } // window coords, current raw touch pos while dragging
-    var lastResidual by remember { mutableStateOf<Offset?>(null) } // |target - p1| for the most recent sample, hint only
     var revertMsg by remember { mutableStateOf<String?>(null) }
     var resultDx by remember { mutableIntStateOf(0) }
     var resultDy by remember { mutableIntStateOf(0) }
-    var spreadPx by remember { mutableStateOf(0f) }
 
-    // Verify phase: every touch leaves a marker (local canvas coords), capped at 30 oldest-dropped.
+    // Verify phase: every touch leaves a marker (local canvas coords), capped at the newest 12.
     var markers by remember { mutableStateOf(listOf<VerifyMarker>()) }
     var dragTrail by remember { mutableStateOf(listOf<Offset>()) } // local coords, in-progress drag only
     var liveDragPos by remember { mutableStateOf<Offset?>(null) } // local coords, live crosshair while dragging
     var lastResidualVerify by remember { mutableStateOf<Offset?>(null) }
-    val markerLabelPaint = remember {
-        AndroidPaint().apply {
-            color = AndroidColor.WHITE
-            textSize = 30f
-            isAntiAlias = true
-        }
-    }
 
     var kept by remember { mutableStateOf(false) }
     var countdown by remember { mutableIntStateOf(CalibrateActivity.VERIFY_COUNTDOWN_S) }
@@ -254,7 +258,6 @@ private fun CalibrateScreen(
         samples = emptyList()
         dragP0 = null
         dragRaw = null
-        lastResidual = null
         markers = emptyList()
         dragTrail = emptyList()
         liveDragPos = null
@@ -291,6 +294,12 @@ private fun CalibrateScreen(
         }
     }
 
+    val primaryColor = MaterialTheme.colorScheme.primary
+    val tertiaryColor = MaterialTheme.colorScheme.tertiary
+    val outlineColor = MaterialTheme.colorScheme.outline
+    val onSurfaceColor = MaterialTheme.colorScheme.onSurface
+    val errorColor = MaterialTheme.colorScheme.error
+
     Box(
         Modifier
             .fillMaxSize()
@@ -316,9 +325,7 @@ private fun CalibrateScreen(
                             val raw = Offset(change.position.x + viewOffsetX, change.position.y + viewOffsetY)
                             dragRaw = raw
                             if (!change.pressed) {
-                                val target = targetsScreen[dotIndex % targetsScreen.size]
                                 samples = samples + Offset(raw.x - p0.x, raw.y - p0.y)
-                                lastResidual = Offset(target.x - raw.x, target.y - raw.y)
                                 dragP0 = null
                                 dragRaw = null
                                 break
@@ -334,7 +341,7 @@ private fun CalibrateScreen(
                         val downTarget = nearestTarget(down.position, targetsVerifyLocal)
                         val downResidual = Offset(downTarget.x - down.position.x, downTarget.y - down.position.y)
                         markers = (markers + VerifyMarker(down.position, downTarget, downResidual))
-                            .let { if (it.size > 30) it.takeLast(30) else it }
+                            .let { if (it.size > VERIFY_MARKER_CAP) it.takeLast(VERIFY_MARKER_CAP) else it }
                         lastResidualVerify = downResidual
                         dragTrail = listOf(down.position)
                         liveDragPos = down.position
@@ -356,7 +363,6 @@ private fun CalibrateScreen(
                             }
                         }
                     }
-                    else -> {}
                 }
             },
     ) {
@@ -364,132 +370,113 @@ private fun CalibrateScreen(
             when (phase) {
                 Phase.DRAG -> {
                     val t = targetsLocal[dotIndex % targetsLocal.size]
-                    drawCircle(color = Color.White.copy(alpha = 0.25f), radius = 24.dp.toPx(), center = t, style = Stroke(width = 2.dp.toPx()))
-                    drawCircle(color = Color.Red, radius = 6.dp.toPx(), center = t)
+                    drawCircle(color = primaryColor.copy(alpha = 0.5f), radius = 24.dp.toPx(), center = t, style = Stroke(width = 2.dp.toPx()))
+                    drawCircle(color = primaryColor, radius = 6.dp.toPx(), center = t)
                     dragRaw?.let { raw ->
                         val p = Offset(raw.x - viewOffsetX, raw.y - viewOffsetY)
                         val len = 14.dp.toPx()
-                        drawLine(Color.Green, Offset(p.x - len, p.y), Offset(p.x + len, p.y), strokeWidth = 3f)
-                        drawLine(Color.Green, Offset(p.x, p.y - len), Offset(p.x, p.y + len), strokeWidth = 3f)
+                        drawLine(tertiaryColor, Offset(p.x - len, p.y), Offset(p.x + len, p.y), strokeWidth = 3f)
+                        drawLine(tertiaryColor, Offset(p.x, p.y - len), Offset(p.x, p.y + len), strokeWidth = 3f)
                     }
                 }
                 Phase.VERIFY -> {
-                    val dotR = 2.dp.toPx()
                     val ringR = 8.dp.toPx()
                     val ringStroke = Stroke(width = 1.5.dp.toPx())
                     val centerIdx = targetsVerifyLocal.size / 2
                     targetsVerifyLocal.forEachIndexed { i, t ->
-                        val scale = if (i == centerIdx) 1.4f else 1f
-                        drawCircle(color = Color.White.copy(alpha = 0.35f), radius = ringR * scale, center = t, style = ringStroke)
-                        drawCircle(color = Color.Red, radius = dotR * scale, center = t)
+                        val scale = if (i == centerIdx) 1.3f else 1f
+                        drawCircle(color = primaryColor.copy(alpha = 0.6f), radius = ringR * scale, center = t, style = ringStroke)
+                        if (i == centerIdx) drawCircle(color = primaryColor, radius = 3.dp.toPx(), center = t)
                     }
                     if (dragTrail.size >= 2) {
                         val path = Path().apply {
                             moveTo(dragTrail.first().x, dragTrail.first().y)
                             dragTrail.drop(1).forEach { lineTo(it.x, it.y) }
                         }
-                        drawPath(path, color = Color.Yellow.copy(alpha = 0.8f), style = Stroke(width = 3f))
+                        drawPath(path, color = tertiaryColor.copy(alpha = 0.8f), style = Stroke(width = 3f))
                     }
-                    val armLen = 5.dp.toPx()
-                    markers.forEach { m ->
-                        drawLine(Color.White.copy(alpha = 0.4f), m.pos, m.target, strokeWidth = 1.5f)
-                        drawLine(Color.Cyan, Offset(m.pos.x - armLen, m.pos.y), Offset(m.pos.x + armLen, m.pos.y), strokeWidth = 3f)
-                        drawLine(Color.Cyan, Offset(m.pos.x, m.pos.y - armLen), Offset(m.pos.x, m.pos.y + armLen), strokeWidth = 3f)
-                        drawContext.canvas.nativeCanvas.drawText(
-                            "${m.residual.x.roundToInt()}, ${m.residual.y.roundToInt()}",
-                            m.pos.x + armLen + 4.dp.toPx(),
-                            m.pos.y - 4.dp.toPx(),
-                            markerLabelPaint,
-                        )
+                    val armLen = 6.dp.toPx()
+                    val n = markers.size
+                    markers.forEachIndexed { idx, m ->
+                        val age = (idx + 1f) / n.coerceAtLeast(1) // 0..1, newest marker = 1
+                        val alpha = 0.25f + 0.75f * age
+                        drawLine(outlineColor.copy(alpha = 0.4f * alpha), m.pos, m.target, strokeWidth = 1.5f)
+                        drawLine(tertiaryColor.copy(alpha = alpha), Offset(m.pos.x - armLen, m.pos.y), Offset(m.pos.x + armLen, m.pos.y), strokeWidth = 3f)
+                        drawLine(tertiaryColor.copy(alpha = alpha), Offset(m.pos.x, m.pos.y - armLen), Offset(m.pos.x, m.pos.y + armLen), strokeWidth = 3f)
                     }
                     liveDragPos?.let { p ->
-                        drawLine(Color.Green, Offset(p.x - armLen, p.y), Offset(p.x + armLen, p.y), strokeWidth = 3f)
-                        drawLine(Color.Green, Offset(p.x, p.y - armLen), Offset(p.x, p.y + armLen), strokeWidth = 3f)
+                        drawLine(tertiaryColor, Offset(p.x - armLen, p.y), Offset(p.x + armLen, p.y), strokeWidth = 3f)
+                        drawLine(tertiaryColor, Offset(p.x, p.y - armLen), Offset(p.x, p.y + armLen), strokeWidth = 3f)
                     }
                 }
-                else -> {}
             }
         }
 
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text("Stylus offset calibration — $profileName", color = Color.White, style = MaterialTheme.typography.titleMedium)
-            Text("Hold the device the way you play.", color = Color.White, style = MaterialTheme.typography.bodyMedium)
-            when (phase) {
-                Phase.DRAG -> {
-                    Text(
-                        "Put the stylus on the dot the way you normally hold it. A crosshair shows where the " +
-                            "touch landed. Without lifting, slide until the crosshair is centered on the dot, then lift.",
-                        color = Color.White,
-                    )
-                    revertMsg?.let { Text(it, color = Color.Red, style = MaterialTheme.typography.bodyMedium) }
-                    if (samples.isNotEmpty()) {
-                        val meanX = samples.map { it.x }.average().toFloat()
-                        val meanY = samples.map { it.y }.average().toFloat()
-                        val spread = samples.maxOf { hypot((it.x - meanX).toDouble(), (it.y - meanY).toDouble()) }.toFloat()
-                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                            samples.forEachIndexed { i, d ->
-                                Text("Sample ${i + 1}: ${"%.1f".format(d.x)}, ${"%.1f".format(d.y)}", color = Color.White, style = MaterialTheme.typography.bodySmall)
-                            }
-                        }
-                        lastResidual?.let { r ->
-                            Text(
-                                "Alignment residual (hint): ${"%.1f".format(hypot(r.x.toDouble(), r.y.toDouble()))} px",
-                                color = Color.Yellow, style = MaterialTheme.typography.bodySmall,
-                            )
-                        }
-                        Text("Spread: ${"%.1f".format(spread)} px", color = Color.White, style = MaterialTheme.typography.bodySmall)
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            OutlinedButton(onClick = { dotIndex = (dotIndex + 1) % targetsLocal.size }) { Text("Add another position") }
-                            OutlinedButton(onClick = { samples = samples.dropLast(1) }) { Text("Redo last") }
-                            Button(onClick = {
-                                val (dx, dy) = Calibration.toPanelOffset(meanX, meanY, rotation, natSize.natW, natSize.natH, panelMaxX, panelMaxY)
-                                resultDx = dx; resultDy = dy; spreadPx = spread
-                                saveOffset(dx, dy, liveUpdate = false)
-                                phase = Phase.RESULT
-                            }) { Text("Use this") }
+        // DRAG: one short instruction line, top center; nothing else on the canvas itself.
+        if (phase == Phase.DRAG) {
+            Text(
+                "Slide the crosshair onto the dot, then lift.",
+                modifier = Modifier.align(Alignment.TopCenter).padding(top = 16.dp),
+                color = onSurfaceColor.copy(alpha = 0.8f),
+                style = MaterialTheme.typography.bodyLarge,
+            )
+            revertMsg?.let {
+                Text(
+                    it,
+                    modifier = Modifier.align(Alignment.TopCenter).padding(top = 52.dp),
+                    color = errorColor,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+
+            // Bottom bar: sample chips + Add/Redo/Continue (once there's a sample), plus the
+            // (collapsed by default) advanced panel-size override.
+            Column(
+                Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .background(Color.Black.copy(alpha = 0.55f))
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                if (samples.isNotEmpty()) {
+                    val meanX = samples.map { it.x }.average().toFloat()
+                    val meanY = samples.map { it.y }.average().toFloat()
+                    val spread = samples.maxOf { hypot((it.x - meanX).toDouble(), (it.y - meanY).toDouble()) }.toFloat()
+
+                    Row(
+                        Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        samples.forEachIndexed { i, d ->
+                            SampleChip("Sample ${i + 1}: ${fmtSigned(d.x)}, ${fmtSigned(d.y)}")
                         }
                     }
-                }
-                Phase.RESULT -> {
-                    Text("Computed offset: dx=$resultDx, dy=$resultDy (panel units)", color = Color.White)
-                    Text("Spread: ${"%.1f".format(spreadPx)} px", color = Color.White)
-                    Button(onClick = { phase = Phase.VERIFY }) { Text("Continue to verify") }
-                }
-                Phase.VERIFY -> {
-                    Text(
-                        "Tap or drag anywhere. Marks show where touches land after the offset. " +
-                            "Nudge until marks sit on the targets, then Keep.",
-                        color = Color.White,
-                    )
-                    val live = currentProfile()
-                    Column(
-                        Modifier.background(Color.Black.copy(alpha = 0.55f)).padding(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(2.dp),
-                    ) {
-                        Text("Offset: dx=${live?.touchDx ?: 0}, dy=${live?.touchDy ?: 0} (panel units)", color = Color.White, style = MaterialTheme.typography.bodySmall)
-                        lastResidualVerify?.let { r ->
-                            Text("Last residual: ${r.x.roundToInt()}, ${r.y.roundToInt()} px", color = Color.White, style = MaterialTheme.typography.bodySmall)
-                        }
-                        if (markers.isNotEmpty()) {
-                            val meanR = markers.map { hypot(it.residual.x.toDouble(), it.residual.y.toDouble()) }.average()
-                            Text("Mean residual: ${"%.1f".format(meanR)} px", color = Color.White, style = MaterialTheme.typography.bodySmall)
-                        }
-                        Text("Samples: ${markers.size}", color = Color.White, style = MaterialTheme.typography.bodySmall)
+                    if (samples.size >= 2) {
+                        Text("Spread: ${spread.roundToInt()} px", color = onSurfaceColor.copy(alpha = 0.8f), style = MaterialTheme.typography.bodySmall)
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedButton(
                             modifier = Modifier.heightIn(min = 48.dp),
+                            onClick = { dotIndex = (dotIndex + 1) % targetsLocal.size },
+                        ) { Text("Add position") }
+                        OutlinedButton(
+                            modifier = Modifier.heightIn(min = 48.dp),
+                            onClick = { samples = samples.dropLast(1) },
+                        ) { Text("Redo") }
+                        Button(
+                            modifier = Modifier.heightIn(min = 48.dp),
                             onClick = {
-                                markers = emptyList()
-                                lastResidualVerify = null
-                                countdown = CalibrateActivity.VERIFY_COUNTDOWN_S
-                                kept = false
+                                val (dx, dy) = Calibration.toPanelOffset(meanX, meanY, rotation, natSize.natW, natSize.natH, panelMaxX, panelMaxY)
+                                resultDx = dx; resultDy = dy
+                                saveOffset(dx, dy, liveUpdate = false)
+                                phase = Phase.VERIFY
                             },
-                        ) { Text("Clear marks") }
+                        ) { Text("Continue") }
                     }
                 }
-            }
-            if (phase == Phase.DRAG) {
                 TextButton(onClick = { showAdvanced = !showAdvanced }) {
-                    Text(if (showAdvanced) "Hide advanced" else "Advanced…", color = Color.White)
+                    Text(if (showAdvanced) "Hide advanced" else "Advanced…", color = onSurfaceColor.copy(alpha = 0.8f))
                 }
                 if (showAdvanced) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -500,54 +487,96 @@ private fun CalibrateScreen(
             }
         }
 
-        // Bottom-edge button bar for VERIFY so buttons never cover the target grid.
+        // VERIFY: one compact readout pill top-center, and a bottom bar with nudge / Reset / Keep.
         if (phase == Phase.VERIFY) {
-            Column(
+            val live = currentProfile()
+            val offsetPart = "Offset ${live?.touchDx ?: 0}, ${live?.touchDy ?: 0}"
+            val lastPart = lastResidualVerify?.let { "Last ${it.x.roundToInt()}, ${it.y.roundToInt()}" }
+            val avgPart = if (markers.isNotEmpty()) {
+                val meanR = markers.map { hypot(it.residual.x.toDouble(), it.residual.y.toDouble()) }.average()
+                "Avg ${meanR.roundToInt()} px"
+            } else {
+                null
+            }
+            val pillText = listOfNotNull(offsetPart, lastPart, avgPart).joinToString(" · ")
+
+            Row(
+                Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 16.dp)
+                    .clip(RoundedCornerShape(50))
+                    .background(Color.Black.copy(alpha = 0.55f))
+                    .padding(start = 16.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(pillText, color = onSurfaceColor.copy(alpha = 0.8f), style = MaterialTheme.typography.bodyMedium)
+                TextButton(onClick = {
+                    markers = emptyList()
+                    lastResidualVerify = null
+                    countdown = CalibrateActivity.VERIFY_COUNTDOWN_S
+                    kept = false
+                }) { Text("Clear") }
+            }
+
+            Box(
                 Modifier
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
                     .background(Color.Black.copy(alpha = 0.55f))
-                    .padding(horizontal = 12.dp, vertical = 10.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
             ) {
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    NudgeButton("X-1") { nudge(ctx, profileName, data, -1f, 0f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
-                    NudgeButton("X+1") { nudge(ctx, profileName, data, 1f, 0f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
-                    NudgeButton("Y-1") { nudge(ctx, profileName, data, 0f, -1f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
-                    NudgeButton("Y+1") { nudge(ctx, profileName, data, 0f, 1f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
+                Row(
+                    Modifier.align(Alignment.CenterStart),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    NudgeButton("←") { nudge(ctx, profileName, data, -1f, 0f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
+                    NudgeButton("→") { nudge(ctx, profileName, data, 1f, 0f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
+                    NudgeButton("↑") { nudge(ctx, profileName, data, 0f, -1f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
+                    NudgeButton("↓") { nudge(ctx, profileName, data, 0f, 1f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    OutlinedButton(
-                        modifier = Modifier.heightIn(min = 48.dp),
-                        onClick = {
-                            saveOffset(resultDx, resultDy, liveUpdate = true)
-                            countdown = CalibrateActivity.VERIFY_COUNTDOWN_S
-                            kept = false
-                        },
-                    ) { Text("Reset") }
-                    Button(modifier = Modifier.heightIn(min = 48.dp), enabled = kept, onClick = onDone) { Text("Done") }
-                }
-                if (!kept) {
-                    Button(
-                        modifier = Modifier.heightIn(min = 48.dp).fillMaxWidth(),
-                        onClick = { kept = true; onKeep() },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
-                    ) { Text("Keep these settings ($countdown)") }
-                    Text(
-                        "Unconfirmed — reverts automatically if you don't tap Keep.",
-                        color = Color.Yellow, style = MaterialTheme.typography.bodySmall,
-                    )
-                } else {
-                    Text("Kept. Tap Done to finish.", color = Color.Green, style = MaterialTheme.typography.bodyMedium)
-                }
+                OutlinedButton(
+                    modifier = Modifier.align(Alignment.Center).heightIn(min = 48.dp),
+                    onClick = {
+                        saveOffset(resultDx, resultDy, liveUpdate = true)
+                        countdown = CalibrateActivity.VERIFY_COUNTDOWN_S
+                        kept = false
+                    },
+                ) { Text("Reset") }
+                Button(
+                    modifier = Modifier.align(Alignment.CenterEnd).heightIn(min = 48.dp),
+                    onClick = {
+                        if (!kept) {
+                            kept = true
+                            onKeep()
+                        } else {
+                            onDone()
+                        }
+                    },
+                ) { Text(if (kept) "Done" else "Keep ($countdown)") }
             }
         }
     }
 }
 
 @Composable
+private fun SampleChip(text: String) {
+    Surface(shape = RoundedCornerShape(50), color = MaterialTheme.colorScheme.surfaceVariant) {
+        Text(
+            text,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall,
+        )
+    }
+}
+
+@Composable
 private fun NudgeButton(label: String, onClick: () -> Unit) {
-    OutlinedButton(modifier = Modifier.heightIn(min = 48.dp), onClick = onClick) { Text(label) }
+    OutlinedButton(
+        modifier = Modifier.size(56.dp),
+        contentPadding = PaddingValues(0.dp),
+        onClick = onClick,
+    ) { Text(label, style = MaterialTheme.typography.titleLarge) }
 }
 
 private fun nudge(
