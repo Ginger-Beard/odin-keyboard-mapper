@@ -35,7 +35,7 @@ jobs:
         run: |
           tag="${GITHUB_REF#refs/tags/}"
           echo "version_name=${tag#v}" >> "$GITHUB_OUTPUT"
-          echo "version_code=${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "version_code=$(( $(date +%s) / 60 - 28927440 ))" >> "$GITHUB_OUTPUT"  # minutes since 2025-01-01, same scale as local builds
 
       - name: Decode keystore
         run: |

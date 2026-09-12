@@ -13,7 +13,10 @@ android {
         applicationId = "com.dpad.mgr"
         minSdk = 33
         targetSdk = 34
-        versionCode = (System.getenv("VERSION_CODE") ?: "1").toInt()
+        // Monotonic default: minutes since 2025-01-01, so every local build installs
+        // over the previous one. CI passes an explicit VERSION_CODE on the same scale.
+        versionCode = (System.getenv("VERSION_CODE")
+            ?: ((System.currentTimeMillis() / 60000L) - 28_927_440L).toString()).toInt()
         versionName = System.getenv("VERSION_NAME") ?: "0.0.0-dev"
         ndk { abiFilters += "arm64-v8a" }
     }
