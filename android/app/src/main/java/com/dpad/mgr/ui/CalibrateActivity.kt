@@ -52,11 +52,13 @@ import kotlinx.coroutines.delay
 import kotlin.math.hypot
 
 /**
- * Calibrates the stylus/touch offset for one profile: step 1 taps five targets (center, then the
- * four corners) once each, per round, to compute a screen-space offset -- accepted deltas can be
- * accumulated over multiple rounds before proceeding -- converts it to panel units and saves it;
- * step 2 runs the daemon in TEST mode with the offset applied so the user can verify (and nudge)
- * it. Runs full-screen while the
+ * Calibrates the stylus/touch offset for one profile: step 1 ("drag to align") shows one target
+ * dot at a time -- the user puts the stylus down near it, then without lifting slides until an
+ * on-screen crosshair (which follows the raw touch position) is centered on the dot and lifts;
+ * the drag's end-minus-start delta is one sample. Samples can be collected at multiple dot
+ * positions (center, then the four corners) and averaged (plain mean, no outlier rejection) into
+ * a screen-space offset, which is converted to panel units and saved; step 2 runs the daemon in
+ * TEST mode with the offset applied so the user can verify (and nudge) it. Runs full-screen while the
  * Supervisor is suspended (daemon stopped, foreground changes ignored) so calibration taps are
  * never intercepted or shifted by a live daemon.
  *
@@ -133,11 +135,7 @@ class CalibrateActivity : ComponentActivity() {
     }
 }
 
-private enum class Phase { TARGETS, ROUND_RESULT, RESULT, VERIFY }
-
-/** Order of the five calibration targets tapped each round: centre first, then the four corners
- *  (each inset 12% of the window width/height from its edge). */
-private val TARGET_NAMES = listOf("center", "top-left", "top-right", "bottom-left", "bottom-right")
+private enum class Phase { DRAG, RESULT, VERIFY }
 
 @Composable
 private fun CalibrateScreen(
@@ -175,14 +173,12 @@ private fun CalibrateScreen(
     var viewOffsetY by remember { mutableStateOf(0f) }
     var boxSize by remember { mutableStateOf(IntSize.Zero) }
 
-    var phase by remember { mutableStateOf(Phase.TARGETS) }
-    var targetIndex by remember { mutableIntStateOf(0) } // 0..4, current target within the round
-    var roundTaps by remember { mutableStateOf(listOf<Offset>()) } // window coords, this round only
-    var pool by remember { mutableStateOf(listOf<Offset>()) } // accepted deltas (screen px), all rounds
-    var roundNumber by remember { mutableIntStateOf(1) }
-    var roundTable by remember { mutableStateOf(listOf<Triple<String, Offset, Boolean>>()) } // name, delta, accepted
-    var roundSpread by remember { mutableStateOf(0f) }
-    var spreadMsg by remember { mutableStateOf<String?>(null) }
+    var phase by remember { mutableStateOf(Phase.DRAG) }
+    var dotIndex by remember { mutableIntStateOf(0) } // cycles through targetsLocal (center, then the 4 corners)
+    var samples by remember { mutableStateOf(listOf<Offset>()) } // p1-p0 deltas (screen px), all dot positions
+    var dragP0 by remember { mutableStateOf<Offset?>(null) } // window coords, start of the in-progress drag
+    var dragRaw by remember { mutableStateOf<Offset?>(null) } // window coords, current raw touch pos while dragging
+    var lastResidual by remember { mutableStateOf<Offset?>(null) } // |target - p1| for the most recent sample, hint only
     var revertMsg by remember { mutableStateOf<String?>(null) }
     var resultDx by remember { mutableIntStateOf(0) }
     var resultDy by remember { mutableIntStateOf(0) }
@@ -198,8 +194,8 @@ private fun CalibrateScreen(
         boxSize.height / 2f + viewOffsetY,
     )
 
-    // The five calibration targets, in canvas-local and window (screen) coordinates. Corners are
-    // inset 12% of the window width/height from their respective edges.
+    // The five positions the drag-align dot cycles through, in canvas-local and window (screen)
+    // coordinates. Corners are inset 12% of the window width/height from their respective edges.
     val insetX = boxSize.width * 0.12f
     val insetY = boxSize.height * 0.12f
     val targetsLocal = listOf(
@@ -228,55 +224,19 @@ private fun CalibrateScreen(
         DpadService.send(ctx, DpadService.ACTION_STOP_TEST)
         revertMsg = reason
         kept = false
-        phase = Phase.TARGETS
-        targetIndex = 0
-        roundTaps = emptyList()
-        pool = emptyList()
-        roundNumber = 1
-        spreadMsg = null
+        phase = Phase.DRAG
+        dotIndex = 0
+        samples = emptyList()
+        dragP0 = null
+        dragRaw = null
+        lastResidual = null
         verifyTap = null
         residual = null
     }
 
-    fun handleTap(sx: Float, sy: Float) {
-        when (phase) {
-            Phase.TARGETS -> {
-                if (roundTaps.isEmpty()) revertMsg = null
-                if (targetIndex >= 5) return
-                roundTaps = roundTaps + Offset(sx, sy)
-                targetIndex = roundTaps.size
-                if (roundTaps.size == 5) {
-                    // delta_i = target_i - tap_i, screen px.
-                    val deltas = targetsScreen.zip(roundTaps) { t, p -> Offset(t.x - p.x, t.y - p.y) }
-                    val meanX = deltas.map { it.x }.average().toFloat()
-                    val meanY = deltas.map { it.y }.average().toFloat()
-                    val acceptedFlags = deltas.map { hypot((it.x - meanX).toDouble(), (it.y - meanY).toDouble()) <= 40.0 }
-                    val accepted = deltas.filterIndexed { i, _ -> acceptedFlags[i] }
-                    if (accepted.size < 3) {
-                        spreadMsg = "Too much spread, try again"
-                        roundTaps = emptyList()
-                        targetIndex = 0
-                    } else {
-                        spreadMsg = null
-                        val ax = accepted.map { it.x }.average().toFloat()
-                        val ay = accepted.map { it.y }.average().toFloat()
-                        val spread = accepted.maxOf { hypot((it.x - ax).toDouble(), (it.y - ay).toDouble()) }.toFloat()
-                        roundTable = TARGET_NAMES.indices.map { i -> Triple(TARGET_NAMES[i], deltas[i], acceptedFlags[i]) }
-                        roundSpread = spread
-                        pool = pool + accepted
-                        roundTaps = emptyList()
-                        targetIndex = 0
-                        phase = Phase.ROUND_RESULT
-                    }
-                }
-            }
-            Phase.ROUND_RESULT -> {} // wait for Another round / Use this
-            Phase.RESULT -> {} // wait for the Continue button
-            Phase.VERIFY -> {
-                verifyTap = Offset(sx, sy)
-                residual = Offset(dotCenter.x - sx, dotCenter.y - sy)
-            }
-        }
+    fun handleVerifyTap(sx: Float, sy: Float) {
+        verifyTap = Offset(sx, sy)
+        residual = Offset(dotCenter.x - sx, dotCenter.y - sy)
     }
 
     // Starts the verify test run once, the moment this phase is entered, and remembers the
@@ -315,19 +275,50 @@ private fun CalibrateScreen(
                 view.getLocationOnScreen(loc)
                 viewOffsetX = loc[0].toFloat(); viewOffsetY = loc[1].toFloat()
             }
-            .pointerInput(Unit) {
-                awaitEachGesture {
-                    val down = awaitFirstDown(requireUnconsumed = false)
-                    handleTap(down.position.x + viewOffsetX, down.position.y + viewOffsetY)
+            .pointerInput(phase) {
+                when (phase) {
+                    Phase.DRAG -> awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        revertMsg = null
+                        val p0 = Offset(down.position.x + viewOffsetX, down.position.y + viewOffsetY)
+                        dragP0 = p0
+                        dragRaw = p0
+                        val id = down.id
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val change = event.changes.firstOrNull { it.id == id } ?: break
+                            val raw = Offset(change.position.x + viewOffsetX, change.position.y + viewOffsetY)
+                            dragRaw = raw
+                            if (!change.pressed) {
+                                val target = targetsScreen[dotIndex % targetsScreen.size]
+                                samples = samples + Offset(raw.x - p0.x, raw.y - p0.y)
+                                lastResidual = Offset(target.x - raw.x, target.y - raw.y)
+                                dragP0 = null
+                                dragRaw = null
+                                break
+                            }
+                        }
+                    }
+                    Phase.VERIFY -> awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        handleVerifyTap(down.position.x + viewOffsetX, down.position.y + viewOffsetY)
+                    }
+                    else -> {}
                 }
             },
     ) {
         Canvas(Modifier.fillMaxSize()) {
             when (phase) {
-                Phase.TARGETS -> {
-                    val t = targetsLocal.getOrElse(targetIndex) { Offset(size.width / 2f, size.height / 2f) }
-                    drawCircle(color = Color.White.copy(alpha = 0.25f), radius = 18.dp.toPx(), center = t, style = Stroke(width = 2.dp.toPx()))
+                Phase.DRAG -> {
+                    val t = targetsLocal[dotIndex % targetsLocal.size]
+                    drawCircle(color = Color.White.copy(alpha = 0.25f), radius = 24.dp.toPx(), center = t, style = Stroke(width = 2.dp.toPx()))
                     drawCircle(color = Color.Red, radius = 6.dp.toPx(), center = t)
+                    dragRaw?.let { raw ->
+                        val p = Offset(raw.x - viewOffsetX, raw.y - viewOffsetY)
+                        val len = 14.dp.toPx()
+                        drawLine(Color.Green, Offset(p.x - len, p.y), Offset(p.x + len, p.y), strokeWidth = 3f)
+                        drawLine(Color.Green, Offset(p.x, p.y - len), Offset(p.x, p.y + len), strokeWidth = 3f)
+                    }
                 }
                 Phase.VERIFY -> {
                     val center = Offset(size.width / 2f, size.height / 2f)
@@ -347,39 +338,39 @@ private fun CalibrateScreen(
             Text("Stylus offset calibration — $profileName", color = Color.White, style = MaterialTheme.typography.titleMedium)
             Text("Hold the device the way you play.", color = Color.White, style = MaterialTheme.typography.bodyMedium)
             when (phase) {
-                Phase.TARGETS -> {
-                    Text("Tap target ${targetIndex + 1}/5 — ${TARGET_NAMES[targetIndex]}", color = Color.White)
-                    spreadMsg?.let { Text(it, color = Color.Yellow) }
+                Phase.DRAG -> {
+                    Text(
+                        "Put the stylus on the dot the way you normally hold it. A crosshair shows where the " +
+                            "touch landed. Without lifting, slide until the crosshair is centered on the dot, then lift.",
+                        color = Color.White,
+                    )
                     revertMsg?.let { Text(it, color = Color.Red, style = MaterialTheme.typography.bodyMedium) }
-                }
-                Phase.ROUND_RESULT -> {
-                    Text("Round $roundNumber — spread ${"%.1f".format(roundSpread)} px", color = Color.White)
-                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        Row {
-                            Text("Target", color = Color.White, modifier = Modifier.width(96.dp), style = MaterialTheme.typography.bodySmall)
-                            Text("dx", color = Color.White, modifier = Modifier.width(56.dp), style = MaterialTheme.typography.bodySmall)
-                            Text("dy", color = Color.White, modifier = Modifier.width(56.dp), style = MaterialTheme.typography.bodySmall)
-                        }
-                        for ((name, d, accepted) in roundTable) {
-                            val c = if (accepted) Color.White else Color.Gray
-                            Row {
-                                Text(name, color = c, modifier = Modifier.width(96.dp), style = MaterialTheme.typography.bodySmall)
-                                Text("%.1f".format(d.x), color = c, modifier = Modifier.width(56.dp), style = MaterialTheme.typography.bodySmall)
-                                Text("%.1f".format(d.y), color = c, modifier = Modifier.width(56.dp), style = MaterialTheme.typography.bodySmall)
+                    if (samples.isNotEmpty()) {
+                        val meanX = samples.map { it.x }.average().toFloat()
+                        val meanY = samples.map { it.y }.average().toFloat()
+                        val spread = samples.maxOf { hypot((it.x - meanX).toDouble(), (it.y - meanY).toDouble()) }.toFloat()
+                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            samples.forEachIndexed { i, d ->
+                                Text("Sample ${i + 1}: ${"%.1f".format(d.x)}, ${"%.1f".format(d.y)}", color = Color.White, style = MaterialTheme.typography.bodySmall)
                             }
                         }
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        OutlinedButton(onClick = { roundNumber++; phase = Phase.TARGETS }) { Text("Another round") }
-                        Button(onClick = {
-                            val meanX = pool.map { it.x }.average().toFloat()
-                            val meanY = pool.map { it.y }.average().toFloat()
-                            val finalSpread = pool.maxOf { hypot((it.x - meanX).toDouble(), (it.y - meanY).toDouble()) }.toFloat()
-                            val (dx, dy) = Calibration.toPanelOffset(meanX, meanY, rotation, natSize.natW, natSize.natH, panelMaxX, panelMaxY)
-                            resultDx = dx; resultDy = dy; spreadPx = finalSpread
-                            saveOffset(dx, dy, liveUpdate = false)
-                            phase = Phase.RESULT
-                        }) { Text("Use this") }
+                        lastResidual?.let { r ->
+                            Text(
+                                "Alignment residual (hint): ${"%.1f".format(hypot(r.x.toDouble(), r.y.toDouble()))} px",
+                                color = Color.Yellow, style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                        Text("Spread: ${"%.1f".format(spread)} px", color = Color.White, style = MaterialTheme.typography.bodySmall)
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            OutlinedButton(onClick = { dotIndex = (dotIndex + 1) % targetsLocal.size }) { Text("Add another position") }
+                            OutlinedButton(onClick = { samples = samples.dropLast(1) }) { Text("Redo last") }
+                            Button(onClick = {
+                                val (dx, dy) = Calibration.toPanelOffset(meanX, meanY, rotation, natSize.natW, natSize.natH, panelMaxX, panelMaxY)
+                                resultDx = dx; resultDy = dy; spreadPx = spread
+                                saveOffset(dx, dy, liveUpdate = false)
+                                phase = Phase.RESULT
+                            }) { Text("Use this") }
+                        }
                     }
                 }
                 Phase.RESULT -> {
@@ -422,7 +413,7 @@ private fun CalibrateScreen(
                     }
                 }
             }
-            if (phase == Phase.TARGETS) {
+            if (phase == Phase.DRAG) {
                 TextButton(onClick = { showAdvanced = !showAdvanced }) {
                     Text(if (showAdvanced) "Hide advanced" else "Advanced…", color = Color.White)
                 }
