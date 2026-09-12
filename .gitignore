@@ -1,0 +1,16 @@
+# device captures and per-device state
+capture/
+device.env
+base/
+out/
+build/
+# daemon build output (rebuild with daemon/build.sh; the shipped copy lives in android/.../jniLibs)
+daemon/out/
+# android build
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/*.iml
+android/.kotlin/

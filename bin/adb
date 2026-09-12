@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# WSL shim: run the Windows-side adb.exe so USB devices work. Translates the
+# local path argument of push/pull to a Windows path via wslpath, and strips
+# CRLF from text-producing subcommands so bash comparisons work.
+ADB_EXE="${ADB_EXE:-/mnt/c/Users/Josh/AppData/Local/Android/Sdk/platform-tools/adb.exe}"
+args=("$@")
+case "${1:-}" in
+  push) [[ $# -ge 2 ]] && args[1]="$(wslpath -w "$2")" ;;
+  pull) n=$#; [[ $n -ge 3 ]] && args[$((n-1))]="$(wslpath -w "${!n}")" ;;
+esac
+case "${1:-}" in
+  shell|get-state|devices|get-serialno|version|logcat)
+    set -o pipefail
+    "$ADB_EXE" "${args[@]}" | tr -d '\r'
+    exit "${PIPESTATUS[0]}" ;;
+  *) exec "$ADB_EXE" "${args[@]}" ;;
+esac
