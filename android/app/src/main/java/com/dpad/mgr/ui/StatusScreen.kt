@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.PowerManager
 import android.provider.Settings
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -28,6 +29,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
@@ -38,7 +40,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.dpad.mgr.core.DaemonState
 import com.dpad.mgr.core.Store
@@ -58,6 +63,11 @@ private fun appLabel(ctx: Context, pkg: String): String =
         val pm = ctx.packageManager
         pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
     }.getOrDefault(pkg)
+
+private fun isIgnoringBatteryOptimizations(ctx: Context): Boolean {
+    val pm = ctx.getSystemService(PowerManager::class.java) ?: return true
+    return pm.isIgnoringBatteryOptimizations(ctx.packageName)
+}
 
 private fun isDaemonActive(d: DaemonState): Boolean = when (d) {
     is DaemonState.Running, is DaemonState.Starting, is DaemonState.Backoff -> true
@@ -80,6 +90,18 @@ fun StatusScreen(modifier: Modifier = Modifier) {
     }
     var menu by remember { mutableStateOf(false) }
     val snackbarHostState = remember { SnackbarHostState() }
+
+    // Battery-optimization exemption state, refreshed on resume (the user grants it in a
+    // Settings dialog that returns here, so a one-shot check at composition wouldn't pick it up).
+    var batteryExempt by remember { mutableStateOf(isIgnoringBatteryOptimizations(ctx)) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) batteryExempt = isIgnoringBatteryOptimizations(ctx)
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     LaunchedEffect(lastAction) { lastAction?.let { snackbarHostState.showSnackbar(it) } }
 
@@ -150,6 +172,25 @@ fun StatusScreen(modifier: Modifier = Modifier) {
                             "Starts the daemon with the selected profile for 30 seconds. All pad input is swallowed except the mapped keys.",
                             style = MaterialTheme.typography.bodySmall,
                         )
+                    }
+                }
+            }
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Keep alive", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        if (batteryExempt) "Exempt from battery optimization"
+                        else "Battery optimization is on — Android may stop the background service",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    if (!batteryExempt) {
+                        Button(onClick = {
+                            val intent = Intent(
+                                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                Uri.parse("package:${ctx.packageName}"),
+                            )
+                            ctx.startActivity(intent)
+                        }) { Text("Allow running in background") }
                     }
                 }
             }
@@ -244,6 +285,11 @@ private fun SetupCard(modifier: Modifier = Modifier) {
                 body = "Requests the Shizuku permission for this app and re-checks privilege.",
                 buttonLabel = "Grant access",
                 onClick = { DpadService.send(ctx, DpadService.ACTION_RECHECK) },
+            )
+
+            Text(
+                "The app runs in the background; you don't need to open it before launching a game.",
+                style = MaterialTheme.typography.bodySmall,
             )
 
             Text(

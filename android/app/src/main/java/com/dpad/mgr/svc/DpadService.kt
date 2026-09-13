@@ -30,6 +30,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import rikka.shizuku.Shizuku
 
 class DpadService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -42,6 +43,15 @@ class DpadService : Service() {
      *  avoid restarting the tail (and leaking a logcat process) on every re-check when the
      *  same privilege is still held. */
     private var watcherStartedFor: com.dpad.mgr.priv.PrivShell? = null
+
+    /** Fires whenever the Shizuku binder (re)appears, including after the service was started
+     *  before Shizuku itself was up. Re-runs the probe so privilege is picked up without the
+     *  user having to hit Re-check by hand. Sticky, so it also fires immediately on registration
+     *  if the binder is already available. */
+    private val shizukuBinderListener = Shizuku.OnBinderReceivedListener {
+        Log.i(TAG, "shizuku: binder received, re-probing")
+        scope.launch { recheck("shizuku binder received") }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -84,6 +94,8 @@ class DpadService : Service() {
                 .collect { (pkg, prof) -> supervisor.setTarget(if (prof != null) pkg else null, prof) }
         }
         scope.launch { recheck("service start") }
+        runCatching { Shizuku.addBinderReceivedListenerSticky(shizukuBinderListener) }
+            .onFailure { Log.w(TAG, "shizuku: addBinderReceivedListenerSticky failed $it") }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -194,8 +206,18 @@ class DpadService : Service() {
         supervisor.reset()
     }
 
+    /** Swiping the app from recents (task removed) must not stop the daemon: restart the
+     *  service immediately so the mapping keeps running. Belt-and-suspenders alongside
+     *  android:stopWithTask="false" on the service and excludeFromRecents on MainActivity. */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        Log.i(TAG, "onTaskRemoved: restarting service")
+        ensureStarted(this)
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
         ServiceState.serviceRunning.value = false
+        runCatching { Shizuku.removeBinderReceivedListener(shizukuBinderListener) }
         scope.cancel()
         super.onDestroy()
     }
