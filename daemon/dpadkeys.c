@@ -112,7 +112,7 @@ typedef struct {
     int code;        /* EV_KEY or EV_ABS code */
     int dir;         /* RAW_ABS only: -1 (neg) or +1 (pos) */
     bool axis_known; /* RAW_ABS: axis range queried from the device */
-    struct { int min, max; double center, half; int state; } axis;
+    struct { int min, max; double center, half; bool unipolar; int state; } axis;
 } raw_source_t;
 
 /* ---- target key name table ---- */
@@ -825,6 +825,7 @@ typedef struct {
     int code;
     int min, max;
     double center, half;
+    bool unipolar; /* min >= 0, resting at/near min (a real trigger axis) */
     int state; /* tri-state (-1/0/1) for sticks, 0/1 for triggers */
 } axis_t;
 
@@ -838,6 +839,12 @@ typedef struct {
     unsigned ls_dirs, rs_dirs;
 } axes_t;
 
+/* Unipolar: min >= 0 and the axis was resting within 5% of its minimum when
+ * queried -- i.e. a real trigger axis (0..N resting at 0), as opposed to a
+ * 0..255-style stick axis resting at its midpoint. Overridden to true
+ * unconditionally for the trigger axes detect_axes() picks from
+ * ABS_GAS/ABS_BRAKE/ABS_Z/ABS_RZ, since those are always triggers even if
+ * queried mid-pull. */
 static void query_abs(int fd, int code, axis_t *a) {
     struct input_absinfo info;
     if (ioctl(fd, EVIOCGABS(code), &info) < 0) {
@@ -851,6 +858,9 @@ static void query_abs(int fd, int code, axis_t *a) {
     a->center = (info.minimum + info.maximum) / 2.0;
     a->half = (info.maximum - info.minimum) / 2.0;
     if (a->half <= 0) a->half = 1.0; /* degenerate axis: avoid div-by-zero feel */
+    double range = info.maximum - info.minimum;
+    a->unipolar = info.minimum >= 0 && info.maximum > 0 &&
+                  info.value <= info.minimum + 0.05 * range;
     a->state = 0;
 }
 
@@ -877,15 +887,22 @@ static void detect_axes(int fd, axes_t *ax) {
         query_abs(fd, ABS_RZ, &ax->rs_y);
     }
 
-    /* Triggers: Z/RZ if the right stick didn't already claim them as its
-     * Z/RZ fallback, else BRAKE/GAS, else HAT2Y/HAT2X. */
-    bool rs_uses_z_rz = !has_rx_ry && has_z_rz;
-    if (has_z_rz && !rs_uses_z_rz) {
-        query_abs(fd, ABS_Z, &ax->lt);
-        query_abs(fd, ABS_RZ, &ax->rt);
-    } else if (TEST_BIT(ABS_BRAKE, absbits) && TEST_BIT(ABS_GAS, absbits)) {
+    /* Triggers, in priority order: ABS_BRAKE/ABS_GAS (the real triggers on
+     * pads like the AYN Odin 2's virtual gamepad, which also expose Z/RZ);
+     * else ABS_Z/ABS_RZ, but only if the right stick claimed RX/RY instead
+     * (so Z/RZ are free -- otherwise they're the right stick's own axes,
+     * not triggers); else ABS_HAT2Y/ABS_HAT2X. Whichever of
+     * BRAKE/GAS/Z/RZ is chosen is always treated as unipolar (0-resting),
+     * regardless of query_abs()'s resting-value heuristic -- a trigger may
+     * be mid-pulled at detect time. */
+    if (TEST_BIT(ABS_BRAKE, absbits) && TEST_BIT(ABS_GAS, absbits)) {
         query_abs(fd, ABS_BRAKE, &ax->lt);
         query_abs(fd, ABS_GAS, &ax->rt);
+        ax->lt.unipolar = ax->rt.unipolar = true;
+    } else if (has_z_rz && has_rx_ry) {
+        query_abs(fd, ABS_Z, &ax->lt);
+        query_abs(fd, ABS_RZ, &ax->rt);
+        ax->lt.unipolar = ax->rt.unipolar = true;
     } else if (TEST_BIT(ABS_HAT2Y, absbits) && TEST_BIT(ABS_HAT2X, absbits)) {
         query_abs(fd, ABS_HAT2Y, &ax->lt);
         query_abs(fd, ABS_HAT2X, &ax->rt);
@@ -909,8 +926,22 @@ static int classify_stick(int raw, const axis_t *a, double deadzone) {
     return 0;
 }
 
+/* Unipolar (real trigger) axes are thresholded off the minimum, not the
+ * midpoint: pressed at min + deadzone*(max-min) (50% pull by default),
+ * released below min + (deadzone-0.1)*(max-min). A center-based threshold
+ * would put a 0-resting 0..32767 axis' press point at 75% pull instead of
+ * 50%. Non-unipolar (bipolar, e.g. a HAT2-fallback trigger) axes keep the
+ * old center/half hysteresis formula. */
 static bool classify_trigger(int raw, const axis_t *a, double deadzone) {
-    double v = raw, hys = 0.1 * a->half;
+    double v = raw;
+    if (a->unipolar) {
+        double range = a->max - a->min;
+        if (range <= 0) range = 1.0;
+        double press = a->min + deadzone * range;
+        double release = a->min + (deadzone - 0.1) * range;
+        return a->state ? (v >= release) : (v >= press);
+    }
+    double hys = 0.1 * a->half;
     double press = a->center + deadzone * a->half;
     return a->state ? (v >= press - hys) : (v >= press);
 }
@@ -984,13 +1015,41 @@ static void raw_query_axes(int fd, config_t *cfg) {
         r->axis.center = (info.minimum + info.maximum) / 2.0;
         r->axis.half = (info.maximum - info.minimum) / 2.0;
         if (r->axis.half <= 0) r->axis.half = 1.0;
+        double range = info.maximum - info.minimum;
+        r->axis.unipolar = info.minimum >= 0 && info.maximum > 0 &&
+                            info.value <= info.minimum + 0.05 * range;
         r->axis.state = 0;
     }
 }
 
+/* A raw abs source addressing the same physical axis code the daemon chose
+ * as lt/rt inherits that axis' (possibly forced-true) unipolar flag, so
+ * e.g. abs.0x9.pos agrees with rt on an AYN-style GAS/BRAKE pad even though
+ * the per-axis heuristic alone would already have gotten it right. Called
+ * after both detect_axes() and raw_query_axes(). */
+static void propagate_trigger_unipolar(config_t *cfg, const axes_t *ax) {
+    for (int i = 0; i < cfg->n_raw; i++) {
+        raw_source_t *r = &cfg->raw[i];
+        if (r->kind != RAW_ABS || !r->axis_known) continue;
+        if (ax->lt.present && r->code == ax->lt.code) r->axis.unipolar = ax->lt.unipolar;
+        else if (ax->rt.present && r->code == ax->rt.code) r->axis.unipolar = ax->rt.unipolar;
+    }
+}
+
 /* Raw abs threshold: same deadzone + 0.1 hysteresis as triggers, mirrored
- * for `.neg`. A hat-like -1..1 axis therefore fires exactly at -1 / +1. */
+ * for `.neg`. A hat-like -1..1 axis therefore fires exactly at -1 / +1. A
+ * unipolar axis (see raw_query_axes()/propagate_trigger_unipolar()) is
+ * thresholded off its minimum like classify_trigger(); `.neg` is rejected
+ * for such an axis at load time (raw_unipolar_neg_reject()), so `r->dir` is
+ * always +1 here in practice. */
 static bool raw_abs_pressed(const raw_source_t *r, int value, double deadzone) {
+    if (r->axis.unipolar) {
+        double range = r->axis.max - r->axis.min;
+        if (range <= 0) range = 1.0;
+        double press = r->axis.min + deadzone * range;
+        double release = r->axis.min + (deadzone - 0.1) * range;
+        return r->axis.state ? (value >= release) : (value >= press);
+    }
     double v = (value - r->axis.center) / r->axis.half;
     if (r->dir < 0) v = -v;
     return r->axis.state ? (v >= deadzone - 0.1) : (v >= deadzone);
@@ -1036,6 +1095,33 @@ static const char *raw_axis_collision(const config_t *cfg, const axes_t *ax) {
             snprintf(msg, sizeof(msg), "raw source '%s' collides with '%s' on this pad", r->name, sem);
             return msg;
         }
+    }
+    return NULL;
+}
+
+/* A unipolar axis (real trigger: min >= 0, resting at/near min) never goes
+ * negative, so `abs.0xNN.neg` can never fire on one -- reject it once the
+ * device's axis range is known (after raw_query_axes()/
+ * propagate_trigger_unipolar()), suggesting `.pos` and, if this raw source
+ * addresses the axis chosen as lt/rt, that semantic name too. */
+static const char *raw_unipolar_neg_reject(const config_t *cfg, const axes_t *ax) {
+    static char msg[160];
+    for (int i = 0; i < cfg->n_raw; i++) {
+        const raw_source_t *r = &cfg->raw[i];
+        if (r->kind != RAW_ABS || r->dir >= 0) continue; /* only .neg */
+        if (!r->axis_known || !r->axis.unipolar) continue;
+        char pos_name[32];
+        snprintf(pos_name, sizeof(pos_name), "abs.0x%x.pos", (unsigned)r->code);
+        if (ax->lt.present && r->code == ax->lt.code)
+            snprintf(msg, sizeof(msg), "raw source '%s' addresses a unipolar axis (min=%d,max=%d); "
+                     "'.neg' can never fire -- use '%s' or 'lt' instead", r->name, r->axis.min, r->axis.max, pos_name);
+        else if (ax->rt.present && r->code == ax->rt.code)
+            snprintf(msg, sizeof(msg), "raw source '%s' addresses a unipolar axis (min=%d,max=%d); "
+                     "'.neg' can never fire -- use '%s' or 'rt' instead", r->name, r->axis.min, r->axis.max, pos_name);
+        else
+            snprintf(msg, sizeof(msg), "raw source '%s' addresses a unipolar axis (min=%d,max=%d); "
+                     "'.neg' can never fire -- use '%s' instead", r->name, r->axis.min, r->axis.max, pos_name);
+        return msg;
     }
     return NULL;
 }
@@ -1702,8 +1788,10 @@ static void print_touch_banner(const config_t *cfg) {
 
 /* ---- banner formatting ---- */
 
+/* lt=/rt= banner form includes the chosen ABS code so it's clear which axis
+ * won the priority order in detect_axes(), e.g. "lt=0xa[0,32767]". */
 static void fmt_axis(char *buf, size_t n, const axis_t *a) {
-    if (a->present) snprintf(buf, n, "[%d,%d]", a->min, a->max);
+    if (a->present) snprintf(buf, n, "0x%02x[%d,%d]", (unsigned)a->code, a->min, a->max);
     else snprintf(buf, n, "none");
 }
 
@@ -1835,10 +1923,17 @@ static void learn_stick_name(const axes_t *ax, int code, int sign, char *out, si
  * print_usage() for examples and --learn-hold-ms. Returns 0 on success, 3 on
  * timeout (`learned NONE`). */
 static int learn_mode(int fd, const axes_t *ax, long long timeout_ms, long long hold_ms) {
-    /* Per-axis tri-state (-1/0/1) seeded from the CURRENT position so a
-     * trigger resting at its minimum or an off-centre stick never counts as
-     * a press; only a transition into the pressed zone does. */
-    struct { bool known; double center, half; int state; } axes[ABS_CNT];
+    /* Per-axis state seeded from the CURRENT position so a trigger resting
+     * at its minimum or an off-centre stick never counts as a press; only a
+     * transition into the pressed zone does. Bipolar axes (sticks, hat,
+     * HAT2-fallback triggers) use a tri-state -1/0/1 centered on the axis
+     * midpoint; unipolar axes (real triggers: min >= 0, resting at/near
+     * min -- see query_abs()) use a 0/1 state anchored at the minimum, same
+     * as the daemon's classify_trigger()/raw_abs_pressed(), so --learn
+     * fires at the same 50%-pull point the daemon will. A chosen lt/rt axis
+     * is unipolar per `ax` regardless of the heuristic below (it may be
+     * mid-pulled right now), mirroring detect_axes(). */
+    struct { bool known; double center, half; int min, max; bool unipolar; int state; } axes[ABS_CNT];
     memset(axes, 0, sizeof(axes));
     unsigned long absbits[NLONGS(ABS_CNT)] = {0};
     ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits);
@@ -1848,11 +1943,24 @@ static int learn_mode(int fd, const axes_t *ax, long long timeout_ms, long long 
         struct input_absinfo info;
         if (ioctl(fd, EVIOCGABS(c), &info) < 0) continue;
         axes[c].known = true;
+        axes[c].min = info.minimum;
+        axes[c].max = info.maximum;
         axes[c].center = (info.minimum + info.maximum) / 2.0;
         axes[c].half = (info.maximum - info.minimum) / 2.0;
         if (axes[c].half <= 0) axes[c].half = 1.0;
-        double v = (info.value - axes[c].center) / axes[c].half;
-        axes[c].state = v >= dz ? 1 : (v <= -dz ? -1 : 0);
+        double range = info.maximum - info.minimum;
+        axes[c].unipolar = info.minimum >= 0 && info.maximum > 0 &&
+                            info.value <= info.minimum + 0.05 * range;
+        if (ax->lt.present && c == ax->lt.code) axes[c].unipolar = ax->lt.unipolar;
+        else if (ax->rt.present && c == ax->rt.code) axes[c].unipolar = ax->rt.unipolar;
+        if (axes[c].unipolar) {
+            double r = axes[c].max - axes[c].min;
+            double frac = (info.value - axes[c].min) / (r > 0 ? r : 1.0);
+            axes[c].state = frac >= dz ? 1 : 0;
+        } else {
+            double v = (info.value - axes[c].center) / axes[c].half;
+            axes[c].state = v >= dz ? 1 : (v <= -dz ? -1 : 0);
+        }
     }
 
     static learn_held_t held[LEARN_MAX_HELD];
@@ -1894,15 +2002,15 @@ static int learn_mode(int fd, const axes_t *ax, long long timeout_ms, long long 
         }
 
         if (ev.type != EV_ABS || ev.code >= ABS_CNT || !axes[ev.code].known) continue;
-        double v = (ev.value - axes[ev.code].center) / axes[ev.code].half;
-        int st = axes[ev.code].state;
-        int ns = st == 1 ? (v >= dz - 0.1 ? 1 : 0)
-               : st == -1 ? (v <= -(dz - 0.1) ? -1 : 0)
-               : (v >= dz ? 1 : (v <= -dz ? -1 : 0));
-        if (ns == st) continue;
-        axes[ev.code].state = ns;
 
         if (learn_is_stick_axis(ax, ev.code)) {
+            double v = (ev.value - axes[ev.code].center) / axes[ev.code].half;
+            int st = axes[ev.code].state;
+            int ns = st == 1 ? (v >= dz - 0.1 ? 1 : 0)
+                   : st == -1 ? (v <= -(dz - 0.1) ? -1 : 0)
+                   : (v >= dz ? 1 : (v <= -dz ? -1 : 0));
+            if (ns == st) continue;
+            axes[ev.code].state = ns;
             /* stick directions are never hold-eligible: a release is not a
              * trigger, and a fresh press is a trigger with no press/release
              * bookkeeping of its own. */
@@ -1915,27 +2023,67 @@ static int learn_mode(int fd, const axes_t *ax, long long timeout_ms, long long 
             break;
         }
 
-        /* hat / trigger / raw abs axis: button-like, so track press+release
-         * like an EV_KEY control. A direct sign flip (-1 <-> 1, e.g. a hat
-         * snapping past centre in one event) is a release of the old
-         * direction followed by a press of the new one. */
-        if (st != 0) {
+        if (axes[ev.code].unipolar) {
+            /* Real trigger axis (chosen lt/rt, or any other unipolar raw
+             * abs axis): press-only, thresholded off the minimum at the
+             * same 50%-pull point as the daemon (classify_trigger()/
+             * raw_abs_pressed()). Never reports on release -- there is no
+             * meaningful ".neg" for a unipolar axis, so a bare release
+             * (e.g. the trigger was already held when --learn started)
+             * stays silent instead of misreporting one. */
+            double r = axes[ev.code].max - axes[ev.code].min;
+            if (r <= 0) r = 1.0;
+            double frac = (ev.value - axes[ev.code].min) / r;
+            int st = axes[ev.code].state; /* 0 or 1 */
+            int ns = st ? (frac >= dz - 0.1 ? 1 : 0) : (frac >= dz ? 1 : 0);
+            if (ns == st) continue;
+            axes[ev.code].state = ns;
             char name[48];
-            learn_abs_name(ax, ev.code, st, name, sizeof(name));
-            learn_held_t *e = learn_find(held, LEARN_MAX_HELD, name);
-            if (e) e->held = false;
-            /* A pure release (back to centre) may itself be the plain report;
-             * a direct sign flip (st and ns both nonzero) falls through to
-             * report the new direction's press instead. */
-            if (ns == 0 && !out[0]) { snprintf(out, sizeof(out), "%s", name); break; }
-        }
-        if (ns != 0) {
-            char name[48];
-            learn_abs_name(ax, ev.code, ns, name, sizeof(name));
+            learn_abs_name(ax, ev.code, 1, name, sizeof(name)); /* lt/rt or abs.0xNN.pos -- never .neg */
+            if (ns == 0) {
+                learn_held_t *e = learn_find(held, LEARN_MAX_HELD, name);
+                if (e) e->held = false;
+                continue; /* no report on release */
+            }
             learn_held_t *best = learn_best_hold(held, LEARN_MAX_HELD, now, hold_ms);
             if (best) { snprintf(out, sizeof(out), "%s+%s", best->name, name); break; }
             learn_held_t *e = learn_find_or_add(held, LEARN_MAX_HELD, name);
             if (e) { e->held = true; e->since = now; }
+            continue;
+        }
+
+        /* bipolar hat / HAT2-fallback trigger / raw abs axis: button-like,
+         * so track press+release like an EV_KEY control. A direct sign flip
+         * (-1 <-> 1, e.g. a hat snapping past centre in one event) is a
+         * release of the old direction followed by a press of the new
+         * one. */
+        {
+            double v = (ev.value - axes[ev.code].center) / axes[ev.code].half;
+            int st = axes[ev.code].state;
+            int ns = st == 1 ? (v >= dz - 0.1 ? 1 : 0)
+                   : st == -1 ? (v <= -(dz - 0.1) ? -1 : 0)
+                   : (v >= dz ? 1 : (v <= -dz ? -1 : 0));
+            if (ns == st) continue;
+            axes[ev.code].state = ns;
+
+            if (st != 0) {
+                char name[48];
+                learn_abs_name(ax, ev.code, st, name, sizeof(name));
+                learn_held_t *e = learn_find(held, LEARN_MAX_HELD, name);
+                if (e) e->held = false;
+                /* A pure release (back to centre) may itself be the plain
+                 * report; a direct sign flip (st and ns both nonzero) falls
+                 * through to report the new direction's press instead. */
+                if (ns == 0 && !out[0]) { snprintf(out, sizeof(out), "%s", name); break; }
+            }
+            if (ns != 0) {
+                char name[48];
+                learn_abs_name(ax, ev.code, ns, name, sizeof(name));
+                learn_held_t *best = learn_best_hold(held, LEARN_MAX_HELD, now, hold_ms);
+                if (best) { snprintf(out, sizeof(out), "%s+%s", best->name, name); break; }
+                learn_held_t *e = learn_find_or_add(held, LEARN_MAX_HELD, name);
+                if (e) { e->held = true; e->since = now; }
+            }
         }
     }
     if (!out[0]) {
@@ -2113,10 +2261,19 @@ int main(int argc, char **argv) {
     }
 
     raw_query_axes(g_pad_fd, &cfg);
+    propagate_trigger_unipolar(&cfg, &ax);
     {
         const char *coll = raw_axis_collision(&cfg, &ax);
         if (coll) {
             fprintf(stderr, "dpadkeys: %s\n", coll);
+            close(g_pad_fd);
+            return 2;
+        }
+    }
+    {
+        const char *bad = raw_unipolar_neg_reject(&cfg, &ax);
+        if (bad) {
+            fprintf(stderr, "dpadkeys: %s\n", bad);
             close(g_pad_fd);
             return 2;
         }
@@ -2317,6 +2474,7 @@ int main(int argc, char **argv) {
                 }
                 detect_axes(g_pad_fd, &ax);
                 raw_query_axes(g_pad_fd, &cfg);
+                propagate_trigger_unipolar(&cfg, &ax);
                 fprintf(stderr, "dpadkeys: reacquired pad=%s name=\"%s\"\n", pad_path, pad_name);
                 print_banner(pad_path, pad_name, vendor, product, &ax, &cfg);
                 continue;
