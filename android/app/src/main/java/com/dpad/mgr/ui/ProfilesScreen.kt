@@ -86,13 +86,14 @@ fun ProfilesScreen(modifier: Modifier = Modifier) {
         return
     }
     Column(modifier) {
-        Row(Modifier.padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Profiles", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
+        Row(Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
                 modifier = Modifier.heightIn(min = 48.dp),
                 onClick = { editing = null to Profile(name = uniqueName("New profile", data.profiles.map { it.name })) },
             ) { Text("New profile") }
         }
-        LazyColumn {
+        LazyColumn(contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 16.dp)) {
             items(data.profiles, key = { it.name }) { p ->
                 val used = data.assignments.count { it.value == p.name }
                 Row(

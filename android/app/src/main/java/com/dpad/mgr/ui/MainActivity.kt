@@ -7,16 +7,24 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
-import androidx.compose.material3.Scaffold
+import androidx.compose.material3.NavigationRail
+import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.List
@@ -26,8 +34,10 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.dpad.mgr.core.Store
 import com.dpad.mgr.svc.DpadService
@@ -44,7 +54,6 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun App() {
     val ctx = androidx.compose.ui.platform.LocalContext.current
@@ -55,23 +64,52 @@ fun App() {
         }
         runCatching { DpadService.ensureStarted(ctx) }
     }
-    var tab by remember { mutableIntStateOf(0) }
+    var tab by rememberSaveable { mutableIntStateOf(0) }
     val titles = listOf("Status", "Apps", "Profiles")
-    Scaffold(
-        topBar = { TopAppBar(title = { Text("Odin DPad Keys") }) },
-        bottomBar = {
-            NavigationBar {
-                NavigationBarItem(selected = tab == 0, onClick = { tab = 0 }, icon = { Icon(Icons.Default.Info, null) }, label = { Text(titles[0]) })
-                NavigationBarItem(selected = tab == 1, onClick = { tab = 1 }, icon = { Icon(Icons.Default.List, null) }, label = { Text(titles[1]) })
-                NavigationBarItem(selected = tab == 2, onClick = { tab = 2 }, icon = { Icon(Icons.Default.Settings, null) }, label = { Text(titles[2]) })
+    val icons = listOf(Icons.Default.Info, Icons.Default.List, Icons.Default.Settings)
+
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val landscape = maxWidth > maxHeight
+        if (landscape) {
+            Row(Modifier.fillMaxSize()) {
+                NavigationRail(
+                    modifier = Modifier.width(72.dp).fillMaxHeight(),
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                ) {
+                    titles.indices.forEach { i ->
+                        NavigationRailItem(
+                            selected = tab == i,
+                            onClick = { tab = i },
+                            icon = { Icon(icons[i], null) },
+                            label = { Text(titles[i], style = MaterialTheme.typography.labelSmall) },
+                        )
+                    }
+                }
+                Box(Modifier.weight(1f).fillMaxHeight().padding(12.dp)) {
+                    val m = Modifier.fillMaxSize()
+                    when (tab) {
+                        0 -> StatusScreen(m)
+                        1 -> AppsScreen(m)
+                        else -> ProfilesScreen(m)
+                    }
+                }
             }
-        },
-    ) { pad ->
-        val m = Modifier.padding(pad)
-        when (tab) {
-            0 -> StatusScreen(m)
-            1 -> AppsScreen(m)
-            else -> ProfilesScreen(m)
+        } else {
+            Column(Modifier.fillMaxSize()) {
+                TabRow(selectedTabIndex = tab, modifier = Modifier.fillMaxWidth().height(48.dp)) {
+                    titles.indices.forEach { i ->
+                        Tab(selected = tab == i, onClick = { tab = i }, text = { Text(titles[i]) })
+                    }
+                }
+                Box(Modifier.weight(1f).fillMaxWidth()) {
+                    val m = Modifier.fillMaxSize()
+                    when (tab) {
+                        0 -> StatusScreen(m)
+                        1 -> AppsScreen(m)
+                        else -> ProfilesScreen(m)
+                    }
+                }
+            }
         }
     }
 }

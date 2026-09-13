@@ -60,7 +60,8 @@ fun AppsScreen(modifier: Modifier = Modifier) {
         }
     }
     Column(modifier) {
-        OutlinedTextField(filter, { filter = it }, Modifier.fillMaxWidth().padding(12.dp), label = { Text("Filter apps") }, singleLine = true)
+        Text("Apps", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
+        OutlinedTextField(filter, { filter = it }, Modifier.fillMaxWidth().padding(horizontal = 12.dp), label = { Text("Filter apps") }, singleLine = true)
         val list = apps
         if (list == null) {
             Text("Loading apps…", Modifier.padding(16.dp))
