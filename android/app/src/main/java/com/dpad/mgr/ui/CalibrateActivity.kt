@@ -9,21 +9,27 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material3.Button
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -166,6 +172,7 @@ private fun fmtSigned(v: Float): String {
 private const val VERIFY_MARKER_CAP = 12
 private const val TAG = "DpadMgr"
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun CalibrateScreen(
     profileName: String,
@@ -219,6 +226,11 @@ private fun CalibrateScreen(
 
     var kept by remember { mutableStateOf(false) }
     var countdown by remember { mutableIntStateOf(CalibrateActivity.VERIFY_COUNTDOWN_S) }
+
+    // Hamburger menu: a single floating panel (contents depend on `phase`) toggled by the
+    // bottom-right icon button. Closed automatically whenever the phase changes.
+    var menuOpen by remember { mutableStateOf(false) }
+    LaunchedEffect(phase) { menuOpen = false }
 
     // The five positions the drag-align dot cycles through, in canvas-local and window (screen)
     // coordinates. Corners are inset 12% of the window width/height from their respective edges.
@@ -436,65 +448,9 @@ private fun CalibrateScreen(
                 )
             }
 
-            // Bottom bar: sample chips + Add/Redo/Continue (once there's a sample), plus the
-            // (collapsed by default) advanced panel-size override.
-            Column(
-                Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .background(Color.Black.copy(alpha = 0.55f))
-                    .padding(horizontal = 16.dp, vertical = 10.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                if (samples.isNotEmpty()) {
-                    val meanX = samples.map { it.x }.average().toFloat()
-                    val meanY = samples.map { it.y }.average().toFloat()
-                    val spread = samples.maxOf { hypot((it.x - meanX).toDouble(), (it.y - meanY).toDouble()) }.toFloat()
-
-                    Row(
-                        Modifier.horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        samples.forEachIndexed { i, d ->
-                            SampleChip("Sample ${i + 1}: ${fmtSigned(d.x)}, ${fmtSigned(d.y)}")
-                        }
-                    }
-                    if (samples.size >= 2) {
-                        Text("Spread: ${spread.roundToInt()} px", color = onSurfaceColor.copy(alpha = 0.8f), style = MaterialTheme.typography.bodySmall)
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(
-                            modifier = Modifier.heightIn(min = 48.dp),
-                            onClick = { dotIndex = (dotIndex + 1) % targetsLocal.size },
-                        ) { Text("Add position") }
-                        OutlinedButton(
-                            modifier = Modifier.heightIn(min = 48.dp),
-                            onClick = { samples = samples.dropLast(1) },
-                        ) { Text("Redo") }
-                        Button(
-                            modifier = Modifier.heightIn(min = 48.dp),
-                            onClick = {
-                                val (dx, dy) = Calibration.toPanelOffset(meanX, meanY, rotation, natSize.natW, natSize.natH, panelMaxX, panelMaxY)
-                                resultDx = dx; resultDy = dy
-                                saveOffset(dx, dy, liveUpdate = false)
-                                phase = Phase.VERIFY
-                            },
-                        ) { Text("Continue") }
-                    }
-                }
-                TextButton(onClick = { showAdvanced = !showAdvanced }) {
-                    Text(if (showAdvanced) "Hide advanced" else "Advanced…", color = onSurfaceColor.copy(alpha = 0.8f))
-                }
-                if (showAdvanced) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedTextField(panelMaxXText, { panelMaxXText = it }, Modifier.width(120.dp), label = { Text("Panel max X") }, singleLine = true)
-                        OutlinedTextField(panelMaxYText, { panelMaxYText = it }, Modifier.width(120.dp), label = { Text("Panel max Y") }, singleLine = true)
-                    }
-                }
-            }
         }
 
-        // VERIFY: one compact readout pill top-center, and a bottom bar with nudge / Reset / Keep.
+        // VERIFY: one compact readout pill top-center (includes the keep countdown until kept).
         if (phase == Phase.VERIFY) {
             val live = currentProfile()
             val offsetPart = "Offset ${live?.touchDx ?: 0}, ${live?.touchDy ?: 0}"
@@ -505,61 +461,155 @@ private fun CalibrateScreen(
             } else {
                 null
             }
-            val pillText = listOfNotNull(offsetPart, lastPart, avgPart).joinToString(" · ")
+            val keepPart = if (!kept) "Keep in $countdown s" else null
+            val pillText = listOfNotNull(offsetPart, lastPart, avgPart, keepPart).joinToString(" · ")
 
-            Row(
-                Modifier
+            Text(
+                pillText,
+                modifier = Modifier
                     .align(Alignment.TopCenter)
                     .padding(top = 16.dp)
                     .clip(RoundedCornerShape(50))
                     .background(Color.Black.copy(alpha = 0.55f))
-                    .padding(start = 16.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(pillText, color = onSurfaceColor.copy(alpha = 0.8f), style = MaterialTheme.typography.bodyMedium)
-                TextButton(onClick = {
-                    markers = emptyList()
-                    lastResidualVerify = null
-                    countdown = CalibrateActivity.VERIFY_COUNTDOWN_S
-                    kept = false
-                }) { Text("Clear") }
-            }
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                color = onSurfaceColor.copy(alpha = 0.8f),
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        }
 
-            Box(
-                Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .background(Color.Black.copy(alpha = 0.55f))
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
+        // Hamburger menu: a single 48dp icon button, bottom-right, toggling a floating panel
+        // (contents depend on `phase`) anchored above/left of it. The panel and button only ever
+        // occupy their own bounds, so canvas touches elsewhere are never intercepted.
+        if (menuOpen) {
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = 16.dp, bottom = 16.dp + 48.dp + 8.dp)
+                    .widthIn(max = 320.dp),
+                shape = RoundedCornerShape(16.dp),
+                tonalElevation = 6.dp,
             ) {
-                Row(
-                    Modifier.align(Alignment.CenterStart),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    NudgeButton("←") { nudge(ctx, profileName, data, -1f, 0f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
-                    NudgeButton("→") { nudge(ctx, profileName, data, 1f, 0f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
-                    NudgeButton("↑") { nudge(ctx, profileName, data, 0f, -1f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
-                    NudgeButton("↓") { nudge(ctx, profileName, data, 0f, 1f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
-                }
-                OutlinedButton(
-                    modifier = Modifier.align(Alignment.Center).heightIn(min = 48.dp),
-                    onClick = {
-                        saveOffset(resultDx, resultDy, liveUpdate = true)
-                        countdown = CalibrateActivity.VERIFY_COUNTDOWN_S
-                        kept = false
-                    },
-                ) { Text("Reset") }
-                Button(
-                    modifier = Modifier.align(Alignment.CenterEnd).heightIn(min = 48.dp),
-                    onClick = {
-                        if (!kept) {
-                            kept = true
-                            onKeep()
-                        } else {
-                            onDone()
+                Box(Modifier.padding(12.dp)) {
+                    when (phase) {
+                        Phase.DRAG -> {
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                if (samples.isEmpty()) {
+                                    Text(
+                                        "Drag once to take a sample",
+                                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f),
+                                        style = MaterialTheme.typography.bodyMedium,
+                                    )
+                                } else {
+                                    val meanX = samples.map { it.x }.average().toFloat()
+                                    val meanY = samples.map { it.y }.average().toFloat()
+                                    val spread = samples.maxOf { hypot((it.x - meanX).toDouble(), (it.y - meanY).toDouble()) }.toFloat()
+
+                                    FlowRow(
+                                        modifier = Modifier.heightIn(max = 140.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                                    ) {
+                                        samples.forEachIndexed { i, d ->
+                                            SampleChip("Sample ${i + 1}: ${fmtSigned(d.x)}, ${fmtSigned(d.y)}")
+                                        }
+                                    }
+                                    if (samples.size >= 2) {
+                                        Text("Spread: ${spread.roundToInt()} px", color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f), style = MaterialTheme.typography.bodySmall)
+                                    }
+                                }
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    OutlinedButton(
+                                        enabled = samples.isNotEmpty(),
+                                        onClick = { dotIndex = (dotIndex + 1) % targetsLocal.size },
+                                    ) { Text("Add position") }
+                                    OutlinedButton(
+                                        enabled = samples.isNotEmpty(),
+                                        onClick = { samples = samples.dropLast(1) },
+                                    ) { Text("Redo") }
+                                    Button(
+                                        enabled = samples.isNotEmpty(),
+                                        onClick = {
+                                            val meanX = samples.map { it.x }.average().toFloat()
+                                            val meanY = samples.map { it.y }.average().toFloat()
+                                            val (dx, dy) = Calibration.toPanelOffset(meanX, meanY, rotation, natSize.natW, natSize.natH, panelMaxX, panelMaxY)
+                                            resultDx = dx; resultDy = dy
+                                            saveOffset(dx, dy, liveUpdate = false)
+                                            phase = Phase.VERIFY
+                                        },
+                                    ) { Text("Continue") }
+                                }
+                                TextButton(onClick = { showAdvanced = !showAdvanced }) {
+                                    Text(if (showAdvanced) "Hide advanced" else "Advanced…", color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f))
+                                }
+                                if (showAdvanced) {
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        OutlinedTextField(panelMaxXText, { panelMaxXText = it }, Modifier.width(120.dp), label = { Text("Panel max X") }, singleLine = true)
+                                        OutlinedTextField(panelMaxYText, { panelMaxYText = it }, Modifier.width(120.dp), label = { Text("Panel max Y") }, singleLine = true)
+                                    }
+                                }
+                            }
                         }
-                    },
-                ) { Text(if (kept) "Done" else "Keep ($countdown)") }
+                        Phase.VERIFY -> {
+                            Row(horizontalArrangement = Arrangement.spacedBy(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    NudgeButton("▲") { nudge(ctx, profileName, data, 0f, -1f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
+                                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                        NudgeButton("◀") { nudge(ctx, profileName, data, -1f, 0f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
+                                        NudgeButton("▶") { nudge(ctx, profileName, data, 1f, 0f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
+                                    }
+                                    NudgeButton("▼") { nudge(ctx, profileName, data, 0f, 1f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
+                                }
+                                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Button(
+                                        modifier = Modifier.heightIn(min = 48.dp),
+                                        onClick = {
+                                            if (!kept) {
+                                                kept = true
+                                                onKeep()
+                                            } else {
+                                                onDone()
+                                            }
+                                        },
+                                    ) { Text(if (kept) "Done" else "Keep ($countdown)") }
+                                    OutlinedButton(
+                                        modifier = Modifier.heightIn(min = 48.dp),
+                                        onClick = {
+                                            saveOffset(resultDx, resultDy, liveUpdate = true)
+                                            countdown = CalibrateActivity.VERIFY_COUNTDOWN_S
+                                            kept = false
+                                        },
+                                    ) { Text("Reset") }
+                                    OutlinedButton(
+                                        modifier = Modifier.heightIn(min = 48.dp),
+                                        onClick = {
+                                            markers = emptyList()
+                                            lastResidualVerify = null
+                                            countdown = CalibrateActivity.VERIFY_COUNTDOWN_S
+                                            kept = false
+                                        },
+                                    ) { Text("Clear marks") }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Surface(
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(16.dp)
+                .size(48.dp),
+            shape = CircleShape,
+            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.5f),
+        ) {
+            IconButton(onClick = { menuOpen = !menuOpen }) {
+                Icon(
+                    if (menuOpen) Icons.Default.Close else Icons.Default.Menu,
+                    contentDescription = if (menuOpen) "Close menu" else "Open menu",
+                    tint = MaterialTheme.colorScheme.onSurface,
+                )
             }
         }
     }
@@ -580,7 +630,7 @@ private fun SampleChip(text: String) {
 @Composable
 private fun NudgeButton(label: String, onClick: () -> Unit) {
     OutlinedButton(
-        modifier = Modifier.size(56.dp),
+        modifier = Modifier.size(48.dp),
         contentPadding = PaddingValues(0.dp),
         onClick = onClick,
     ) { Text(label, style = MaterialTheme.typography.titleLarge) }
