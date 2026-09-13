@@ -14,7 +14,15 @@ object ServiceState {
     val pad = MutableStateFlow(PadInfo(null, null, null, "not checked"))
     val foreground = MutableStateFlow<String?>(null)
     val binaryPath = MutableStateFlow<String?>(null)
-    val message = MutableStateFlow<String?>(null)
+    /** Short feedback for the last button press ("Stopping…", "Nothing is running", …), set by
+     *  DpadService on every action so the UI can show it immediately regardless of whether the
+     *  action changed any other state. */
+    val lastAction = MutableStateFlow<String?>(null)
+    /** Wall-clock deadline (ms) of an in-progress manual test, or null when no test is running.
+     *  Set on ACTION_TEST and cleared once the daemon state shows the test ended (naturally or
+     *  via ACTION_STOP_TEST/STOP_DAEMON). Lets the UI render a live "N s left" countdown without
+     *  the Supervisor needing to expose a ticking timer itself. */
+    val testEndsAtMs = MutableStateFlow<Long?>(null)
 
     fun <T> StateFlow<T>.value() = this.value
 }

@@ -198,6 +198,17 @@ private fun CalibrateScreen(
     val panelMaxX = panelMaxXText.toIntOrNull() ?: natSize.natW
     val panelMaxY = panelMaxYText.toIntOrNull() ?: natSize.natH
 
+    LaunchedEffect(Unit) {
+        val b = activity.windowManager.currentWindowMetrics.bounds
+        val sx = if (natSize.natW != 0) panelMaxX.toFloat() / natSize.natW else 1f
+        val sy = if (natSize.natH != 0) panelMaxY.toFloat() / natSize.natH else 1f
+        Log.i(
+            TAG,
+            "calib: enter window=(${b.width()},${b.height()}) rotation=$rotation " +
+                "natural=(${natSize.natW},${natSize.natH}) panelMax=($panelMaxX,$panelMaxY) scale=($sx,$sy)",
+        )
+    }
+
     var viewOffsetX by remember { mutableStateOf(0f) }
     var viewOffsetY by remember { mutableStateOf(0f) }
     var boxSize by remember { mutableStateOf(IntSize.Zero) }
@@ -332,7 +343,19 @@ private fun CalibrateScreen(
                             val raw = Offset(change.position.x + viewOffsetX, change.position.y + viewOffsetY)
                             dragRaw = raw
                             if (!change.pressed) {
-                                samples = samples + Offset(raw.x - p0.x, raw.y - p0.y)
+                                // delta = p1 - p0 (p0 = ACTION_DOWN, p1/raw = ACTION_UP): the user
+                                // slides the stylus so the crosshair (drawn at the raw touch
+                                // position) ends up on the target, so this is how far it moved.
+                                val delta = Offset(raw.x - p0.x, raw.y - p0.y)
+                                samples = samples + delta
+                                val target = targetsScreen[dotIndex % targetsScreen.size]
+                                val residual = Offset(target.x - raw.x, target.y - raw.y)
+                                Log.i(
+                                    TAG,
+                                    "calib: sample p0=(${p0.x},${p0.y}) p1=(${raw.x},${raw.y}) " +
+                                        "delta=(${delta.x},${delta.y}) target=(${target.x},${target.y}) " +
+                                        "residualAtP1=(${residual.x},${residual.y})",
+                                )
                                 dragP0 = null
                                 dragRaw = null
                                 break
@@ -350,6 +373,13 @@ private fun CalibrateScreen(
                         markers = (markers + VerifyMarker(down.position, downTarget, downResidual))
                             .let { if (it.size > VERIFY_MARKER_CAP) it.takeLast(VERIFY_MARKER_CAP) else it }
                         lastResidualVerify = downResidual
+                        val offsetNow = currentProfile()
+                        Log.i(
+                            TAG,
+                            "calib: verify tap=(${down.position.x},${down.position.y}) " +
+                                "nearestTarget=(${downTarget.x},${downTarget.y}) residual=(${downResidual.x},${downResidual.y}) " +
+                                "offsetNow=(${offsetNow?.touchDx ?: 0},${offsetNow?.touchDy ?: 0})",
+                        )
                         dragTrail = listOf(down.position)
                         liveDragPos = down.position
                         val id = down.id
@@ -476,6 +506,16 @@ private fun CalibrateScreen(
                             onClick = {
                                 val (dx, dy) = Calibration.toPanelOffset(meanX, meanY, rotation, natSize.natW, natSize.natH, panelMaxX, panelMaxY)
                                 resultDx = dx; resultDy = dy
+                                val rotName = when (rotation) {
+                                    Calibration.ROTATION_90 -> "ROTATION_90"
+                                    Calibration.ROTATION_180 -> "ROTATION_180"
+                                    Calibration.ROTATION_270 -> "ROTATION_270"
+                                    else -> "ROTATION_0"
+                                }
+                                Log.i(
+                                    TAG,
+                                    "calib: continue meanDelta=($meanX,$meanY) rotation=$rotName -> panelOffset=($dx,$dy)",
+                                )
                                 saveOffset(dx, dy, liveUpdate = false)
                                 phase = Phase.VERIFY
                             },
@@ -594,5 +634,6 @@ private fun nudge(
     val (ddx, ddy) = Calibration.toPanelOffset(dsx, dsy, rotation, natSize.natW, natSize.natH, panelMaxX, panelMaxY)
     val updated = cur.copy(touchOffsetEnabled = true, touchDx = cur.touchDx + ddx, touchDy = cur.touchDy + ddy)
     Store.saveProfile(updated, cur.name)
+    Log.i(TAG, "calib: nudge screen=(${dsx.roundToInt()},${dsy.roundToInt()}) -> panel offset now (${updated.touchDx},${updated.touchDy})")
     DpadService.send(ctx, DpadService.ACTION_UPDATE_CONFIG_LIVE, profile = updated.name)
 }

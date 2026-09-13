@@ -191,7 +191,9 @@ class Supervisor(
     }
 
     private suspend fun reconcile() {
-        if (suspended) {
+        // Suspended (calibration): ignore foreground-driven targets, but an explicit
+        // test override (the verify step) must still run.
+        if (suspended && override == null) {
             val cur = running
             if (cur != null) {
                 Log.i(TAG, "supervisor: stopping daemon (suspended) pid=${cur.first}")
@@ -203,7 +205,7 @@ class Supervisor(
             _state.value = DaemonState.Idle
             return
         }
-        val want = override ?: desired
+        val want = override ?: (if (suspended) null else desired)
         val cur = running
         val shell = shellProvider()
 

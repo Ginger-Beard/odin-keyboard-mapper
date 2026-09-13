@@ -61,7 +61,22 @@ class DpadService : Service() {
         ServiceState.serviceRunning.value = true
 
         scope.launch { probe.state.collect { ServiceState.priv.value = it } }
-        scope.launch { supervisor.state.collect { ServiceState.daemon.value = it; updateNotification(it) } }
+        scope.launch {
+            supervisor.state.collect { s ->
+                ServiceState.daemon.value = s
+                updateNotification(s)
+                // Clear the test countdown once the daemon state shows the test truly ended:
+                // fully idle, or running/starting the real assigned target (pkg != null). Backoff
+                // and Failed are left alone since they can happen mid-test as well as mid-run.
+                val testEnded = when (s) {
+                    is DaemonState.Idle -> true
+                    is DaemonState.Running -> s.pkg != null
+                    is DaemonState.Starting -> s.pkg != null
+                    else -> false
+                }
+                if (testEnded) ServiceState.testEndsAtMs.value = null
+            }
+        }
         scope.launch { watcher.foreground.collect { ServiceState.foreground.value = it } }
         scope.launch {
             combine(watcher.foreground, Store.data) { pkg, data -> pkg to (pkg?.let { data.profileFor(it) }) }
@@ -73,23 +88,40 @@ class DpadService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_RECHECK -> scope.launch { recheck("re-check") }
+            ACTION_RECHECK -> {
+                ServiceState.lastAction.value = "Re-checking…"
+                scope.launch { recheck("re-check") }
+            }
             ACTION_STOP_DAEMON -> {
-                Log.i(TAG, "action: stop daemon")
-                supervisor.stop()
-                ServiceState.message.value = "Daemon stop requested"
+                if (!isDaemonActive()) {
+                    Log.i(TAG, "action: stop daemon (nothing running)")
+                    ServiceState.lastAction.value = "Nothing is running"
+                } else {
+                    Log.i(TAG, "action: stop daemon")
+                    supervisor.stop()
+                    ServiceState.testEndsAtMs.value = null
+                    ServiceState.lastAction.value = "Stopping…"
+                }
             }
             ACTION_TEST -> {
-                val name = intent.getStringExtra(EXTRA_PROFILE) ?: "OSRS"
+                val name = intent.getStringExtra(EXTRA_PROFILE)
                 val secs = intent.getIntExtra(EXTRA_SECONDS, 30)
-                val p = Store.data.value.profile(name)
-                if (p == null) {
-                    Log.w(TAG, "action: test profile '$name' not found")
-                    ServiceState.message.value = "Profile '$name' not found"
-                } else {
-                    Log.i(TAG, "action: test profile=$name secs=$secs")
-                    ServiceState.message.value = "Testing $name for $secs s"
-                    supervisor.test(p, secs)
+                val p = name?.let { Store.data.value.profile(it) }
+                when {
+                    name.isNullOrBlank() -> {
+                        Log.w(TAG, "action: test with no profile selected")
+                        ServiceState.lastAction.value = "Select a profile first"
+                    }
+                    p == null -> {
+                        Log.w(TAG, "action: test profile '$name' not found")
+                        ServiceState.lastAction.value = "Profile '$name' not found"
+                    }
+                    else -> {
+                        Log.i(TAG, "action: test profile=$name secs=$secs")
+                        ServiceState.testEndsAtMs.value = System.currentTimeMillis() + secs * 1000L
+                        ServiceState.lastAction.value = "Starting test of $name…"
+                        supervisor.test(p, secs)
+                    }
                 }
             }
             ACTION_STOP_SERVICE -> {
@@ -101,8 +133,15 @@ class DpadService : Service() {
                 }
             }
             ACTION_STOP_TEST -> {
-                Log.i(TAG, "action: stop test")
-                supervisor.stopTest()
+                if (ServiceState.testEndsAtMs.value == null) {
+                    Log.i(TAG, "action: stop test (nothing running)")
+                    ServiceState.lastAction.value = "Nothing is running"
+                } else {
+                    Log.i(TAG, "action: stop test")
+                    supervisor.stopTest()
+                    ServiceState.testEndsAtMs.value = null
+                    ServiceState.lastAction.value = "Stopping…"
+                }
             }
             ACTION_SUSPEND -> {
                 Log.i(TAG, "action: suspend (calibration)")
@@ -123,6 +162,12 @@ class DpadService : Service() {
             }
         }
         return START_STICKY
+    }
+
+    /** True if the daemon is running or actively trying to (not idle/failed/panic-stopped). */
+    private fun isDaemonActive(): Boolean = when (ServiceState.daemon.value) {
+        is DaemonState.Running, is DaemonState.Starting, is DaemonState.Backoff -> true
+        else -> false
     }
 
     private suspend fun recheck(why: String) = probeMutex.withLock {
