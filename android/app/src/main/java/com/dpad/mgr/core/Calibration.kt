@@ -29,6 +29,14 @@ object Calibration {
         else -> dsx to dsy // ROTATION_0
     }
 
+    /** Inverse of [rotateDelta]: rotates a PANEL-space delta back into SCREEN space. */
+    fun rotateDeltaInverse(dpx: Float, dpy: Float, rotation: Int): Pair<Float, Float> = when (rotation) {
+        ROTATION_90 -> dpy to -dpx
+        ROTATION_180 -> -dpx to -dpy
+        ROTATION_270 -> -dpy to dpx
+        else -> dpx to dpy // ROTATION_0
+    }
+
     /**
      * Full screen-delta -> panel dx/dy (integer, panel units). [panelMaxX]/[panelMaxY] default to
      * [natW]/[natH] (panel == natural display size, true on the Odin 2).

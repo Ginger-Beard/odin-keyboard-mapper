@@ -58,6 +58,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.dpad.mgr.core.Calibration
 import com.dpad.mgr.core.DaemonState
 import com.dpad.mgr.core.KeyDef
 import com.dpad.mgr.core.Keys
@@ -70,6 +71,7 @@ import com.dpad.mgr.svc.ServiceState
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 
 @Composable
 fun ProfilesScreen(modifier: Modifier = Modifier) {
@@ -198,6 +200,22 @@ fun ProfileEditor(
     )
     val nameClash = draft.name.isBlank() || (draft.name != persistedName && draft.name in existingNames)
 
+    // Stylus offset, in SCREEN pixels as perceived in landscape: the stored profile only ever
+    // holds PANEL-space touchDx/touchDy, so display/edit values are the panel value rotated back
+    // into screen space via Calibration.rotateDeltaInverse (the inverse of the same rotation
+    // Calibration.rotateDelta/CalibrateActivity use to go the other way). Rotation is read once
+    // from this Activity's display; a composable context can't otherwise learn it, so this mirrors
+    // CalibrateActivity's `activity.display?.rotation` read, with ROTATION_90 (this device's
+    // landscape) as the fallback if display is unavailable.
+    val touchRotation = remember { ctx.display?.rotation ?: Calibration.ROTATION_90 }
+    val (storedScreenXF, storedScreenYF) = Calibration.rotateDeltaInverse(stored.touchDx.toFloat(), stored.touchDy.toFloat(), touchRotation)
+    val storedScreenX = storedScreenXF.roundToInt()
+    val storedScreenY = storedScreenYF.roundToInt()
+    var touchXText by remember { mutableStateOf<String?>(null) }
+    var touchXJob by remember { mutableStateOf<Job?>(null) }
+    var touchYText by remember { mutableStateOf<String?>(null) }
+    var touchYJob by remember { mutableStateOf<Job?>(null) }
+
     fun flashSaved() {
         showSaved = true
         savedFlashJob?.cancel()
@@ -253,6 +271,42 @@ fun ProfileEditor(
         flashSaved()
     }
 
+    /** Reads the CURRENTLY stored profile's touch offset back out as a screen-space (horizontal,
+     *  vertical) pair, same rotation as [storedScreenX]/[storedScreenY] above but read fresh --
+     *  used so that committing one axis while the other has its own pending debounce still writes
+     *  the other axis's up-to-date value instead of a stale closure-captured one. */
+    fun freshScreenXY(): Pair<Int, Int> {
+        val name = persistedName ?: return 0 to 0
+        val p = Store.data.value.profile(name) ?: return 0 to 0
+        val (sx, sy) = Calibration.rotateDeltaInverse(p.touchDx.toFloat(), p.touchDy.toFloat(), touchRotation)
+        return sx.roundToInt() to sy.roundToInt()
+    }
+
+    /** Rotates a SCREEN-space (horizontal, vertical) pair back to PANEL space, clamps to
+     *  Calibration.MAX_OFFSET (rotateDelta only swaps/flips-sign components, so clamping either
+     *  space by the same bound is equivalent), and writes+live-pushes it exactly like the Enabled
+     *  switch does. */
+    fun writeTouchOffset(sx: Int, sy: Int) {
+        val (pdxF, pdyF) = Calibration.rotateDelta(sx.toFloat(), sy.toFloat(), touchRotation)
+        val pdx = pdxF.roundToInt().coerceIn(-Calibration.MAX_OFFSET, Calibration.MAX_OFFSET)
+        val pdy = pdyF.roundToInt().coerceIn(-Calibration.MAX_OFFSET, Calibration.MAX_OFFSET)
+        changeNow(live = true) { d -> d.copy(touchDx = pdx, touchDy = pdy) }
+    }
+
+    fun commitTouchX(sx: Int) {
+        val (_, freshY) = freshScreenXY()
+        val sy = touchYText?.toIntOrNull() ?: freshY
+        writeTouchOffset(sx, sy)
+        touchXText = null
+    }
+
+    fun commitTouchY(sy: Int) {
+        val (freshX, _) = freshScreenXY()
+        val sx = touchXText?.toIntOrNull() ?: freshX
+        writeTouchOffset(sx, sy)
+        touchYText = null
+    }
+
     /** Cancels and immediately runs any pending debounced field commit. Called before Calibrate
      *  and Duplicate (so they read a fully up-to-date stored profile) and on ON_PAUSE (so a pending
      *  edit can't land AFTER CalibrateActivity underneath has written its own fields, per the old
@@ -264,6 +318,10 @@ fun ProfileEditor(
         deadzoneLocal?.let { commitDeadzone(it) }
         wheelJob?.cancel(); wheelJob = null
         wheelLocal?.let { commitWheel(it) }
+        touchXJob?.cancel(); touchXJob = null
+        touchXText?.toIntOrNull()?.let { commitTouchX(it) }
+        touchYJob?.cancel(); touchYJob = null
+        touchYText?.toIntOrNull()?.let { commitTouchY(it) }
     }
 
     // Brand-new profile: persist it as soon as the editor opens so it exists in the Store (and
@@ -407,7 +465,7 @@ fun ProfileEditor(
 
             // ---- Stylus offset card ----
             Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text("Stylus offset", style = MaterialTheme.typography.titleMedium)
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         Text("Enabled", Modifier.weight(1f))
@@ -415,17 +473,38 @@ fun ProfileEditor(
                             checked = draft.touchOffsetEnabled,
                             onCheckedChange = { v -> changeNow(live = true) { d -> d.copy(touchOffsetEnabled = v) } },
                         )
-                        Spacer(Modifier.width(8.dp))
-                        OutlinedButton(
-                            modifier = Modifier.heightIn(min = 48.dp),
-                            onClick = { changeNow(live = true) { d -> d.copy(touchOffsetEnabled = false, touchDx = 0, touchDy = 0) } },
-                        ) { Text("Disable") }
                     }
                     Text(
-                        "Only active while the assigned game is in front. To turn it off from inside the game, hold both back buttons for 1 second.",
+                        "Only active while the assigned game is in front. To turn it off from inside the game, hold both back buttons for 1 second. Turning Enabled off keeps these values, ready to restore.",
                         style = MaterialTheme.typography.bodySmall,
                     )
-                    Text("Offset: dx=${draft.touchDx}, dy=${draft.touchDy} (panel units)", style = MaterialTheme.typography.bodySmall)
+                    Text("Offset, as seen in landscape", style = MaterialTheme.typography.bodySmall)
+                    OffsetRow(
+                        "Horizontal", touchXText ?: storedScreenX.toString(),
+                        onStep = { delta ->
+                            touchXJob?.cancel(); touchXJob = null
+                            val cur = touchXText?.toIntOrNull() ?: storedScreenX
+                            commitTouchX((cur + delta).coerceIn(-Calibration.MAX_OFFSET, Calibration.MAX_OFFSET))
+                        },
+                        onTextChange = { text ->
+                            touchXText = text
+                            touchXJob?.cancel()
+                            touchXJob = scope.launch { delay(300); text.toIntOrNull()?.let { commitTouchX(it) } }
+                        },
+                    )
+                    OffsetRow(
+                        "Vertical", touchYText ?: storedScreenY.toString(),
+                        onStep = { delta ->
+                            touchYJob?.cancel(); touchYJob = null
+                            val cur = touchYText?.toIntOrNull() ?: storedScreenY
+                            commitTouchY((cur + delta).coerceIn(-Calibration.MAX_OFFSET, Calibration.MAX_OFFSET))
+                        },
+                        onTextChange = { text ->
+                            touchYText = text
+                            touchYJob?.cancel()
+                            touchYJob = scope.launch { delay(300); text.toIntOrNull()?.let { commitTouchY(it) } }
+                        },
+                    )
                     OutlinedButton(
                         modifier = Modifier.heightIn(min = 48.dp),
                         onClick = {
@@ -524,6 +603,36 @@ private fun SourceChip(src: String, onRemove: () -> Unit) {
         label = { Text(SourceNames.label(src)) },
         trailingIcon = { Icon(Icons.Default.Close, contentDescription = "Unbind", Modifier.size(InputChipDefaults.IconSize)) },
     )
+}
+
+/** One stylus-offset axis: label, a −/+ 48dp stepper (writes immediately), and a numeric text
+ *  field for the value in between (debounced by the caller like other text fields). */
+@Composable
+private fun OffsetRow(label: String, text: String, onStep: (Int) -> Unit, onTextChange: (String) -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().heightIn(min = 48.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(label, Modifier.width(88.dp), style = MaterialTheme.typography.bodyMedium)
+        OffsetStepButton("−", onClick = { onStep(-1) })
+        OutlinedTextField(
+            value = text,
+            onValueChange = onTextChange,
+            modifier = Modifier.width(84.dp),
+            singleLine = true,
+        )
+        OffsetStepButton("+", onClick = { onStep(1) })
+    }
+}
+
+@Composable
+private fun OffsetStepButton(label: String, onClick: () -> Unit) {
+    OutlinedButton(
+        modifier = Modifier.size(48.dp),
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
+        onClick = onClick,
+    ) { Text(label, style = MaterialTheme.typography.titleMedium) }
 }
 
 /** Compact per-stick row: label plus "Invert vertical" / "Invert horizontal" switches. */
