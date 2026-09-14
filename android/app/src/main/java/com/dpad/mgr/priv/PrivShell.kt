@@ -48,7 +48,7 @@ interface PrivShell {
     suspend fun stopTail()
 
     companion object {
-        val SAFE_TOKEN = Regex("^[A-Za-z0-9._/~=+,:@-]+$")
+        val SAFE_TOKEN = Regex("^[A-Za-z0-9._/~=+,:@ -]+$")
         // wm_set_resumed_activity carries "pkg/cls" in its raw text on Android 13; am_resume_activity
         // is kept for older Android where wm_set_resumed_activity doesn't exist. wm_on_resume_called
         // only carries the class name (no package), so it can't be parsed and is intentionally excluded.
