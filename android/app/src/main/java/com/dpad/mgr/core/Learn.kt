@@ -3,7 +3,6 @@ package com.dpad.mgr.core
 import android.content.Context
 import android.util.Log
 import com.dpad.mgr.priv.PrivShell
-import com.dpad.mgr.svc.DpadService
 import com.dpad.mgr.svc.ServiceState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -36,14 +35,29 @@ object Learn {
         val bin = ServiceState.binaryPath.value
             ?: return Result.failure(LearnError("Daemon binary not ready — check the Status tab"))
 
-        if (daemonBusy()) {
-            onStatus("Stopping daemon…")
-            DpadService.send(ctx, DpadService.ACTION_STOP_DAEMON)
-            val deadline = System.currentTimeMillis() + 4_000
-            while (daemonBusy() && System.currentTimeMillis() < deadline) delay(100)
+        // `--learn` is a separate one-shot process and needs the serve daemon to be idle first.
+        // beginLearn() writes an idle config + SIGUSR1 and waits for the status file to report it;
+        // endLearn() restores whatever target is still intended (nothing, if the user moved on).
+        val sup = ServiceState.supervisor
+        if (sup == null) {
             if (daemonBusy()) return Result.failure(LearnError("Daemon is still running; stop it and try again"))
-            Log.i(TAG, "learn: stopped daemon for learn")
+        } else {
+            if (daemonBusy()) onStatus("Going idle…")
+            if (!sup.beginLearn()) {
+                sup.endLearn()
+                return Result.failure(LearnError("Daemon did not go idle; stop it and try again"))
+            }
+            Log.i(TAG, "learn: daemon idle for learn")
         }
+        try {
+            return runLearnIdle(shell, bin, onStatus)
+        } finally {
+            sup?.endLearn()
+        }
+    }
+
+    /** The actual one-shot `--learn` invocation; the serve daemon is already idle here. */
+    private suspend fun runLearnIdle(shell: PrivShell, bin: String, onStatus: (String) -> Unit): Result<String> {
 
         /* drop a pidfile left behind by a previous, SIGKILLed learn so cancel can't kill a stranger */
         runCatching { shell.exec(listOf("rm", "-f", PIDFILE)) }
@@ -85,7 +99,7 @@ object Learn {
     }
 
     private fun daemonBusy(): Boolean = when (ServiceState.daemon.value) {
-        is DaemonState.Running, is DaemonState.Starting, is DaemonState.Backoff -> true
+        is DaemonState.Running, is DaemonState.Testing, is DaemonState.Starting, is DaemonState.Backoff -> true
         else -> false
     }
 

@@ -75,6 +75,7 @@ class DpadService : Service() {
             onFailed = { reason -> notifyFailed(reason) },
             onPanic = { profile -> notifyPanic(profile) },
         )
+        ServiceState.supervisor = supervisor
         ServiceState.serviceRunning.value = true
 
         scope.launch {
@@ -91,9 +92,7 @@ class DpadService : Service() {
                 // fully idle, or running/starting the real assigned target (pkg != null). Backoff
                 // and Failed are left alone since they can happen mid-test as well as mid-run.
                 val testEnded = when (s) {
-                    is DaemonState.Idle -> true
-                    is DaemonState.Running -> s.pkg != null
-                    is DaemonState.Starting -> s.pkg != null
+                    is DaemonState.Idle, is DaemonState.Stopped, is DaemonState.Running -> true
                     else -> false
                 }
                 if (testEnded) ServiceState.testEndsAtMs.value = null
@@ -175,6 +174,11 @@ class DpadService : Service() {
                 Log.i(TAG, "action: resume (calibration done)")
                 supervisor.resume()
             }
+            ACTION_RESTART_DAEMON -> {
+                Log.i(TAG, "action: restart daemon")
+                supervisor.restartDaemon()
+                ServiceState.lastAction.value = "Restarting daemon…"
+            }
             ACTION_UPDATE_CONFIG_LIVE -> {
                 val name = intent.getStringExtra(EXTRA_PROFILE)
                 val p = name?.let { Store.data.value.profile(it) }
@@ -188,9 +192,9 @@ class DpadService : Service() {
         return START_STICKY
     }
 
-    /** True if the daemon is running or actively trying to (not idle/failed/panic-stopped). */
+    /** True if the daemon is mapping or actively trying to (not idle/failed/panic-stopped). */
     private fun isDaemonActive(): Boolean = when (ServiceState.daemon.value) {
-        is DaemonState.Running, is DaemonState.Starting, is DaemonState.Backoff -> true
+        is DaemonState.Running, is DaemonState.Testing, is DaemonState.Starting, is DaemonState.Backoff -> true
         else -> false
     }
 
@@ -282,6 +286,8 @@ class DpadService : Service() {
 
     override fun onDestroy() {
         ServiceState.serviceRunning.value = false
+        supervisor.shutdown()
+        ServiceState.supervisor = null
         runCatching { Shizuku.removeBinderReceivedListener(shizukuBinderListener) }
         scope.cancel()
         super.onDestroy()
@@ -310,7 +316,8 @@ class DpadService : Service() {
 
     private fun updateNotification(s: DaemonState) {
         val text = when (s) {
-            is DaemonState.Running -> "Mapping ${s.profile}" + (s.pkg?.let { " for $it" } ?: " (test)")
+            is DaemonState.Running -> "Mapping ${s.pkg} with ${s.profile}"
+            is DaemonState.Testing -> "Testing ${s.profile}"
             else -> "Daemon ${s.label}"
         }
         runCatching {
@@ -361,6 +368,7 @@ class DpadService : Service() {
         const val ACTION_SUSPEND = "com.dpad.mgr.action.SUSPEND"
         const val ACTION_RESUME = "com.dpad.mgr.action.RESUME"
         const val ACTION_UPDATE_CONFIG_LIVE = "com.dpad.mgr.action.UPDATE_CONFIG_LIVE"
+        const val ACTION_RESTART_DAEMON = "com.dpad.mgr.action.RESTART_DAEMON"
         const val ACTION_STOP_SERVICE = "com.dpad.mgr.action.STOP_SERVICE"
         const val EXTRA_PROFILE = "profile"
         const val EXTRA_SECONDS = "seconds"

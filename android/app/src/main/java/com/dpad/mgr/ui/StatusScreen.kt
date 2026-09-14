@@ -28,6 +28,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -70,7 +71,7 @@ private fun isIgnoringBatteryOptimizations(ctx: Context): Boolean {
 }
 
 private fun isDaemonActive(d: DaemonState): Boolean = when (d) {
-    is DaemonState.Running, is DaemonState.Starting, is DaemonState.Backoff -> true
+    is DaemonState.Running, is DaemonState.Testing, is DaemonState.Starting, is DaemonState.Backoff -> true
     else -> false
 }
 
@@ -122,13 +123,12 @@ fun StatusScreen(modifier: Modifier = Modifier) {
     val assignedCount = data.assignments.size
 
     val statusLine = when (val d = daemon) {
-        DaemonState.Idle -> "Stopped — starts automatically when an assigned app is in front"
-        is DaemonState.Starting ->
-            if (d.pkg == null) "Testing ${d.profile} — starting…" else "Starting ${d.profile} for ${appLabel(ctx, d.pkg)}…"
-        is DaemonState.Running ->
-            if (d.pkg == null) "Testing ${d.profile} — ${remainingSec ?: 0} s left"
-            else "Running for ${appLabel(ctx, d.pkg)} with profile ${d.profile} (pid ${d.pid})"
-        is DaemonState.Backoff -> "Retrying ${d.profile} (attempt ${d.attempt}): ${d.reason}"
+        DaemonState.Idle -> "Serving (idle) — starts mapping automatically when an assigned app is in front"
+        DaemonState.Stopped -> "Daemon not running"
+        DaemonState.Starting -> "Starting daemon…"
+        is DaemonState.Running -> "Mapping ${appLabel(ctx, d.pkg)} with ${d.profile}"
+        is DaemonState.Testing -> "Testing ${d.profile} — ${remainingSec ?: 0} s"
+        is DaemonState.Backoff -> "Retrying (attempt ${d.attempt}): ${d.reason}"
         is DaemonState.Failed -> "Failed: ${d.reason}"
         is DaemonState.PanicStopped -> "Disabled by panic chord"
     }
@@ -145,14 +145,17 @@ fun StatusScreen(modifier: Modifier = Modifier) {
                     Text("Daemon", style = MaterialTheme.typography.titleMedium)
                     Text(statusLine)
                     Text(assignedLine, style = MaterialTheme.typography.bodySmall)
-                    val runningProfile = (daemon as? DaemonState.Running)?.let { data.profile(it.profile) }
+                    val activeProfileName = (daemon as? DaemonState.Running)?.profile
+                        ?: (daemon as? DaemonState.Testing)?.profile
+                    val runningProfile = activeProfileName?.let { data.profile(it) }
                     if (runningProfile?.touchOffsetEnabled == true) {
                         Text("Touch offset: ${runningProfile.touchDx},${runningProfile.touchDy}", style = MaterialTheme.typography.bodySmall)
                         Text("Panic: hold both back buttons 1 s", style = MaterialTheme.typography.bodySmall)
                     }
                     if (active) {
                         Button(onClick = {
-                            val action = if (testEndsAtMs != null) DpadService.ACTION_STOP_TEST else DpadService.ACTION_STOP_DAEMON
+                            val action = if (daemon is DaemonState.Testing || testEndsAtMs != null)
+                                DpadService.ACTION_STOP_TEST else DpadService.ACTION_STOP_DAEMON
                             DpadService.send(ctx, action)
                         }) { Text("Stop") }
                     } else {
@@ -191,6 +194,9 @@ fun StatusScreen(modifier: Modifier = Modifier) {
                             )
                             ctx.startActivity(intent)
                         }) { Text("Allow running in background") }
+                    }
+                    TextButton(onClick = { DpadService.send(ctx, DpadService.ACTION_RESTART_DAEMON) }) {
+                        Text("Restart daemon")
                     }
                 }
             }

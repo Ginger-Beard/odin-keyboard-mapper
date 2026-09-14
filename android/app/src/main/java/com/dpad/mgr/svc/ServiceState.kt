@@ -2,6 +2,7 @@ package com.dpad.mgr.svc
 
 import com.dpad.mgr.core.DaemonState
 import com.dpad.mgr.core.PadInfo
+import com.dpad.mgr.core.Supervisor
 import com.dpad.mgr.priv.PrivState
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -10,7 +11,10 @@ import kotlinx.coroutines.flow.StateFlow
 object ServiceState {
     val serviceRunning = MutableStateFlow(false)
     val priv = MutableStateFlow(PrivState())
-    val daemon = MutableStateFlow<DaemonState>(DaemonState.Idle)
+    val daemon = MutableStateFlow<DaemonState>(DaemonState.Stopped)
+    /** The live [Supervisor] while DpadService is running (same process); null otherwise.
+     *  Used by [com.dpad.mgr.core.Learn] to force the serve daemon idle for `--learn`. */
+    @Volatile var supervisor: Supervisor? = null
     val pad = MutableStateFlow(PadInfo(null, null, null, "not checked"))
     val foreground = MutableStateFlow<String?>(null)
     val binaryPath = MutableStateFlow<String?>(null)

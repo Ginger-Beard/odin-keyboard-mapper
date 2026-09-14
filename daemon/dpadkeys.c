@@ -34,6 +34,7 @@
 #include <signal.h>
 #include <math.h>
 #include <poll.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -193,6 +194,11 @@ typedef struct {
     raw_source_t raw[MAX_RAW];
     char device_match[128]; /* substring of the pad name, or "vvvv:pppp" hex; empty = any */
 
+    /* `idle 1`: an explicit "this profile deliberately does nothing" marker so
+     * --serve can be parked on a config file that still exists. Equivalent to
+     * a file with no bindings and no touch.offset, but self-documenting. */
+    bool idle;
+
     /* touch pass-through: absent touch.offset means the daemon never opens
      * or touches the panel at all. */
     bool touch_offset_set;
@@ -214,9 +220,37 @@ static int g_wheel_count[WHEEL_COUNT] = {0};
 static long long g_wheel_next_due_ms[WHEEL_COUNT] = {0};
 static int g_wheel_repeat_ms = 120;
 
+/* ---- serve mode ----
+ *
+ * In --serve the daemon lives as long as the app's privilege does: both
+ * uinput devices are created once at startup and destroyed only at exit, and
+ * "switching profile" is the app rewriting the config file and sending
+ * SIGUSR1. Everything that used to be decided once at startup -- whether to
+ * grab the pad, whether to grab the panel, what the mappings are -- becomes a
+ * transition between an IDLE state (nothing grabbed, the pad behaves normally
+ * for every other app) and an ACTIVE one.
+ *
+ * g_want_pad / g_want_touch are the *intent* derived from the active profile;
+ * g_pad_fd >= 0 and g_touch_grabbed are whether that intent is currently
+ * satisfied. They can disagree while a device is missing, which is what
+ * g_retry_due_ms is for. */
+static bool g_serve = false;
+static const char *g_status_path = NULL;   /* --status-file, or NULL */
+static bool g_want_pad = false;            /* active profile has bindings */
+static bool g_want_touch = false;          /* active profile has touch.offset */
+static long g_panic_count = 0;             /* panic-chord firings since start */
+static long long g_retry_due_ms = -1;      /* next acquisition retry, -1 = none */
+#define SERVE_RETRY_MS 500
+
+/* Self-pipe, so a signal that lands between the g_reload_req test and poll()
+ * still wakes the loop. This matters far more in serve mode than it used to:
+ * an idle daemon has no fds to poll at all and would otherwise sleep through
+ * the very SIGUSR1 that is meant to activate it. */
+static int g_sigpipe[2] = { -1, -1 };
+
 /* touch pass-through state: the virtual touchscreen is created once at
  * startup and kept alive across panel re-detects (like the keyboard). */
-static volatile sig_atomic_t g_reload_offset = 0; /* SIGUSR1 */
+static volatile sig_atomic_t g_reload_req = 0; /* SIGUSR1: re-read the config */
 static int g_touch_fd = -1;
 static int g_touch_uinput_fd = -1;
 static bool g_touch_grabbed = false;
@@ -224,6 +258,14 @@ static char g_touch_path[64] = {0};
 static char g_touch_name[128] = {0};
 static struct input_absinfo g_touch_mtx_info, g_touch_mty_info, g_touch_x_info, g_touch_y_info;
 static bool g_touch_has_mtx = false, g_touch_has_mty = false, g_touch_has_x = false, g_touch_has_y = false;
+/* Silences touch_enable()'s "no panel"/"cannot grab" lines while serve mode
+ * is retrying acquisition every SERVE_RETRY_MS -- the retry itself logs, but
+ * throttled (see serve_retry_acquire). */
+static bool g_touch_quiet = false;
+/* Set by touch_write() in serve mode when the clone stops accepting writes.
+ * One-shot mode treats that as fatal (exit 5); a serve daemon must not exit,
+ * so the loop picks this up and drops to keys-only instead. */
+static bool g_touch_uinput_dead = false;
 
 /* Panic chord: while a touch offset is active and the panel is grabbed,
  * holding both back buttons (raw BTN_C/BTN_Z on the pad) for
@@ -235,14 +277,26 @@ static panic_chord_t g_panic_chord = PANIC_CHORD_M1M2;
 static bool g_chord_m1_held = false, g_chord_m2_held = false;
 static long long g_chord_start_ms = -1; /* -1 = not both held */
 
+/* Both handlers poke the self-pipe; write() is async-signal-safe and the
+ * write end is non-blocking, so a full pipe (many signals, loop not yet
+ * drained) is harmless -- the loop is going to wake anyway. */
+static void sigpipe_poke(void) {
+    if (g_sigpipe[1] < 0) return;
+    char b = 1;
+    ssize_t r = write(g_sigpipe[1], &b, 1);
+    (void)r;
+}
+
 static void on_signal(int sig) {
     (void)sig;
     g_running = 0;
+    sigpipe_poke();
 }
 
 static void on_usr1(int sig) {
     (void)sig;
-    g_reload_offset = 1;
+    g_reload_req = 1;
+    sigpipe_poke();
 }
 
 static void init_config(config_t *cfg) {
@@ -261,6 +315,7 @@ static void init_config(config_t *cfg) {
     cfg->wheel_repeat_ms = 120;
     cfg->n_raw = 0;
     cfg->device_match[0] = '\0';
+    cfg->idle = false;
     cfg->touch_offset_set = false;
     cfg->touch_dx = 0;
     cfg->touch_dy = 0;
@@ -379,46 +434,72 @@ static bool source_can_be_hold(int slot) {
     return !(slot >= SRC_LS_UP && slot <= SRC_RS_RIGHT);
 }
 
+/* ---- config diagnostics ----
+ *
+ * A config file reaches the parser in one of two modes. STRICT is how the
+ * one-shot CLI has always behaved: the first bad line is fatal (exit 2), so a
+ * typo can never silently half-apply. LENIENT is what --serve needs: the
+ * daemon owns the virtual devices for the lifetime of the app's privilege, so
+ * a bad line in a profile the app just wrote must never take the daemon (and
+ * with it both uinput devices) down -- it is logged and the line is skipped,
+ * leaving the rest of the profile to apply.
+ *
+ * cfg_problem() is the single choke point for both. In lenient mode it sets
+ * g_cfg_line_bad, which every caller inside load_config_file() checks so the
+ * offending line is abandoned rather than half-applied. */
+static bool g_cfg_lenient = false;
+static bool g_cfg_line_bad = false;
+
+static void cfg_problem(const char *path, int lineno, const char *fmt, ...) {
+    va_list ap;
+    fprintf(stderr, "dpadkeys: %s:%d: ", path, lineno);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    fflush(stderr);
+    if (!g_cfg_lenient) exit(2);
+    g_cfg_line_bad = true;
+}
+
 /* Resolves (adding a raw slot on first use) and registers a source name from
- * a config line, exiting(2) with a message on any error -- unknown name,
- * raw/semantic collision, etc. Shared by plain lines and both sides of a
- * `<hold>+<src>` chord line. */
+ * a config line. Shared by plain lines and both sides of a `<hold>+<src>`
+ * chord line. Returns -1 (lenient mode only) after reporting an unknown name,
+ * a raw/semantic collision, etc.; in strict mode cfg_problem() exits first. */
 static int resolve_source(config_t *cfg, const char *name, const char *path, int lineno) {
     const char *err = NULL;
     int src = lookup_or_add_source(cfg, name, &err);
     if (src < 0) {
-        if (err) fprintf(stderr, "dpadkeys: %s:%d: %s\n", path, lineno, err);
-        else fprintf(stderr, "dpadkeys: %s:%d: unknown source '%s'\n", path, lineno, name);
-        exit(2);
+        if (err) cfg_problem(path, lineno, "%s", err);
+        else cfg_problem(path, lineno, "unknown source '%s'", name);
+        return -1;
     }
     if (src < SRC_COUNT && !cfg->defined[src]) {
         const char *raw = semantic_collides_with_raw(cfg, src);
         if (raw) {
-            fprintf(stderr, "dpadkeys: %s:%d: source '%s' collides with raw source '%s'\n",
-                    path, lineno, name, raw);
-            exit(2);
+            cfg_problem(path, lineno, "source '%s' collides with raw source '%s'", name, raw);
+            return -1;
         }
     }
     cfg->defined[src] = true;
     return src;
 }
 
-/* Resolves a target token, exiting(2) with a message if it's not a known
- * target name (KEY_*, WHEEL_* / HWHEEL_*, or NONE). */
+/* Resolves a target token; reports (and in strict mode exits on) anything that
+ * is not a known target name (KEY_*, WHEEL_* / HWHEEL_*, or NONE), returning
+ * TARGET_UNKNOWN so a lenient caller can skip the line. */
 static int resolve_target_tok(const char *tok, const char *path, int lineno) {
     int target = lookup_target(tok);
-    if (target == TARGET_UNKNOWN) {
-        fprintf(stderr, "dpadkeys: %s:%d: unknown target '%s'\n", path, lineno, tok);
-        exit(2);
-    }
+    if (target == TARGET_UNKNOWN)
+        cfg_problem(path, lineno, "unknown target '%s'", tok);
     return target;
 }
 
-/* Appends a chord, exiting(2) if the table is full. */
+/* Appends a chord; reports (and in strict mode exits on) a full table. */
 static void add_chord(config_t *cfg, int hold, int src, int target, const char *path, int lineno) {
     if (cfg->n_chords >= MAX_CHORDS) {
-        fprintf(stderr, "dpadkeys: %s:%d: too many chords (max %d)\n", path, lineno, MAX_CHORDS);
-        exit(2);
+        cfg_problem(path, lineno, "too many chords (max %d)", MAX_CHORDS);
+        return;
     }
     cfg->chords[cfg->n_chords].hold = hold;
     cfg->chords[cfg->n_chords].src = src;
@@ -446,17 +527,32 @@ static void clamp_touch_offset(config_t *cfg, const char *context) {
     }
 }
 
-static void load_config_file(const char *path, config_t *cfg) {
+/* Parses `path` into a fresh *cfg. `lenient` selects the diagnostic mode
+ * described above cfg_problem(): false = the historical CLI behaviour (any
+ * problem exits 2), true = skip the offending line and carry on, which is
+ * what --serve's SIGUSR1 reload uses. Returns false only in lenient mode and
+ * only when the file could not be opened at all (errno set); in that case
+ * *cfg is left in the init_config() state. */
+static bool load_config_file(const char *path, config_t *cfg, bool lenient) {
+    bool prev_lenient = g_cfg_lenient;
+    g_cfg_lenient = lenient;
+    init_config(cfg);
     FILE *f = fopen(path, "r");
     if (!f) {
-        fprintf(stderr, "dpadkeys: cannot open config '%s': %s\n", path, strerror(errno));
-        exit(2);
+        int e = errno;
+        if (!lenient) {
+            fprintf(stderr, "dpadkeys: cannot open config '%s': %s\n", path, strerror(e));
+            exit(2);
+        }
+        g_cfg_lenient = prev_lenient;
+        errno = e;
+        return false;
     }
-    init_config(cfg);
     char line[256];
     int lineno = 0;
     while (fgets(line, sizeof(line), f)) {
         lineno++;
+        g_cfg_line_bad = false;
         char *hash = strchr(line, '#');
         if (hash) *hash = '\0';
         char *save = NULL;
@@ -464,9 +560,10 @@ static void load_config_file(const char *path, config_t *cfg) {
         if (!tok1) continue;
         char *tok2 = strtok_r(NULL, " \t\r\n", &save);
         if (!tok2) {
-            fprintf(stderr, "dpadkeys: %s:%d: missing value for '%s'\n", path, lineno, tok1);
-            exit(2);
+            cfg_problem(path, lineno, "missing value for '%s'", tok1);
+            continue;
         }
+        if (strcmp(tok1, "idle") == 0) { cfg->idle = atoi(tok2) != 0; continue; }
         if (strcmp(tok1, "ls.invert_x") == 0) { cfg->ls_invert_x = atoi(tok2) != 0; continue; }
         if (strcmp(tok1, "rs.invert_x") == 0) { cfg->rs_invert_x = atoi(tok2) != 0; continue; }
         if (strcmp(tok1, "ls.invert_y") == 0) { cfg->ls_invert_y = atoi(tok2) != 0; continue; }
@@ -487,8 +584,8 @@ static void load_config_file(const char *path, config_t *cfg) {
             }
             char *tok3 = strtok_r(NULL, " \t\r\n", &save);
             if (!tok3) {
-                fprintf(stderr, "dpadkeys: %s:%d: touch.offset needs two values (dx dy)\n", path, lineno);
-                exit(2);
+                cfg_problem(path, lineno, "touch.offset needs two values (dx dy)");
+                continue;
             }
             cfg->touch_dx = atoi(tok2);
             cfg->touch_dy = atoi(tok3);
@@ -523,36 +620,44 @@ static void load_config_file(const char *path, config_t *cfg) {
             const char *src_name = plus + 1;
             if (strcmp(hold_name, "mod") == 0) {
                 int src = resolve_source(cfg, src_name, path, lineno);
+                if (src < 0) continue;
                 int target = resolve_target_tok(tok2, path, lineno);
+                if (target == TARGET_UNKNOWN) continue;
                 cfg->legacy_mod_set[src] = true;
                 cfg->legacy_mod_target[src] = target;
                 continue;
             }
             int hold = resolve_source(cfg, hold_name, path, lineno);
+            if (hold < 0) continue;
             if (!source_can_be_hold(hold)) {
-                fprintf(stderr, "dpadkeys: %s:%d: '%s' cannot be used as a hold "
-                                "(stick directions can't be held)\n", path, lineno, hold_name);
-                exit(2);
+                cfg_problem(path, lineno, "'%s' cannot be used as a hold "
+                                          "(stick directions can't be held)", hold_name);
+                continue;
             }
             int src = resolve_source(cfg, src_name, path, lineno);
+            if (src < 0) continue;
             int target = resolve_target_tok(tok2, path, lineno);
+            if (target == TARGET_UNKNOWN) continue;
             add_chord(cfg, hold, src, target, path, lineno);
             continue;
         }
 
         int src = resolve_source(cfg, tok1, path, lineno);
+        if (src < 0) continue;
 
         if (strcmp(tok2, "MOD") == 0) {
             if (cfg->modifier_src != -1) {
-                fprintf(stderr, "dpadkeys: %s:%d: modifier already declared as '%s'\n",
-                        path, lineno, source_name(cfg, cfg->modifier_src));
-                exit(2);
+                cfg_problem(path, lineno, "modifier already declared as '%s'",
+                            source_name(cfg, cfg->modifier_src));
+                continue;
             }
             cfg->modifier_src = src;
             continue;
         }
 
-        cfg->target[src] = resolve_target_tok(tok2, path, lineno);
+        int target = resolve_target_tok(tok2, path, lineno);
+        if (target == TARGET_UNKNOWN) continue;
+        cfg->target[src] = target;
     }
     fclose(f);
 
@@ -571,6 +676,9 @@ static void load_config_file(const char *path, config_t *cfg) {
     }
 
     clamp_touch_offset(cfg, path);
+    g_cfg_lenient = prev_lenient;
+    g_cfg_line_bad = false;
+    return true;
 }
 
 static void load_profile(config_t *cfg, const char *name) {
@@ -594,6 +702,7 @@ static void load_profile(config_t *cfg, const char *name) {
 static void print_config(const config_t *cfg, FILE *out) {
     fprintf(out, "# effective dpadkeys config\n");
     if (cfg->device_match[0]) fprintf(out, "%-12s %s\n", "device.match", cfg->device_match);
+    if (cfg->idle) fprintf(out, "%-12s %d\n", "idle", 1);
     /* semantic sources are always listed; raw ones exactly as they were given.
      * A source used as a hold prints its plain target here (NONE unless it
      * also has its own binding) and its chords below in canonical
@@ -652,7 +761,31 @@ static long long now_ms(void) {
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-static int open_uinput(const config_t *cfg) {
+/* True if `code` is on the fixed key superset the --serve keyboard registers:
+ * everything in KEY_TABLE except KEY_Q.
+ *
+ * Why KEY_Q is held back: Android's EventHub classifies a device as
+ * INPUT_DEVICE_CLASS_ALPHAKEY when its key bitmap covers the alphabetic
+ * block, and an alphabetic keyboard being present makes the framework hide
+ * the on-screen keyboard (and, on the Odin, makes AYN's mapper treat us as a
+ * text device). Leaving one letter out keeps the device a plain KEYBOARD
+ * class, so the soft keyboard still comes up in the game's chat box while
+ * every other letter we might want to bind is still emittable. KEY_Q is the
+ * sacrifice because no profile in this kit binds it. */
+static bool key_in_superset(int code) {
+    if (code == KEY_Q) return false;
+    for (int i = 0; i < KEY_TABLE_LEN; i++)
+        if (KEY_TABLE[i].code == code) return true;
+    return false;
+}
+
+/* Creates the "Odin DPad Keys" uinput device with exactly the EV_KEY codes
+ * flagged in `used` (KEY_CNT entries), plus -- when `want_pointer` -- the
+ * EV_REL axes and mouse buttons a wheel target needs. Callers:
+ * open_uinput() (one-shot mode: only the keys this config uses) and
+ * open_uinput_superset() (--serve: a fixed set, so profile switches never
+ * have to recreate the device). */
+static int open_uinput_dev(const bool *used, bool want_pointer) {
     int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
     if (fd < 0) {
         perror("open /dev/uinput");
@@ -663,13 +796,6 @@ static int open_uinput(const config_t *cfg) {
         close(fd);
         return -1;
     }
-    bool used[KEY_CNT] = {0};
-    for (int i = 0; i < n_sources(cfg); i++)
-        if (cfg->target[i] >= 0 && cfg->target[i] < KEY_CNT) used[cfg->target[i]] = true;
-    for (int i = 0; i < cfg->n_chords; i++) {
-        int t = cfg->chords[i].target;
-        if (t >= 0 && t < KEY_CNT) used[t] = true;
-    }
     for (int c = 0; c < KEY_CNT; c++) {
         if (used[c] && ioctl(fd, UI_SET_KEYBIT, c) < 0) {
             perror("UI_SET_KEYBIT");
@@ -678,12 +804,7 @@ static int open_uinput(const config_t *cfg) {
         }
     }
 
-    bool uses_wheel = false;
-    for (int i = 0; i < n_sources(cfg); i++)
-        if (target_is_wheel(cfg->target[i])) uses_wheel = true;
-    for (int i = 0; i < cfg->n_chords; i++)
-        if (target_is_wheel(cfg->chords[i].target)) uses_wheel = true;
-    if (uses_wheel) {
+    if (want_pointer) {
         if (ioctl(fd, UI_SET_EVBIT, EV_REL) < 0 ||
             ioctl(fd, UI_SET_RELBIT, REL_WHEEL) < 0 ||
             ioctl(fd, UI_SET_RELBIT, REL_HWHEEL) < 0 ||
@@ -734,6 +855,35 @@ static int open_uinput(const config_t *cfg) {
     }
 #endif
     return fd;
+}
+
+/* One-shot mode: register only the keys this config can actually emit. */
+static int open_uinput(const config_t *cfg) {
+    bool used[KEY_CNT] = {0};
+    for (int i = 0; i < n_sources(cfg); i++)
+        if (cfg->target[i] >= 0 && cfg->target[i] < KEY_CNT) used[cfg->target[i]] = true;
+    for (int i = 0; i < cfg->n_chords; i++) {
+        int t = cfg->chords[i].target;
+        if (t >= 0 && t < KEY_CNT) used[t] = true;
+    }
+    bool uses_wheel = false;
+    for (int i = 0; i < n_sources(cfg); i++)
+        if (target_is_wheel(cfg->target[i])) uses_wheel = true;
+    for (int i = 0; i < cfg->n_chords; i++)
+        if (target_is_wheel(cfg->chords[i].target)) uses_wheel = true;
+    return open_uinput_dev(used, uses_wheel);
+}
+
+/* --serve mode: one device for the daemon's whole lifetime, carrying every
+ * key any profile is allowed to bind (see key_in_superset()) and always the
+ * pointer bits, so switching to a profile that uses WHEEL_* never means
+ * destroying and recreating the device -- which is exactly what makes AYN's
+ * mapper service toast "<device> connected". */
+static int open_uinput_superset(void) {
+    bool used[KEY_CNT] = {0};
+    for (int i = 0; i < KEY_TABLE_LEN; i++)
+        if (key_in_superset(KEY_TABLE[i].code)) used[KEY_TABLE[i].code] = true;
+    return open_uinput_dev(used, true);
 }
 
 static void destroy_uinput(int fd) {
@@ -838,6 +988,15 @@ typedef struct {
     bool ls_active, rs_active;
     unsigned ls_dirs, rs_dirs;
 } axes_t;
+
+/* The pad the daemon is currently driving: identity plus the axis layout
+ * detected on it. Global alongside g_pad_fd so serve mode's acquire/release
+ * helpers, the event loop and the banner all agree without threading five
+ * out-params through every call. */
+static char g_pad_path[64] = {0};
+static char g_pad_name[128] = {0};
+static unsigned short g_pad_vendor = 0, g_pad_product = 0;
+static axes_t g_ax;
 
 /* Unipolar: min >= 0 and the axis was resting within 5% of its minimum when
  * queried -- i.e. a real trigger axis (0..N resting at 0), as opposed to a
@@ -1434,14 +1593,22 @@ static int open_touch_uinput(int real_fd, const struct input_id *id, const char 
     return fd;
 }
 
-/* Releases the panel grab, closes the panel fd, and destroys the virtual
- * touchscreen -- the touch-only half of teardown. Shared by touch_fatal_exit(),
- * main()'s normal shutdown, and the live SIGUSR1 disable path (see
- * reload_touch_config). Safe to call when touch was never enabled: every
- * step is a no-op against -1/false state. */
-static void touch_disable(void) {
+/* Lets go of the real panel -- ungrab, close -- while leaving the virtual
+ * touchscreen alone. This is the whole of "turn touch off" in serve mode:
+ * touch stops being intercepted, but the clone stays registered with the
+ * kernel so no device appears or disappears. Safe against -1/false state. */
+static void touch_release_panel(void) {
     if (g_touch_grabbed) { ioctl(g_touch_fd, EVIOCGRAB, 0); g_touch_grabbed = false; }
     if (g_touch_fd >= 0) { close(g_touch_fd); g_touch_fd = -1; }
+}
+
+/* touch_release_panel() plus destroying the virtual touchscreen -- the
+ * touch-only half of teardown. Shared by touch_fatal_exit(), normal shutdown,
+ * and the one-shot mode's live SIGUSR1 disable path (see
+ * reload_touch_config). Never called from a serve-mode transition: in serve
+ * mode the clone is created once and destroyed only at exit. */
+static void touch_disable(void) {
+    touch_release_panel();
     destroy_uinput(g_touch_uinput_fd);
     g_touch_uinput_fd = -1;
 }
@@ -1457,11 +1624,30 @@ static void touch_fatal_exit(int code) {
     exit(code);
 }
 
-/* Logs the panic trigger and reuses touch_fatal_exit's cleanup (release the
- * panel grab, destroy the virtual touchscreen, ungrab the pad, destroy the
- * keyboard device) to exit(6) so the supervisor can persist "touch offset
- * disabled" and restart without it. */
-static void panic_chord_fire(void) {
+/* Defined in the serve section below; the panic chord is the one place a
+ * mid-file function has to reach forward into it. */
+static void serve_go_idle(config_t *cfg);
+static void write_status(const config_t *cfg);
+
+/* One-shot mode: log the panic trigger and reuse touch_fatal_exit's cleanup
+ * (release the panel grab, destroy the virtual touchscreen, ungrab the pad,
+ * destroy the keyboard device) to exit(6) so the supervisor can persist
+ * "touch offset disabled" and restart without it.
+ *
+ * Serve mode must not exit -- it owns devices that other profiles will want
+ * again -- so it drops to IDLE instead: both grabs released, every held key
+ * let go, the config file left exactly as the app wrote it, and the panic
+ * counter bumped in the status file so the supervisor notices and decides
+ * what to write next. */
+static void panic_chord_fire(config_t *cfg) {
+    if (g_serve) {
+        g_panic_count++;
+        fprintf(stderr, "dpadkeys: panic: idle\n");
+        fflush(stderr);
+        serve_go_idle(cfg);
+        write_status(cfg);
+        return;
+    }
     fprintf(stderr, "dpadkeys: panic: back-button chord held, disabling touch offset\n");
     fflush(stderr);
     touch_fatal_exit(6);
@@ -1472,23 +1658,26 @@ static void panic_chord_fire(void) {
  * offset is active (configured and the panel currently grabbed). Called both
  * on every raw pad EV_KEY event (code, pressed) and, with code 0, from the
  * poll-timeout path so the chord fires purely from elapsed time even if no
- * further pad events arrive while both buttons are held. */
-static void check_panic_chord(const config_t *cfg, int code, bool pressed) {
-    if (g_panic_chord != PANIC_CHORD_M1M2) return;
+ * further pad events arrive while both buttons are held. Returns true if the
+ * chord fired, which in serve mode means the pad has just been released and
+ * the caller must stop touching it for this event. */
+static bool check_panic_chord(config_t *cfg, int code, bool pressed) {
+    if (g_panic_chord != PANIC_CHORD_M1M2) return false;
     if (code == BTN_C) g_chord_m1_held = pressed;
     else if (code == BTN_Z) g_chord_m2_held = pressed;
 
     if (!(cfg->touch_offset_set && g_touch_grabbed) || !g_chord_m1_held || !g_chord_m2_held) {
         g_chord_start_ms = -1;
-        return;
+        return false;
     }
     long long now = now_ms();
     if (g_chord_start_ms < 0) {
         g_chord_start_ms = now;
-        return;
+        return false;
     }
-    if (now - g_chord_start_ms >= PANIC_CHORD_MS)
-        panic_chord_fire();
+    if (now - g_chord_start_ms < PANIC_CHORD_MS) return false;
+    panic_chord_fire(cfg);
+    return true;
 }
 
 /* Writes a batch of events to the virtual touchscreen. A write error of
@@ -1502,6 +1691,8 @@ static bool touch_write(const struct input_event *evs, int n) {
     if (w == want) return true;
     if (w < 0 && (errno == ENODEV || errno == EIO)) {
         fprintf(stderr, "dpadkeys: touch: uinput write failed: %s\n", strerror(errno));
+        fflush(stderr);
+        if (g_serve) { g_touch_uinput_dead = true; return false; }
         touch_fatal_exit(5);
     }
     fprintf(stderr, "dpadkeys: touch: short/failed uinput write (%zd/%zd)%s%s\n",
@@ -1602,10 +1793,16 @@ typedef enum {
  * created (via touch_disable()) and returns a code identifying the failed
  * step; g_touch_grabbed is true if and only if it returns TOUCH_ENABLE_OK. */
 static touch_enable_result_t touch_enable(const config_t *cfg) {
+    /* Serve mode pre-creates the clone at startup (serve_create_touch_device)
+     * and never destroys it, so this may be a pure re-grab. Only a clone this
+     * call created is torn down again on failure. */
+    bool created_here = false;
+
     g_touch_fd = find_touch(cfg, g_touch_path, sizeof(g_touch_path));
     if (g_touch_fd < 0) {
-        fprintf(stderr, "dpadkeys: touch: no touch panel found%s%s\n",
-                cfg->touch_device[0] ? " at " : "", cfg->touch_device);
+        if (!g_touch_quiet)
+            fprintf(stderr, "dpadkeys: touch: no touch panel found%s%s\n",
+                    cfg->touch_device[0] ? " at " : "", cfg->touch_device);
         return TOUCH_ENABLE_ERR_NO_PANEL;
     }
     struct input_id touch_id;
@@ -1615,19 +1812,25 @@ static touch_enable_result_t touch_enable(const config_t *cfg) {
         snprintf(g_touch_name, sizeof(g_touch_name), "?");
     query_touch_axes(g_touch_fd);
 
-    g_touch_uinput_fd = open_touch_uinput(g_touch_fd, &touch_id, "fts_ts");
     if (g_touch_uinput_fd < 0) {
-        fprintf(stderr, "dpadkeys: touch: could not create virtual touchscreen\n");
-        close(g_touch_fd);
-        g_touch_fd = -1;
-        return TOUCH_ENABLE_ERR_UINPUT;
+        g_touch_uinput_fd = open_touch_uinput(g_touch_fd, &touch_id, "fts_ts");
+        if (g_touch_uinput_fd < 0) {
+            fprintf(stderr, "dpadkeys: touch: could not create virtual touchscreen\n");
+            close(g_touch_fd);
+            g_touch_fd = -1;
+            return TOUCH_ENABLE_ERR_UINPUT;
+        }
+        created_here = true;
+        fprintf(stderr, "dpadkeys: touch: created virtual touchscreen \"fts_ts\" (from %s)\n", g_touch_path);
     }
-    fprintf(stderr, "dpadkeys: touch: created virtual touchscreen \"fts_ts\" (from %s)\n", g_touch_path);
 
     if (ioctl(g_touch_fd, EVIOCGRAB, 1) < 0) {
-        perror("EVIOCGRAB (touch)");
-        fprintf(stderr, "dpadkeys: touch: cannot grab the panel\n");
-        touch_disable();
+        if (!g_touch_quiet) {
+            perror("EVIOCGRAB (touch)");
+            fprintf(stderr, "dpadkeys: touch: cannot grab the panel\n");
+        }
+        touch_release_panel();
+        if (created_here) { destroy_uinput(g_touch_uinput_fd); g_touch_uinput_fd = -1; }
         return TOUCH_ENABLE_ERR_GRAB;
     }
     g_touch_grabbed = true;
@@ -1822,7 +2025,37 @@ static void print_usage(const char *argv0) {
             "usage: %s --config FILE [--grab] [--list] [--device auto|/dev/input/eventN] "
             "[--verbose] [--pidfile PATH] [--print-config] [--panic-chord none|m1+m2]\n"
             "       %s --profile fkeys|wasd [--grab] ...\n"
+            "       %s --serve --config FILE [--pidfile PATH] [--status-file PATH] [--verbose]\n"
+            "                  [--device ...] [--panic-chord none|m1+m2]\n"
             "       %s --learn [--learn-timeout-ms N] [--learn-hold-ms N] [--config FILE] [--device ...] [--pidfile PATH]\n"
+            "\n"
+            "--serve keeps ONE daemon alive for as long as the supervising app holds its\n"
+            "privilege. Both virtual devices -- the \"Odin DPad Keys\" keyboard+mouse and the\n"
+            "cloned touchscreen -- are created once at startup and destroyed only at exit, so\n"
+            "switching profiles never makes an input device appear or disappear (which is what\n"
+            "makes the system mapper toast \"<device> connected\" on every game launch).\n"
+            "\n"
+            "The config file is the active profile. Rewrite it and send SIGUSR1 to switch:\n"
+            "the whole file is re-read and the daemon transitions between states.\n"
+            "  * no bindings and no touch.offset (or an empty file, or just `idle 1`)\n"
+            "    -> IDLE: the pad and panel are not grabbed and nothing is emitted, so the\n"
+            "       pad behaves normally for every other app.\n"
+            "  * any binding -> the pad is grabbed and mapped.\n"
+            "  * touch.offset dx dy -> the panel is grabbed and passed through with the offset.\n"
+            "A binding naming a key the fixed serve keyboard does not carry (KEY_Q, which is\n"
+            "held back so Android keeps offering the on-screen keyboard) is logged and ignored;\n"
+            "a bad line never fails a reload.\n"
+            "\n"
+            "--status-file PATH makes the daemon write, atomically, on every transition:\n"
+            "    state=idle|active touch=on|off keys=<n> panic=<count>\n"
+            "state/touch are the active profile's intent; `keys` counts the bindings that can\n"
+            "emit something; `panic` counts panic-chord firings. In serve mode the panic chord\n"
+            "does NOT exit -- it drops to idle, logs `panic: idle`, leaves the config file\n"
+            "untouched, and bumps `panic` so the supervisor can react.\n"
+            "\n"
+            "--learn is a separate process and needs the pad ungrabbed, so run it while the\n"
+            "serve daemon is idle: write an idle config (`idle 1`) and send SIGUSR1 first if a\n"
+            "profile is active, then restore the profile the same way afterwards.\n"
             "\n"
             "--learn reports a single press as \"learned <source>\", e.g. \"learned hat.up\".\n"
             "Holding one button-like control (btn.*, hat.*, lt, rt, key.0x.., abs.0x..) and\n"
@@ -1832,7 +2065,7 @@ static void print_usage(const char *argv0) {
             "control must still be held, with nothing else pressed yet, before it is a\n"
             "candidate hold for a later chord; release it first with nothing else having\n"
             "happened and it is reported as a plain \"learned btn.thumbl\" instead.\n",
-            argv0, argv0, argv0);
+            argv0, argv0, argv0, argv0);
 }
 
 /* ---- learn mode ---- */
@@ -2124,7 +2357,691 @@ static int dump_all(void) {
     return 0;
 }
 
+/* ---- serve mode ---- */
+
+/* Number of bindings that can actually emit something -- plain targets plus
+ * chord targets, excluding NONE. Reported as keys=<n> in the status file and
+ * the transition log so the supervisor can tell "profile applied" from
+ * "profile parsed to nothing". */
+static int count_bindings(const config_t *cfg) {
+    int n = 0;
+    for (int i = 0; i < n_sources(cfg); i++)
+        if (cfg->target[i] != TARGET_NONE) n++;
+    for (int i = 0; i < cfg->n_chords; i++)
+        if (cfg->chords[i].target != TARGET_NONE) n++;
+    return n;
+}
+
+/* Whether this profile needs the pad grabbed. Deliberately keyed off
+ * cfg->defined rather than the targets: a profile that maps every button to
+ * NONE has no bindings but very much wants the grab, since swallowing the
+ * pad's own events is the entire point of those lines. */
+static bool config_wants_pad(const config_t *cfg) {
+    if (cfg->idle) return false;
+    for (int i = 0; i < n_sources(cfg); i++)
+        if (cfg->defined[i]) return true;
+    return cfg->n_chords > 0;
+}
+
+/* Drops any binding whose key is not on the fixed serve keyboard (in
+ * practice only KEY_Q -- see key_in_superset()) so a profile can never ask
+ * for a key the device cannot emit. The binding becomes NONE rather than
+ * disappearing: the pad is grabbed either way, so leaving it defined keeps
+ * the button swallowed instead of half-working. Never fails a reload. */
+static int filter_targets_to_superset(config_t *cfg, const char *ctx) {
+    int dropped = 0;
+    for (int i = 0; i < n_sources(cfg); i++) {
+        if (cfg->target[i] < 0 || key_in_superset(cfg->target[i])) continue;
+        fprintf(stderr, "dpadkeys: %s: %s -> %s is not on the serve keyboard; ignoring\n",
+                ctx, source_name(cfg, i), key_name(cfg->target[i]));
+        cfg->target[i] = TARGET_NONE;
+        dropped++;
+    }
+    for (int i = 0; i < cfg->n_chords; i++) {
+        chord_t *c = &cfg->chords[i];
+        if (c->target < 0 || key_in_superset(c->target)) continue;
+        fprintf(stderr, "dpadkeys: %s: %s+%s -> %s is not on the serve keyboard; ignoring\n",
+                ctx, source_name(cfg, c->hold), source_name(cfg, c->src), key_name(c->target));
+        c->target = TARGET_NONE;
+        dropped++;
+    }
+    if (dropped) fflush(stderr);
+    return dropped;
+}
+
+/* Writes the one-line status the supervisor polls, atomically (temp file in
+ * the same directory + rename), so a reader never sees a half-written line.
+ * Called on every transition, including the panic chord's. */
+static void write_status(const config_t *cfg) {
+    if (!g_status_path) return;
+    char tmp[PATH_MAX];
+    if (snprintf(tmp, sizeof(tmp), "%s.tmp", g_status_path) >= (int)sizeof(tmp)) return;
+    FILE *f = fopen(tmp, "w");
+    if (!f) {
+        fprintf(stderr, "dpadkeys: serve: cannot write status '%s': %s\n", tmp, strerror(errno));
+        fflush(stderr);
+        return;
+    }
+    fprintf(f, "state=%s touch=%s keys=%d panic=%ld\n",
+            (g_want_pad || g_want_touch) ? "active" : "idle",
+            g_want_touch ? "on" : "off", count_bindings(cfg), g_panic_count);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    if (rename(tmp, g_status_path) < 0) {
+        fprintf(stderr, "dpadkeys: serve: cannot rename status into place: %s\n", strerror(errno));
+        fflush(stderr);
+        unlink(tmp);
+    }
+}
+
+static void log_serve_state(const config_t *cfg) {
+    if (g_want_pad || g_want_touch) {
+        char tb[48];
+        if (g_want_touch) snprintf(tb, sizeof(tb), "on %d %d", cfg->touch_dx, cfg->touch_dy);
+        else snprintf(tb, sizeof(tb), "off");
+        fprintf(stderr, "dpadkeys: serve: state=active keys=%d touch=%s\n", count_bindings(cfg), tb);
+    } else {
+        fprintf(stderr, "dpadkeys: serve: state=idle\n");
+    }
+    fflush(stderr);
+}
+
+static void serve_schedule_retry(void) { g_retry_due_ms = now_ms() + SERVE_RETRY_MS; }
+
+/* Drops every virtual key and wheel repeat the daemon is currently holding,
+ * and forgets all per-source and per-axis state. Called before a mapping
+ * swap (so a key bound only by the outgoing profile can never stick down)
+ * and when going idle. The axis states are cleared too, so a stick already
+ * deflected across the switch re-presses under the new mapping on its next
+ * event rather than being swallowed by handle_stick_2d's no-change test. */
+static void release_all_virtual(config_t *cfg) {
+    release_all_sources(cfg);
+    for (int c = 0; c < KEY_CNT; c++) {
+        if (g_key_count[c] > 0) {
+            emit_key(g_uinput_fd, c, 0);
+            g_key_count[c] = 0;
+        }
+    }
+    for (int w = 0; w < WHEEL_COUNT; w++) { g_wheel_count[w] = 0; g_wheel_next_due_ms[w] = 0; }
+    memset(g_source_pressed, 0, sizeof(g_source_pressed));
+    memset(g_source_press_seq, 0, sizeof(g_source_press_seq));
+    memset(g_resolved_target, 0, sizeof(g_resolved_target));
+    g_ax.ls_active = g_ax.rs_active = false;
+    g_ax.ls_dirs = g_ax.rs_dirs = 0;
+    g_ax.ls_x.state = g_ax.ls_y.state = g_ax.rs_x.state = g_ax.rs_y.state = 0;
+    g_ax.lt.state = g_ax.rt.state = 0;
+    for (int i = 0; i < cfg->n_raw; i++) cfg->raw[i].axis.state = 0;
+    g_chord_m1_held = g_chord_m2_held = false;
+    g_chord_start_ms = -1;
+}
+
+/* Raw-source problems that can only be spotted once the pad is open. In
+ * one-shot mode these exit(2) before the daemon ever runs; in serve mode a
+ * profile is never allowed to kill the daemon, so they are warnings and the
+ * offending raw source simply behaves oddly (double-firing with the semantic
+ * source it collides with, or never firing for a `.neg` on a trigger). */
+static void serve_warn_raw_problems(const config_t *cfg) {
+    const char *coll = raw_axis_collision(cfg, &g_ax);
+    if (coll) { fprintf(stderr, "dpadkeys: serve: %s\n", coll); fflush(stderr); }
+    const char *bad = raw_unipolar_neg_reject(cfg, &g_ax);
+    if (bad) { fprintf(stderr, "dpadkeys: serve: %s\n", bad); fflush(stderr); }
+}
+
+/* One non-blocking attempt to open and grab the pad. Non-blocking matters:
+ * the one-shot path can afford to spin until a pad shows up, but a serve
+ * daemon that blocked here would stop answering SIGUSR1 -- the app could not
+ * even park it back to idle. A failure just asks for a retry. */
+static bool serve_acquire_pad(config_t *cfg, const char *device_override) {
+    if (g_pad_fd >= 0) return true;
+    memset(g_pad_path, 0, sizeof(g_pad_path));
+    memset(g_pad_name, 0, sizeof(g_pad_name));
+    if (device_override) {
+        g_pad_fd = open(device_override, O_RDWR);
+        if (g_pad_fd < 0) return false;
+        snprintf(g_pad_path, sizeof(g_pad_path), "%s", device_override);
+        bool has_south;
+        device_info(g_pad_fd, &g_pad_vendor, &g_pad_product, g_pad_name, sizeof(g_pad_name), &has_south);
+    } else {
+        g_pad_fd = find_pad(cfg->device_match, O_RDWR, g_pad_path, sizeof(g_pad_path),
+                            g_pad_name, sizeof(g_pad_name), &g_pad_vendor, &g_pad_product);
+        if (g_pad_fd < 0) return false;
+    }
+    /* The grab is all-or-nothing here exactly as in one-shot mode: an
+     * ungrabbed active profile would let the pad's own events reach the game
+     * alongside our keys. */
+    if (ioctl(g_pad_fd, EVIOCGRAB, 1) < 0) {
+        close(g_pad_fd);
+        g_pad_fd = -1;
+        return false;
+    }
+    g_grabbed = true;
+    detect_axes(g_pad_fd, &g_ax);
+    raw_query_axes(g_pad_fd, cfg);
+    propagate_trigger_unipolar(cfg, &g_ax);
+    serve_warn_raw_problems(cfg);
+    fprintf(stderr, "dpadkeys: serve: pad=%s name=\"%s\" vid=0x%04x pid=0x%04x grabbed\n",
+            g_pad_path, g_pad_name, g_pad_vendor, g_pad_product);
+    fflush(stderr);
+    return true;
+}
+
+static void serve_release_pad(config_t *cfg) {
+    if (g_pad_fd < 0) return;
+    release_all_virtual(cfg);
+    if (g_grabbed) { ioctl(g_pad_fd, EVIOCGRAB, 0); g_grabbed = false; }
+    close(g_pad_fd);
+    g_pad_fd = -1;
+    fprintf(stderr, "dpadkeys: serve: pad released\n");
+    fflush(stderr);
+}
+
+/* The panic chord's landing state: everything let go, nothing wanted, no
+ * retries pending. Only a SIGUSR1 reload can bring the daemon back. */
+static void serve_go_idle(config_t *cfg) {
+    release_all_virtual(cfg);
+    serve_release_pad(cfg);
+    touch_release_panel();
+    g_want_pad = false;
+    g_want_touch = false;
+    g_retry_due_ms = -1;
+}
+
+/* Makes `newcfg` the active profile. The uinput devices are never touched
+ * here -- that is the entire point of serve mode -- so this is purely: let
+ * go of whatever the old profile held, swap the mappings in, then acquire
+ * whatever the new one wants. */
+static void serve_apply(config_t *cfg, const config_t *newcfg, const char *device_override) {
+    bool match_changed = strcmp(cfg->device_match, newcfg->device_match) != 0;
+    bool touch_dev_changed = strcmp(cfg->touch_device, newcfg->touch_device) != 0;
+
+    release_all_virtual(cfg);
+    *cfg = *newcfg;
+    g_wheel_repeat_ms = cfg->wheel_repeat_ms > 0 ? cfg->wheel_repeat_ms : 120;
+
+    g_want_pad = config_wants_pad(cfg);
+    g_want_touch = !cfg->idle && cfg->touch_offset_set;
+    if (g_want_touch && g_touch_uinput_fd < 0) {
+        fprintf(stderr, "dpadkeys: serve: profile asks for touch.offset but there is no "
+                        "virtual touchscreen; ignoring\n");
+        fflush(stderr);
+        g_want_touch = false;
+    }
+
+    /* device.match / touch.device changing means the profile may want a
+     * different node, so drop what we hold and re-pick below. */
+    if (g_pad_fd >= 0 && (!g_want_pad || match_changed)) serve_release_pad(cfg);
+    if (g_touch_grabbed && (!g_want_touch || touch_dev_changed)) touch_release_panel();
+
+    g_retry_due_ms = -1;
+    if (g_want_pad) {
+        if (g_pad_fd >= 0) {
+            /* Pad already in hand: only the raw-source axis metadata is
+             * profile-specific and has to be re-derived. */
+            raw_query_axes(g_pad_fd, cfg);
+            propagate_trigger_unipolar(cfg, &g_ax);
+            serve_warn_raw_problems(cfg);
+        } else if (!serve_acquire_pad(cfg, device_override)) {
+            fprintf(stderr, "dpadkeys: serve: no pad yet; will keep trying\n");
+            fflush(stderr);
+            serve_schedule_retry();
+        }
+    }
+    if (g_want_touch && !g_touch_grabbed) {
+        if (touch_enable(cfg) == TOUCH_ENABLE_OK) {
+            fprintf(stderr, "dpadkeys: serve: touch grabbed %s off=(%d,%d)\n",
+                    g_touch_path, cfg->touch_dx, cfg->touch_dy);
+            fflush(stderr);
+        } else {
+            fprintf(stderr, "dpadkeys: serve: could not grab the panel; will keep trying\n");
+            fflush(stderr);
+            serve_schedule_retry();
+        }
+    }
+
+    log_serve_state(cfg);
+    write_status(cfg);
+}
+
+/* Re-reads the whole config, tolerating the app rewriting it underneath us:
+ * an open failure (or a zero-length file, which is what a truncate-then-write
+ * looks like mid-flight) is retried once after 50ms. A file that is still
+ * empty on the second look is taken at face value -- an empty config is a
+ * perfectly good idle profile. Returns false only if the file is gone. */
+static bool load_config_retry(const char *path, config_t *out) {
+    for (int attempt = 0; attempt < 2; attempt++) {
+        struct stat st;
+        bool empty_now = (stat(path, &st) == 0 && st.st_size == 0);
+        if (!empty_now && load_config_file(path, out, true)) return true;
+        if (attempt == 0) {
+            struct timespec ts = { 0, 50 * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+        }
+    }
+    struct stat st;
+    if (stat(path, &st) == 0) { init_config(out); return true; }
+    return false;
+}
+
+static void serve_reload(config_t *cfg, const char *config_path, const char *device_override) {
+    static config_t next;
+    if (!load_config_retry(config_path, &next)) {
+        fprintf(stderr, "dpadkeys: serve: cannot read config '%s': %s; keeping current profile\n",
+                config_path, strerror(errno));
+        fflush(stderr);
+        return;
+    }
+    filter_targets_to_superset(&next, config_path);
+    serve_apply(cfg, &next, device_override);
+}
+
+/* Retries whatever the active profile wants but does not yet hold (pad,
+ * panel, or both). Called from the loop when g_retry_due_ms comes due, so a
+ * pad that is still being recreated after a controller-style switch, or a
+ * panel that has not come back yet, is picked up without ever blocking. */
+static void serve_retry_acquire(config_t *cfg, const char *device_override) {
+    static long long last_log_ms = -1;
+    long long now = now_ms();
+    bool log_now = (last_log_ms < 0 || now - last_log_ms >= 10000);
+    bool pending = false;
+
+    if (g_want_pad && g_pad_fd < 0) {
+        if (serve_acquire_pad(cfg, device_override)) write_status(cfg);
+        else pending = true;
+    }
+    if (g_want_touch && !g_touch_grabbed) {
+        g_touch_quiet = !log_now;
+        touch_enable_result_t r = touch_enable(cfg);
+        g_touch_quiet = false;
+        if (r == TOUCH_ENABLE_OK) {
+            fprintf(stderr, "dpadkeys: serve: touch grabbed %s off=(%d,%d)\n",
+                    g_touch_path, cfg->touch_dx, cfg->touch_dy);
+            fflush(stderr);
+            write_status(cfg);
+        } else {
+            pending = true;
+        }
+    }
+    if (pending) {
+        if (log_now) {
+            last_log_ms = now;
+            fprintf(stderr, "dpadkeys: serve: still waiting for %s%s%s\n",
+                    (g_want_pad && g_pad_fd < 0) ? "pad" : "",
+                    (g_want_pad && g_pad_fd < 0 && g_want_touch && !g_touch_grabbed) ? "+" : "",
+                    (g_want_touch && !g_touch_grabbed) ? "panel" : "");
+            fflush(stderr);
+        }
+        serve_schedule_retry();
+    }
+}
+
+/* Creates the virtual touchscreen once, cloned from the real panel, then
+ * closes the panel again. The clone outlives every profile switch; the panel
+ * itself is only opened (and grabbed) while a profile asks for a touch
+ * offset, so an idle daemon holds no panel fd whose event queue could
+ * overflow. Returns false (and logs) when there is no panel at all: the
+ * daemon then serves keys only. */
+static bool serve_create_touch_device(const config_t *cfg) {
+    memset(g_touch_path, 0, sizeof(g_touch_path));
+    int fd = find_touch(cfg, g_touch_path, sizeof(g_touch_path));
+    if (fd < 0) {
+        fprintf(stderr, "dpadkeys: serve: no touch panel found%s%s; serving without touch support\n",
+                cfg->touch_device[0] ? " at " : "", cfg->touch_device);
+        fflush(stderr);
+        g_touch_path[0] = '\0';
+        return false;
+    }
+    struct input_id touch_id;
+    memset(&touch_id, 0, sizeof(touch_id));
+    ioctl(fd, EVIOCGID, &touch_id);
+    if (ioctl(fd, EVIOCGNAME(sizeof(g_touch_name)), g_touch_name) < 0)
+        snprintf(g_touch_name, sizeof(g_touch_name), "?");
+    query_touch_axes(fd);
+    g_touch_uinput_fd = open_touch_uinput(fd, &touch_id, "fts_ts");
+    close(fd);
+    if (g_touch_uinput_fd < 0) {
+        fprintf(stderr, "dpadkeys: serve: could not create the virtual touchscreen\n");
+        fflush(stderr);
+        return false;
+    }
+    fprintf(stderr, "dpadkeys: serve: created virtual touchscreen \"fts_ts\" (cloned from %s \"%s\")\n",
+            g_touch_path, g_touch_name);
+    fflush(stderr);
+    return true;
+}
+
+/* ---- event loop ---- */
+
+/* Turns one pad event into source updates. Shared verbatim by both modes.
+ * Returns false if the pad was let go while handling the event (the panic
+ * chord firing in serve mode), so the caller stops using g_pad_fd. */
+static bool dispatch_pad_event(config_t *cfg, const struct input_event *ev) {
+    if (ev->type == EV_KEY) {
+        if (ev->value == 2)
+            return true; /* ignore autorepeat */
+        /* Raw check ahead of (and independent of) whatever btn.m1/btn.m2
+         * are mapped to in this config; mapping still happens below. */
+        if (ev->code == BTN_C || ev->code == BTN_Z) {
+            if (check_panic_chord(cfg, ev->code, ev->value != 0)) return false;
+        }
+        handle_raw_key(cfg, ev->code, ev->value != 0);
+        for (int i = 0; i < BTN_MAP_LEN; i++) {
+            if (BTN_MAP[i].code == ev->code) {
+                update_source(cfg, BTN_MAP[i].src, ev->value != 0);
+                break;
+            }
+        }
+        return true;
+    }
+    if (ev->type != EV_ABS) return true;
+
+    handle_raw_abs(cfg, ev->code, ev->value);
+    if (ev->code == ABS_HAT0X) {
+        update_source(cfg, SRC_HAT_LEFT, ev->value < 0);
+        update_source(cfg, SRC_HAT_RIGHT, ev->value > 0);
+    } else if (ev->code == ABS_HAT0Y) {
+        update_source(cfg, SRC_HAT_UP, ev->value < 0);
+        update_source(cfg, SRC_HAT_DOWN, ev->value > 0);
+    } else if (g_ax.ls_x.present && g_ax.ls_y.present &&
+               (ev->code == g_ax.ls_x.code || ev->code == g_ax.ls_y.code)) {
+        if (ev->code == g_ax.ls_x.code) g_ax.ls_rx = ev->value; else g_ax.ls_ry = ev->value;
+        handle_stick_2d(cfg, &g_ax.ls_x, &g_ax.ls_y, g_ax.ls_rx, g_ax.ls_ry, &g_ax.ls_active, &g_ax.ls_dirs,
+                        cfg->deadzone, cfg->ls_invert_x, cfg->ls_invert_y,
+                        SRC_LS_UP, SRC_LS_DOWN, SRC_LS_LEFT, SRC_LS_RIGHT);
+    } else if (g_ax.rs_x.present && g_ax.rs_y.present &&
+               (ev->code == g_ax.rs_x.code || ev->code == g_ax.rs_y.code)) {
+        if (ev->code == g_ax.rs_x.code) g_ax.rs_rx = ev->value; else g_ax.rs_ry = ev->value;
+        handle_stick_2d(cfg, &g_ax.rs_x, &g_ax.rs_y, g_ax.rs_rx, g_ax.rs_ry, &g_ax.rs_active, &g_ax.rs_dirs,
+                        cfg->deadzone, cfg->rs_invert_x, cfg->rs_invert_y,
+                        SRC_RS_UP, SRC_RS_DOWN, SRC_RS_LEFT, SRC_RS_RIGHT);
+    } else if (g_ax.lt.present && ev->code == g_ax.lt.code) {
+        handle_trigger_axis(cfg, &g_ax.lt, ev->value, SRC_LT, cfg->deadzone);
+    } else if (g_ax.rt.present && ev->code == g_ax.rt.code) {
+        handle_trigger_axis(cfg, &g_ax.rt, ev->value, SRC_RT, cfg->deadzone);
+    }
+    return true;
+}
+
+/* The daemon's event loop, shared by one-shot and serve modes.
+ *
+ * The only structural difference is that in serve mode every fd here may
+ * legitimately be -1 (an idle profile holds nothing), and a device going
+ * away is a transient to retry rather than something to block on or die
+ * from. The self-pipe is always in the poll set, so an idle daemon with no
+ * device fds at all still wakes promptly on SIGUSR1/SIGTERM. */
+static void event_loop(config_t *cfg, const char *config_path, const char *device_override, bool grab) {
+    while (g_running) {
+        if (g_reload_req) {
+            g_reload_req = 0;
+            if (g_serve) serve_reload(cfg, config_path, device_override);
+            else reload_touch_config(config_path, cfg);
+        }
+        if (g_serve && g_touch_uinput_dead) {
+            /* The clone stopped accepting writes (something destroyed it out
+             * from under us). One-shot mode exits 5 here; a serve daemon has
+             * a keyboard to keep serving, so it drops touch support, tells
+             * the supervisor via the status file, and carries on. */
+            g_touch_uinput_dead = false;
+            fprintf(stderr, "dpadkeys: serve: virtual touchscreen is gone; touch support disabled\n");
+            fflush(stderr);
+            touch_release_panel();
+            destroy_uinput(g_touch_uinput_fd);
+            g_touch_uinput_fd = -1;
+            g_want_touch = false;
+            write_status(cfg);
+        }
+        if (g_serve && g_retry_due_ms >= 0 && now_ms() >= g_retry_due_ms) {
+            g_retry_due_ms = -1;
+            serve_retry_acquire(cfg, device_override);
+        }
+
+        long long deadline = -1;
+        for (int i = 0; i < WHEEL_COUNT; i++) {
+            if (g_wheel_count[i] > 0 && (deadline < 0 || g_wheel_next_due_ms[i] < deadline))
+                deadline = g_wheel_next_due_ms[i];
+        }
+        if (g_chord_start_ms >= 0) {
+            /* Both m1/m2 already held: wake in time to fire the chord even
+             * if no further pad events arrive while they're held. */
+            long long chord_deadline = g_chord_start_ms + PANIC_CHORD_MS;
+            if (deadline < 0 || chord_deadline < deadline)
+                deadline = chord_deadline;
+        }
+        if (g_retry_due_ms >= 0 && (deadline < 0 || g_retry_due_ms < deadline))
+            deadline = g_retry_due_ms;
+        int timeout_ms = -1;
+        if (deadline >= 0) {
+            long long now = now_ms();
+            timeout_ms = (int)(deadline > now ? deadline - now : 0);
+        }
+
+        struct pollfd pfds[3];
+        int nfds = 0, sig_slot = -1, pad_slot = -1, touch_slot = -1;
+        if (g_sigpipe[0] >= 0) {
+            pfds[nfds].fd = g_sigpipe[0]; pfds[nfds].events = POLLIN; pfds[nfds].revents = 0;
+            sig_slot = nfds++;
+        }
+        if (g_pad_fd >= 0) {
+            pfds[nfds].fd = g_pad_fd; pfds[nfds].events = POLLIN; pfds[nfds].revents = 0;
+            pad_slot = nfds++;
+        }
+        if (g_touch_fd >= 0 && g_touch_grabbed) {
+            pfds[nfds].fd = g_touch_fd; pfds[nfds].events = POLLIN; pfds[nfds].revents = 0;
+            touch_slot = nfds++;
+        }
+
+        int pr = poll(nfds ? pfds : NULL, (nfds_t)nfds, timeout_ms);
+        if (pr < 0) {
+            if (errno == EINTR)
+                continue;
+            perror("poll");
+            break;
+        }
+        if (pr == 0) {
+            /* Nothing readable: fire any wheel repeats that came due, and
+             * check whether the panic chord's hold time has elapsed. */
+            if (g_chord_start_ms >= 0)
+                check_panic_chord(cfg, 0, true); /* code 0: re-check elapsed time only */
+            long long now = now_ms();
+            for (int i = 0; i < WHEEL_COUNT; i++) {
+                if (g_wheel_count[i] > 0 && now >= g_wheel_next_due_ms[i]) {
+                    emit_wheel_notch(g_uinput_fd, i);
+                    g_wheel_next_due_ms[i] = now + g_wheel_repeat_ms;
+                }
+            }
+            continue;
+        }
+
+        if (sig_slot >= 0 && (pfds[sig_slot].revents & POLLIN)) {
+            char drain[64];
+            while (read(g_sigpipe[0], drain, sizeof(drain)) > 0) { }
+            continue; /* re-evaluate g_running / g_reload_req at the top */
+        }
+
+        if (touch_slot >= 0 && (pfds[touch_slot].revents & POLLIN)) {
+            if (forward_touch_batch(cfg) < 0) {
+                if (errno == ENODEV) {
+                    if (g_serve) {
+                        /* Never block and never exit: drop the panel and let
+                         * the retry timer pick it back up. */
+                        fprintf(stderr, "dpadkeys: serve: touch panel disconnected, will re-detect\n");
+                        fflush(stderr);
+                        touch_release_panel();
+                        serve_schedule_retry();
+                        continue;
+                    }
+                    fprintf(stderr, "dpadkeys: touch: panel disconnected, re-detecting...\n");
+                    if (g_touch_grabbed) { ioctl(g_touch_fd, EVIOCGRAB, 0); g_touch_grabbed = false; }
+                    close(g_touch_fd);
+                    g_touch_fd = -1;
+                    while (g_running && (g_touch_fd = find_touch(cfg, g_touch_path, sizeof(g_touch_path))) < 0) {
+                        struct timespec ts = { 0, 500 * 1000 * 1000 };
+                        nanosleep(&ts, NULL);
+                    }
+                    if (g_running && g_touch_fd >= 0) {
+                        query_touch_axes(g_touch_fd);
+                        /* Freshly recreated node: retry briefly before giving up. */
+                        bool got = false;
+                        for (int tries = 0; g_running && tries < 20 && !got; tries++) {
+                            if (ioctl(g_touch_fd, EVIOCGRAB, 1) == 0) got = true;
+                            else usleep(100000);
+                        }
+                        if (!got) {
+                            if (!g_running) break;
+                            fprintf(stderr, "dpadkeys: touch: could not re-grab the panel. Exiting.\n");
+                            touch_fatal_exit(4);
+                        }
+                        g_touch_grabbed = true;
+                        touch_sync_initial_contacts(cfg);
+                        fprintf(stderr, "dpadkeys: touch: reacquired %s\n", g_touch_path);
+                        fflush(stderr);
+                    }
+                } else if (errno != EAGAIN) {
+                    perror("read touch");
+                }
+            }
+        }
+
+        if (!g_running)
+            break;
+        if (pad_slot < 0 || !(pfds[pad_slot].revents & POLLIN))
+            continue;
+
+        struct input_event ev;
+        ssize_t n = read(g_pad_fd, &ev, sizeof(ev));
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            if (errno == ENODEV) {
+                if (g_serve) {
+                    fprintf(stderr, "dpadkeys: serve: pad disconnected (style switch?), will re-detect\n");
+                    fflush(stderr);
+                    serve_release_pad(cfg);
+                    serve_schedule_retry();
+                    continue;
+                }
+                fprintf(stderr, "dpadkeys: pad disconnected (style switch?), re-detecting...\n");
+                release_all_sources(cfg);
+                if (g_grabbed) { ioctl(g_pad_fd, EVIOCGRAB, 0); g_grabbed = false; }
+                close(g_pad_fd);
+                g_pad_fd = -1;
+                if (device_override) {
+                    while (g_running && (g_pad_fd = open(device_override, O_RDWR)) < 0) {
+                        struct timespec ts = { 0, 500 * 1000 * 1000 };
+                        nanosleep(&ts, NULL);
+                    }
+                } else {
+                    while (g_running &&
+                           (g_pad_fd = find_pad(cfg->device_match, O_RDWR, g_pad_path, sizeof(g_pad_path),
+                                                 g_pad_name, sizeof(g_pad_name), &g_pad_vendor, &g_pad_product)) < 0) {
+                        struct timespec ts = { 0, 500 * 1000 * 1000 };
+                        nanosleep(&ts, NULL);
+                    }
+                }
+                if (!g_running)
+                    break;
+                if (grab) {
+                    /* Freshly recreated device: retry briefly before giving up. */
+                    int tries = 20;
+                    while (g_running && tries-- > 0 && ioctl(g_pad_fd, EVIOCGRAB, 1) < 0)
+                        usleep(100000);
+                    if (tries < 0) {
+                        perror("EVIOCGRAB");
+                        fprintf(stderr, "dpadkeys: could not re-grab the pad. Exiting.\n");
+                        g_running = 0;
+                        break;
+                    }
+                    g_grabbed = true;
+                }
+                detect_axes(g_pad_fd, &g_ax);
+                raw_query_axes(g_pad_fd, cfg);
+                propagate_trigger_unipolar(cfg, &g_ax);
+                fprintf(stderr, "dpadkeys: reacquired pad=%s name=\"%s\"\n", g_pad_path, g_pad_name);
+                print_banner(g_pad_path, g_pad_name, g_pad_vendor, g_pad_product, &g_ax, cfg);
+                continue;
+            }
+            if (errno == EAGAIN)
+                continue;
+            perror("read pad");
+            break;
+        }
+        if (n != (ssize_t)sizeof(ev))
+            continue;
+
+        if (!dispatch_pad_event(cfg, &ev))
+            continue; /* pad was released mid-event (panic chord) */
+    }
+}
+
+/* ---- startup ---- */
+
+/* Refuses to start if `pidfile` names a live process, then claims it.
+ * Returns false if another instance owns it. */
+static bool claim_pidfile(const char *pidfile) {
+    FILE *pf = fopen(pidfile, "r");
+    if (pf) {
+        int oldpid = 0;
+        if (fscanf(pf, "%d", &oldpid) == 1 && oldpid > 0 && kill(oldpid, 0) == 0) {
+            fprintf(stderr, "dpadkeys: already running as pid %d (per %s). Exiting.\n", oldpid, pidfile);
+            fclose(pf);
+            return false;
+        }
+        fclose(pf);
+    }
+    FILE *f = fopen(pidfile, "w");
+    if (f) { fprintf(f, "%d\n", getpid()); fclose(f); }
+    return true;
+}
+
+/* --serve: create both virtual devices once, then spend the whole process
+ * lifetime switching profiles underneath them. */
+static int run_serve(config_t *cfg, const char *config_path, const char *device_override,
+                     const char *pidfile) {
+    g_serve = true;
+
+    /* Claimed before any device is created: two serve daemons would each
+     * create their own pair, which is exactly the churn this mode exists to
+     * avoid. */
+    if (pidfile && !claim_pidfile(pidfile)) return 1;
+
+    g_uinput_fd = open_uinput_superset();
+    if (g_uinput_fd < 0) {
+        fprintf(stderr, "dpadkeys: serve: cannot create the virtual keyboard. Exiting.\n");
+        if (pidfile) unlink(pidfile);
+        return 1;
+    }
+    bool touch_ok = serve_create_touch_device(cfg);
+
+    printf("dpadkeys: serve: keyboard+mouse ok, touch=%s, state=idle\n",
+           touch_ok ? g_touch_path : "none");
+    fflush(stdout);
+
+    /* Apply the startup profile through the same path SIGUSR1 takes, from a
+     * known-idle base, so there is exactly one transition implementation. */
+    {
+        static config_t startup;
+        startup = *cfg;
+        init_config(cfg);
+        serve_apply(cfg, &startup, device_override);
+    }
+
+    event_loop(cfg, config_path, device_override, true);
+
+    serve_go_idle(cfg);
+    touch_disable();
+    destroy_uinput(g_uinput_fd);
+    g_uinput_fd = -1;
+    if (pidfile) unlink(pidfile);
+    fprintf(stderr, "dpadkeys: serve: stopped\n");
+    fflush(stderr);
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    /* We may be spawned from a Java process (Shizuku user service) whose threads
+     * block SIGUSR1/SIGTERM; the mask is inherited across exec, so clear it or
+     * our reload/exit signals stay pending forever. */
+    { sigset_t none; sigemptyset(&none); sigprocmask(SIG_SETMASK, &none, NULL); }
     const char *config_path = NULL;
     const char *profile_name = NULL;
     bool grab = false;
@@ -2132,6 +3049,7 @@ int main(int argc, char **argv) {
     bool do_dump = false;
     bool print_config_flag = false;
     bool do_learn = false;
+    bool do_serve = false;
     long long learn_timeout_ms = 15000;
     long long learn_hold_ms = 150;
     const char *device_override = NULL;
@@ -2148,6 +3066,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--pidfile") == 0 && i + 1 < argc) pidfile = argv[++i];
         else if (strcmp(argv[i], "--print-config") == 0) print_config_flag = true;
         else if (strcmp(argv[i], "--learn") == 0) do_learn = true;
+        else if (strcmp(argv[i], "--serve") == 0) do_serve = true;
+        else if (strcmp(argv[i], "--status-file") == 0 && i + 1 < argc) g_status_path = argv[++i];
         else if (strcmp(argv[i], "--learn-timeout-ms") == 0 && i + 1 < argc) learn_timeout_ms = atoll(argv[++i]);
         else if (strcmp(argv[i], "--learn-hold-ms") == 0 && i + 1 < argc) learn_hold_ms = atoll(argv[++i]);
         else if (strcmp(argv[i], "--panic-chord") == 0 && i + 1 < argc) {
@@ -2177,9 +3097,29 @@ int main(int argc, char **argv) {
         fprintf(stderr, "dpadkeys: --config and --profile are mutually exclusive\n");
         return 2;
     }
+    if (do_serve) {
+        if (!config_path) {
+            fprintf(stderr, "dpadkeys: --serve requires --config FILE (the active profile)\n");
+            return 2;
+        }
+        if (do_learn) {
+            fprintf(stderr, "dpadkeys: --serve and --learn are separate processes; run --learn on its own\n");
+            return 2;
+        }
+    }
 
     static config_t cfg;
-    if (config_path) load_config_file(config_path, &cfg);
+    if (do_serve) {
+        /* Lenient from the very first read: a broken startup profile must
+         * still leave a daemon running with both devices up, just idle. */
+        if (!load_config_retry(config_path, &cfg)) {
+            fprintf(stderr, "dpadkeys: serve: cannot read config '%s': %s; starting idle\n",
+                    config_path, strerror(errno));
+            init_config(&cfg);
+        }
+        filter_targets_to_superset(&cfg, config_path);
+    }
+    else if (config_path) load_config_file(config_path, &cfg, false);
     else if (do_learn && !profile_name) init_config(&cfg); /* learn needs no mapping, only device.match */
     else load_profile(&cfg, profile_name ? profile_name : "fkeys");
 
@@ -2191,7 +3131,21 @@ int main(int argc, char **argv) {
     {
         /* No SA_RESTART: a blocking read() on the pad must return EINTR so the
          * main loop notices g_running == 0 and cleans up, and SIGUSR1 must
-         * break poll() so g_reload_offset is seen on the next iteration. */
+         * break poll() so g_reload_req is seen on the next iteration. The
+         * self-pipe closes the remaining gap (a signal landing between the
+         * g_reload_req test and poll()), which an idle serve daemon -- with
+         * no device fds in the poll set at all -- would otherwise sleep
+         * through indefinitely. */
+        if (pipe(g_sigpipe) == 0) {
+            for (int i = 0; i < 2; i++) {
+                int fl = fcntl(g_sigpipe[i], F_GETFL, 0);
+                if (fl >= 0) fcntl(g_sigpipe[i], F_SETFL, fl | O_NONBLOCK);
+                fcntl(g_sigpipe[i], F_SETFD, FD_CLOEXEC);
+            }
+        } else {
+            g_sigpipe[0] = g_sigpipe[1] = -1;
+            perror("pipe");
+        }
         struct sigaction sa;
         memset(&sa, 0, sizeof(sa));
         sa.sa_handler = on_signal;
@@ -2201,12 +3155,11 @@ int main(int argc, char **argv) {
         sigaction(SIGTERM, &sa, NULL);
         sa.sa_handler = on_usr1;
         sigaction(SIGUSR1, &sa, NULL);
+        signal(SIGPIPE, SIG_IGN);
     }
 
-    char pad_path[64] = {0};
-    char pad_name[128] = {0};
-    unsigned short vendor = 0, product = 0;
-    axes_t ax;
+    if (do_serve)
+        return run_serve(&cfg, config_path, device_override, pidfile);
 
     /* learn never grabs and never writes, so a read-only open suffices there */
     int open_flags = do_learn ? O_RDONLY : O_RDWR;
@@ -2219,14 +3172,14 @@ int main(int argc, char **argv) {
             if (do_learn) { printf("learned NONE\n"); return 3; }
             return 1;
         }
-        strncpy(pad_path, device_override, sizeof(pad_path) - 1);
+        strncpy(g_pad_path, device_override, sizeof(g_pad_path) - 1);
         bool s;
-        device_info(g_pad_fd, &vendor, &product, pad_name, sizeof(pad_name), &s);
+        device_info(g_pad_fd, &g_pad_vendor, &g_pad_product, g_pad_name, sizeof(g_pad_name), &s);
     } else {
         bool warned = false;
         while (g_running) {
-            g_pad_fd = find_pad(cfg.device_match, open_flags, pad_path, sizeof(pad_path),
-                                pad_name, sizeof(pad_name), &vendor, &product);
+            g_pad_fd = find_pad(cfg.device_match, open_flags, g_pad_path, sizeof(g_pad_path),
+                                g_pad_name, sizeof(g_pad_name), &g_pad_vendor, &g_pad_product);
             if (g_pad_fd >= 0)
                 break;
             if (!warned) {
@@ -2244,7 +3197,7 @@ int main(int argc, char **argv) {
         if (!g_running)
             return 0;
     }
-    detect_axes(g_pad_fd, &ax);
+    detect_axes(g_pad_fd, &g_ax);
 
     if (do_learn) {
         if (pidfile) {
@@ -2252,18 +3205,18 @@ int main(int argc, char **argv) {
             if (f) { fprintf(f, "%d\n", getpid()); fclose(f); }
         }
         fprintf(stderr, "dpadkeys: learn pad=%s name=\"%s\" vid=0x%04x pid=0x%04x timeout=%lldms\n",
-                pad_path, pad_name, vendor, product, learn_timeout_ms);
+                g_pad_path, g_pad_name, g_pad_vendor, g_pad_product, learn_timeout_ms);
         long long remaining = find_deadline - now_ms();
-        int rc = learn_mode(g_pad_fd, &ax, remaining > 0 ? remaining : 0, learn_hold_ms);
+        int rc = learn_mode(g_pad_fd, &g_ax, remaining > 0 ? remaining : 0, learn_hold_ms);
         close(g_pad_fd);
         if (pidfile) unlink(pidfile);
         return rc;
     }
 
     raw_query_axes(g_pad_fd, &cfg);
-    propagate_trigger_unipolar(&cfg, &ax);
+    propagate_trigger_unipolar(&cfg, &g_ax);
     {
-        const char *coll = raw_axis_collision(&cfg, &ax);
+        const char *coll = raw_axis_collision(&cfg, &g_ax);
         if (coll) {
             fprintf(stderr, "dpadkeys: %s\n", coll);
             close(g_pad_fd);
@@ -2271,7 +3224,7 @@ int main(int argc, char **argv) {
         }
     }
     {
-        const char *bad = raw_unipolar_neg_reject(&cfg, &ax);
+        const char *bad = raw_unipolar_neg_reject(&cfg, &g_ax);
         if (bad) {
             fprintf(stderr, "dpadkeys: %s\n", bad);
             close(g_pad_fd);
@@ -2312,222 +3265,18 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (pidfile) {
-        FILE *pf = fopen(pidfile, "r");
-        if (pf) {
-            int oldpid = 0;
-            if (fscanf(pf, "%d", &oldpid) == 1 && oldpid > 0 && kill(oldpid, 0) == 0) {
-                fprintf(stderr, "dpadkeys: already running as pid %d (per %s). Exiting.\n", oldpid, pidfile);
-                fclose(pf);
-                touch_disable();
-                if (g_grabbed) ioctl(g_pad_fd, EVIOCGRAB, 0);
-                destroy_uinput(g_uinput_fd);
-                close(g_pad_fd);
-                return 1;
-            }
-            fclose(pf);
-        }
-        FILE *f = fopen(pidfile, "w");
-        if (f) { fprintf(f, "%d\n", getpid()); fclose(f); }
+    if (pidfile && !claim_pidfile(pidfile)) {
+        touch_disable();
+        if (g_grabbed) ioctl(g_pad_fd, EVIOCGRAB, 0);
+        destroy_uinput(g_uinput_fd);
+        close(g_pad_fd);
+        return 1;
     }
 
-    print_banner(pad_path, pad_name, vendor, product, &ax, &cfg);
+    print_banner(g_pad_path, g_pad_name, g_pad_vendor, g_pad_product, &g_ax, &cfg);
     print_touch_banner(&cfg);
 
-    while (g_running) {
-        if (g_reload_offset) {
-            g_reload_offset = 0;
-            reload_touch_config(config_path, &cfg);
-        }
-
-        long long deadline = -1;
-        for (int i = 0; i < WHEEL_COUNT; i++) {
-            if (g_wheel_count[i] > 0 && (deadline < 0 || g_wheel_next_due_ms[i] < deadline))
-                deadline = g_wheel_next_due_ms[i];
-        }
-        if (g_chord_start_ms >= 0) {
-            /* Both m1/m2 already held: wake in time to fire the chord even
-             * if no further pad events arrive while they're held. */
-            long long chord_deadline = g_chord_start_ms + PANIC_CHORD_MS;
-            if (deadline < 0 || chord_deadline < deadline)
-                deadline = chord_deadline;
-        }
-        int timeout_ms = -1;
-        if (deadline >= 0) {
-            long long now = now_ms();
-            timeout_ms = (int)(deadline > now ? deadline - now : 0);
-        }
-
-        struct pollfd pfds[2];
-        pfds[0].fd = g_pad_fd;
-        pfds[0].events = POLLIN;
-        pfds[0].revents = 0;
-        pfds[1].revents = 0;
-        int nfds = 1;
-        int touch_slot = -1;
-        if (cfg.touch_offset_set && g_touch_fd >= 0) {
-            pfds[1].fd = g_touch_fd;
-            pfds[1].events = POLLIN;
-            touch_slot = 1;
-            nfds = 2;
-        }
-        int pr = poll(pfds, nfds, timeout_ms);
-        if (pr < 0) {
-            if (errno == EINTR)
-                continue;
-            perror("poll pad");
-            break;
-        }
-        if (pr == 0) {
-            /* Nothing readable: fire any wheel repeats that came due, and
-             * check whether the panic chord's hold time has elapsed. */
-            if (g_chord_start_ms >= 0)
-                check_panic_chord(&cfg, 0, true); /* code 0: re-check elapsed time only */
-            long long now = now_ms();
-            for (int i = 0; i < WHEEL_COUNT; i++) {
-                if (g_wheel_count[i] > 0 && now >= g_wheel_next_due_ms[i]) {
-                    emit_wheel_notch(g_uinput_fd, i);
-                    g_wheel_next_due_ms[i] = now + g_wheel_repeat_ms;
-                }
-            }
-            continue;
-        }
-
-        if (touch_slot >= 0 && (pfds[touch_slot].revents & POLLIN)) {
-            if (forward_touch_batch(&cfg) < 0) {
-                if (errno == ENODEV) {
-                    fprintf(stderr, "dpadkeys: touch: panel disconnected, re-detecting...\n");
-                    if (g_touch_grabbed) { ioctl(g_touch_fd, EVIOCGRAB, 0); g_touch_grabbed = false; }
-                    close(g_touch_fd);
-                    g_touch_fd = -1;
-                    while (g_running && (g_touch_fd = find_touch(&cfg, g_touch_path, sizeof(g_touch_path))) < 0) {
-                        struct timespec ts = { 0, 500 * 1000 * 1000 };
-                        nanosleep(&ts, NULL);
-                    }
-                    if (g_running && g_touch_fd >= 0) {
-                        query_touch_axes(g_touch_fd);
-                        /* Freshly recreated node: retry briefly before giving up. */
-                        bool got = false;
-                        for (int tries = 0; g_running && tries < 20 && !got; tries++) {
-                            if (ioctl(g_touch_fd, EVIOCGRAB, 1) == 0) got = true;
-                            else usleep(100000);
-                        }
-                        if (!got) {
-                            if (!g_running) break;
-                            fprintf(stderr, "dpadkeys: touch: could not re-grab the panel. Exiting.\n");
-                            touch_fatal_exit(4);
-                        }
-                        g_touch_grabbed = true;
-                        touch_sync_initial_contacts(&cfg);
-                        fprintf(stderr, "dpadkeys: touch: reacquired %s\n", g_touch_path);
-                        fflush(stderr);
-                    }
-                } else if (errno != EAGAIN) {
-                    perror("read touch");
-                }
-            }
-        }
-
-        if (!g_running)
-            break;
-        if (!(pfds[0].revents & POLLIN))
-            continue;
-
-        struct input_event ev;
-        ssize_t n = read(g_pad_fd, &ev, sizeof(ev));
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            if (errno == ENODEV) {
-                fprintf(stderr, "dpadkeys: pad disconnected (style switch?), re-detecting...\n");
-                release_all_sources(&cfg);
-                if (g_grabbed) { ioctl(g_pad_fd, EVIOCGRAB, 0); g_grabbed = false; }
-                close(g_pad_fd);
-                g_pad_fd = -1;
-                if (device_override) {
-                    while (g_running && (g_pad_fd = open(device_override, O_RDWR)) < 0) {
-                        struct timespec ts = { 0, 500 * 1000 * 1000 };
-                        nanosleep(&ts, NULL);
-                    }
-                } else {
-                    while (g_running &&
-                           (g_pad_fd = find_pad(cfg.device_match, O_RDWR, pad_path, sizeof(pad_path),
-                                                 pad_name, sizeof(pad_name), &vendor, &product)) < 0) {
-                        struct timespec ts = { 0, 500 * 1000 * 1000 };
-                        nanosleep(&ts, NULL);
-                    }
-                }
-                if (!g_running)
-                    break;
-                if (grab) {
-                    /* Freshly recreated device: retry briefly before giving up. */
-                    int tries = 20;
-                    while (g_running && tries-- > 0 && ioctl(g_pad_fd, EVIOCGRAB, 1) < 0)
-                        usleep(100000);
-                    if (tries < 0) {
-                        perror("EVIOCGRAB");
-                        fprintf(stderr, "dpadkeys: could not re-grab the pad. Exiting.\n");
-                        g_running = 0;
-                        break;
-                    }
-                    g_grabbed = true;
-                }
-                detect_axes(g_pad_fd, &ax);
-                raw_query_axes(g_pad_fd, &cfg);
-                propagate_trigger_unipolar(&cfg, &ax);
-                fprintf(stderr, "dpadkeys: reacquired pad=%s name=\"%s\"\n", pad_path, pad_name);
-                print_banner(pad_path, pad_name, vendor, product, &ax, &cfg);
-                continue;
-            }
-            if (errno == EAGAIN)
-                continue;
-            perror("read pad");
-            break;
-        }
-        if (n != (ssize_t)sizeof(ev))
-            continue;
-
-        if (ev.type == EV_KEY) {
-            if (ev.value == 2)
-                continue; /* ignore autorepeat */
-            /* Raw check ahead of (and independent of) whatever btn.m1/btn.m2
-             * are mapped to in this config; mapping still happens below. */
-            if (ev.code == BTN_C || ev.code == BTN_Z)
-                check_panic_chord(&cfg, ev.code, ev.value != 0);
-            handle_raw_key(&cfg, ev.code, ev.value != 0);
-            for (int i = 0; i < BTN_MAP_LEN; i++) {
-                if (BTN_MAP[i].code == ev.code) {
-                    update_source(&cfg, BTN_MAP[i].src, ev.value != 0);
-                    break;
-                }
-            }
-        } else if (ev.type == EV_ABS) {
-            handle_raw_abs(&cfg, ev.code, ev.value);
-            if (ev.code == ABS_HAT0X) {
-                update_source(&cfg, SRC_HAT_LEFT, ev.value < 0);
-                update_source(&cfg, SRC_HAT_RIGHT, ev.value > 0);
-            } else if (ev.code == ABS_HAT0Y) {
-                update_source(&cfg, SRC_HAT_UP, ev.value < 0);
-                update_source(&cfg, SRC_HAT_DOWN, ev.value > 0);
-            } else if (ax.ls_x.present && ax.ls_y.present &&
-                       (ev.code == ax.ls_x.code || ev.code == ax.ls_y.code)) {
-                if (ev.code == ax.ls_x.code) ax.ls_rx = ev.value; else ax.ls_ry = ev.value;
-                handle_stick_2d(&cfg, &ax.ls_x, &ax.ls_y, ax.ls_rx, ax.ls_ry, &ax.ls_active, &ax.ls_dirs,
-                                cfg.deadzone, cfg.ls_invert_x, cfg.ls_invert_y,
-                                SRC_LS_UP, SRC_LS_DOWN, SRC_LS_LEFT, SRC_LS_RIGHT);
-            } else if (ax.rs_x.present && ax.rs_y.present &&
-                       (ev.code == ax.rs_x.code || ev.code == ax.rs_y.code)) {
-                if (ev.code == ax.rs_x.code) ax.rs_rx = ev.value; else ax.rs_ry = ev.value;
-                handle_stick_2d(&cfg, &ax.rs_x, &ax.rs_y, ax.rs_rx, ax.rs_ry, &ax.rs_active, &ax.rs_dirs,
-                                cfg.deadzone, cfg.rs_invert_x, cfg.rs_invert_y,
-                                SRC_RS_UP, SRC_RS_DOWN, SRC_RS_LEFT, SRC_RS_RIGHT);
-            } else if (ax.lt.present && ev.code == ax.lt.code) {
-                handle_trigger_axis(&cfg, &ax.lt, ev.value, SRC_LT, cfg.deadzone);
-            } else if (ax.rt.present && ev.code == ax.rt.code) {
-                handle_trigger_axis(&cfg, &ax.rt, ev.value, SRC_RT, cfg.deadzone);
-            }
-        }
-    }
+    event_loop(&cfg, config_path, device_override, grab);
 
     touch_disable();
 

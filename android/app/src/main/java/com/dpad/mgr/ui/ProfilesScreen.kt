@@ -236,7 +236,8 @@ fun ProfileEditor(
         flashSaved()
         if (live) {
             val d = ServiceState.daemon.value
-            if (d is DaemonState.Running && d.profile == name) {
+            val activeProfile = (d as? DaemonState.Running)?.profile ?: (d as? DaemonState.Testing)?.profile
+            if (activeProfile == name) {
                 DpadService.send(ctx, DpadService.ACTION_UPDATE_CONFIG_LIVE, profile = name)
             }
         }
