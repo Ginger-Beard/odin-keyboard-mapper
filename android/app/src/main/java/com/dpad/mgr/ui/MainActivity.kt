@@ -88,7 +88,7 @@ fun App() {
                 Box(Modifier.weight(1f).fillMaxHeight().padding(12.dp)) {
                     val m = Modifier.fillMaxSize()
                     when (tab) {
-                        0 -> StatusScreen(m)
+                        0 -> StatusScreen(m, onOpenApps = { tab = 1 })
                         1 -> AppsScreen(m)
                         else -> ProfilesScreen(m)
                     }
@@ -104,7 +104,7 @@ fun App() {
                 Box(Modifier.weight(1f).fillMaxWidth()) {
                     val m = Modifier.fillMaxSize()
                     when (tab) {
-                        0 -> StatusScreen(m)
+                        0 -> StatusScreen(m, onOpenApps = { tab = 1 })
                         1 -> AppsScreen(m)
                         else -> ProfilesScreen(m)
                     }

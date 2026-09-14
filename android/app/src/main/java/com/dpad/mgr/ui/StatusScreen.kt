@@ -6,24 +6,35 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.PowerManager
 import android.provider.Settings
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.SnackbarHost
@@ -42,6 +53,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
@@ -78,8 +90,11 @@ private fun isDaemonActive(d: DaemonState): Boolean = when (d) {
     else -> false
 }
 
+/** Accent color for the hero card, matched to what the status means for the user. */
+private enum class HeroTone { INFO, GOOD, ACTIVE, WARN }
+
 @Composable
-fun StatusScreen(modifier: Modifier = Modifier) {
+fun StatusScreen(modifier: Modifier = Modifier, onOpenApps: () -> Unit = {}) {
     val ctx = LocalContext.current
     val priv by ServiceState.priv.collectAsStateWithLifecycle()
     val daemon by ServiceState.daemon.collectAsStateWithLifecycle()
@@ -94,6 +109,7 @@ fun StatusScreen(modifier: Modifier = Modifier) {
     }
     var menu by remember { mutableStateOf(false) }
     var showAllowQDialog by remember { mutableStateOf(false) }
+    var showAdvanced by remember { mutableStateOf(false) }
     val snackbarHostState = remember { SnackbarHostState() }
 
     // Battery-optimization exemption state, refreshed on resume (the user grants it in a
@@ -123,48 +139,147 @@ fun StatusScreen(modifier: Modifier = Modifier) {
         val msLeft = deadline - nowMs
         ((msLeft + 999) / 1000).toInt().coerceAtLeast(0)
     }
-    val active = isDaemonActive(daemon)
     val assignedCount = data.assignments.size
-
-    val statusLine = when (val d = daemon) {
-        DaemonState.Idle -> "Serving (idle) — starts mapping automatically when an assigned app is in front"
-        DaemonState.Stopped -> "Daemon not running"
-        DaemonState.Starting -> "Starting daemon…"
-        is DaemonState.Running -> "Mapping ${appLabel(ctx, d.pkg)} with ${d.profile}"
-        is DaemonState.Testing -> "Testing ${d.profile} — ${remainingSec ?: 0} s"
-        is DaemonState.Backoff -> "Retrying (attempt ${d.attempt}): ${d.reason}"
-        is DaemonState.Failed -> "Failed: ${d.reason}"
-        is DaemonState.PanicStopped -> "Disabled by panic chord"
-    }
-    val assignedLine = "$assignedCount app${if (assignedCount == 1) "" else "s"} assigned" +
-        if (assignedCount == 0) " — assign one in the Apps tab" else ""
 
     Box(modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             if (priv.source == PrivSource.NONE) {
+                HeroCard(
+                    icon = Icons.Default.Info,
+                    tone = HeroTone.INFO,
+                    title = "Needs setup",
+                    subtitle = "Shizuku is not connected. Follow the steps below.",
+                )
                 SetupCard()
+            } else {
+                when (val d = daemon) {
+                    DaemonState.Idle -> HeroCard(
+                        icon = Icons.Default.CheckCircle,
+                        tone = HeroTone.GOOD,
+                        title = "Ready",
+                        subtitle = "Mapping starts automatically when an assigned app opens.",
+                        extraLines = listOf("$assignedCount app${if (assignedCount == 1) "" else "s"} assigned"),
+                        linkLabel = if (assignedCount == 0) "Assign apps" else null,
+                        onLink = if (assignedCount == 0) onOpenApps else null,
+                    )
+                    is DaemonState.Running -> {
+                        val profile = data.profile(d.profile)
+                        val chordLine = profile?.panicChord?.let { "Hold ${SourceNames.chordLabel(it)} for 1 s to pause" }
+                        HeroCard(
+                            icon = Icons.Default.PlayArrow,
+                            tone = HeroTone.ACTIVE,
+                            title = "Mapping ${appLabel(ctx, d.pkg)}",
+                            subtitle = "Profile: ${d.profile}",
+                            extraLines = listOfNotNull(chordLine),
+                            actionLabel = "Pause",
+                            onAction = { DpadService.send(ctx, DpadService.ACTION_STOP_DAEMON) },
+                        )
+                    }
+                    is DaemonState.Testing -> HeroCard(
+                        icon = Icons.Default.PlayArrow,
+                        tone = HeroTone.ACTIVE,
+                        title = "Testing ${d.profile}",
+                        subtitle = "${remainingSec ?: 0} s left",
+                        actionLabel = "Stop",
+                        onAction = { DpadService.send(ctx, DpadService.ACTION_STOP_TEST) },
+                    )
+                    DaemonState.Starting -> HeroCard(
+                        icon = Icons.Default.PlayArrow,
+                        tone = HeroTone.ACTIVE,
+                        title = "Starting",
+                        subtitle = "Setting up the mapping service.",
+                    )
+                    else -> {
+                        val subtitle = when (d) {
+                            is DaemonState.Failed -> "The mapping service stopped and needs a restart."
+                            is DaemonState.PanicStopped -> "Mapping was paused by the panic shortcut."
+                            is DaemonState.Backoff -> "The mapping service is restarting itself."
+                            else -> "The mapping service isn't running."
+                        }
+                        HeroCard(
+                            icon = Icons.Default.Warning,
+                            tone = HeroTone.WARN,
+                            title = "Something went wrong",
+                            subtitle = subtitle,
+                            actionLabel = "Restart",
+                            onAction = { DpadService.send(ctx, DpadService.ACTION_RESTART_DAEMON) },
+                        )
+                    }
+                }
             }
+
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Daemon", style = MaterialTheme.typography.titleMedium)
-                    Text(statusLine)
-                    Text(assignedLine, style = MaterialTheme.typography.bodySmall)
-                    val activeProfileName = (daemon as? DaemonState.Running)?.profile
-                        ?: (daemon as? DaemonState.Testing)?.profile
-                    val runningProfile = activeProfileName?.let { data.profile(it) }
-                    if (runningProfile?.touchOffsetEnabled == true) {
-                        Text("Touch offset: ${runningProfile.touchDx},${runningProfile.touchDy}", style = MaterialTheme.typography.bodySmall)
+                    Text("Run in background", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "Lets mapping keep working even when you're not looking at this app.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            if (batteryExempt) "Allowed" else "Not allowed",
+                            Modifier.weight(1f),
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        if (!batteryExempt) {
+                            Button(onClick = {
+                                val intent = Intent(
+                                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                    Uri.parse("package:${ctx.packageName}"),
+                                )
+                                ctx.startActivity(intent)
+                            }) { Text("Allow running in background") }
+                        }
                     }
-                    runningProfile?.panicChord?.let { chord ->
-                        Text("Panic: hold ${SourceNames.chordLabel(chord)} 1 s (4 s restarts)", style = MaterialTheme.typography.bodySmall)
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text("Allow Q key (see Profiles)", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                        Switch(
+                            checked = data.allowQ,
+                            onCheckedChange = { v ->
+                                if (v) showAllowQDialog = true
+                                else DpadService.send(ctx, DpadService.ACTION_DISALLOW_Q)
+                            },
+                        )
                     }
-                    if (active) {
-                        Button(onClick = {
-                            val action = if (daemon is DaemonState.Testing || testEndsAtMs != null)
-                                DpadService.ACTION_STOP_TEST else DpadService.ACTION_STOP_DAEMON
-                            DpadService.send(ctx, action)
-                        }) { Text("Stop") }
-                    } else {
+                }
+            }
+
+            TextButton(onClick = { showAdvanced = !showAdvanced }) { Text("Advanced") }
+
+            if (showAdvanced) {
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("Privilege", style = MaterialTheme.typography.titleMedium)
+                        Text("${priv.source.label}" + if (priv.probing) " (probing…)" else "")
+                        Text(priv.detail, style = MaterialTheme.typography.bodySmall)
+                        Button(onClick = { DpadService.send(ctx, DpadService.ACTION_RECHECK) }) { Text("Re-check") }
+                    }
+                }
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("Status", style = MaterialTheme.typography.titleMedium)
+                        Text("Daemon: ${daemon.label}", style = MaterialTheme.typography.bodySmall)
+                        Text("Binary: ${bin ?: "n/a"}", style = MaterialTheme.typography.bodySmall)
+                        Text("Controller: " + (pad.name?.let { "$it (${pad.idText})" } ?: "missing"))
+                        Text("Foreground: ${fg ?: "none / launcher"}", style = MaterialTheme.typography.bodySmall)
+                        TextButton(onClick = { DpadService.send(ctx, DpadService.ACTION_RESTART_DAEMON) }) {
+                            Text("Restart daemon")
+                        }
+                        if (pad.warn) {
+                            Spacer(Modifier.height(4.dp))
+                            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFB00020))) {
+                                Text(
+                                    if (pad.missing) "No gamepad device found (on the Odin 2, set AYN Controller Style to Xbox for this app)"
+                                    else "Pad is \"None Controller\" — on the Odin 2, set AYN Controller Style for this app to Xbox.",
+                                    Modifier.padding(12.dp), color = Color.White,
+                                )
+                            }
+                        }
+                    }
+                }
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Test a profile", style = MaterialTheme.typography.titleMedium)
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             OutlinedButton(onClick = { menu = true }) { Text(testProfile.ifEmpty { "select profile" }) }
                             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
@@ -181,64 +296,6 @@ fun StatusScreen(modifier: Modifier = Modifier) {
                             "Starts the daemon with the selected profile for 30 seconds. All pad input is swallowed except the mapped keys.",
                             style = MaterialTheme.typography.bodySmall,
                         )
-                    }
-                }
-            }
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Keep alive", style = MaterialTheme.typography.titleMedium)
-                    Text(
-                        if (batteryExempt) "Exempt from battery optimization"
-                        else "Battery optimization is on — Android may stop the background service",
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                    if (!batteryExempt) {
-                        Button(onClick = {
-                            val intent = Intent(
-                                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                                Uri.parse("package:${ctx.packageName}"),
-                            )
-                            ctx.startActivity(intent)
-                        }) { Text("Allow running in background") }
-                    }
-                    TextButton(onClick = { DpadService.send(ctx, DpadService.ACTION_RESTART_DAEMON) }) {
-                        Text("Restart daemon")
-                    }
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Text("Q key allowed", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
-                        Switch(
-                            checked = data.allowQ,
-                            onCheckedChange = { v ->
-                                if (v) showAllowQDialog = true
-                                else DpadService.send(ctx, DpadService.ACTION_DISALLOW_Q)
-                            },
-                        )
-                    }
-                }
-            }
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Privilege", style = MaterialTheme.typography.titleMedium)
-                    Text("${priv.source.label}" + if (priv.probing) " (probing…)" else "")
-                    Text(priv.detail, style = MaterialTheme.typography.bodySmall)
-                    Button(onClick = { DpadService.send(ctx, DpadService.ACTION_RECHECK) }) { Text("Re-check") }
-                }
-            }
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Status", style = MaterialTheme.typography.titleMedium)
-                    Text("Binary: ${bin ?: "n/a"}", style = MaterialTheme.typography.bodySmall)
-                    Text("Pad device: " + (pad.name?.let { "$it (${pad.idText})" } ?: "missing"))
-                    Text("Foreground: ${fg ?: "none / launcher"}", style = MaterialTheme.typography.bodySmall)
-                    if (pad.warn) {
-                        Spacer(Modifier.height(4.dp))
-                        Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFB00020))) {
-                            Text(
-                                if (pad.missing) "No gamepad device found (on the Odin 2, set AYN Controller Style to Xbox for this app)"
-                                else "Pad is \"None Controller\" — on the Odin 2, set AYN Controller Style for this app to Xbox.",
-                                Modifier.padding(12.dp), color = Color.White,
-                            )
-                        }
                     }
                 }
             }
@@ -268,6 +325,50 @@ fun StatusScreen(modifier: Modifier = Modifier) {
             },
             dismissButton = { TextButton(onClick = { showAllowQDialog = false }) { Text("Cancel") } },
         )
+    }
+}
+
+/** Large status card at the top of the screen: one headline, one sentence, optional extra lines,
+ *  an optional link (e.g. "Assign apps") and an optional single action button. */
+@Composable
+private fun HeroCard(
+    icon: ImageVector,
+    tone: HeroTone,
+    title: String,
+    subtitle: String,
+    extraLines: List<String> = emptyList(),
+    linkLabel: String? = null,
+    onLink: (() -> Unit)? = null,
+    actionLabel: String? = null,
+    onAction: (() -> Unit)? = null,
+    modifier: Modifier = Modifier,
+) {
+    val accent = when (tone) {
+        HeroTone.INFO -> MaterialTheme.colorScheme.primary
+        HeroTone.GOOD -> Color(0xFF2E7D32)
+        HeroTone.ACTIVE -> MaterialTheme.colorScheme.primary
+        HeroTone.WARN -> Color(0xFFB00020)
+    }
+    Card(modifier.fillMaxWidth()) {
+        Row(Modifier.height(IntrinsicSize.Min)) {
+            Box(Modifier.fillMaxHeight().width(6.dp).background(accent))
+            Column(Modifier.padding(20.dp).weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(icon, contentDescription = null, tint = accent, modifier = Modifier.size(32.dp))
+                    Spacer(Modifier.width(12.dp))
+                    Text(title, style = MaterialTheme.typography.headlineMedium)
+                }
+                Text(subtitle, style = MaterialTheme.typography.bodyLarge)
+                extraLines.forEach { Text(it, style = MaterialTheme.typography.bodyMedium) }
+                if (linkLabel != null && onLink != null) {
+                    TextButton(onClick = onLink, contentPadding = PaddingValues(0.dp)) { Text(linkLabel) }
+                }
+                if (actionLabel != null && onAction != null) {
+                    Spacer(Modifier.height(4.dp))
+                    Button(onClick = onAction) { Text(actionLabel) }
+                }
+            }
+        }
     }
 }
 

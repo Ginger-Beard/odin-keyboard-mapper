@@ -39,6 +39,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import android.content.Context
 import android.content.Intent
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -79,6 +80,7 @@ import kotlin.math.roundToInt
 
 @Composable
 fun ProfilesScreen(modifier: Modifier = Modifier) {
+    val ctx = LocalContext.current
     val data by Store.data.collectAsStateWithLifecycle()
     var editing by remember { mutableStateOf<Pair<String?, Profile>?>(null) } // originalName, initial draft
     val e = editing
@@ -108,7 +110,18 @@ fun ProfilesScreen(modifier: Modifier = Modifier) {
                 ) {
                     Column(Modifier.weight(1f)) {
                         Text(p.name, style = MaterialTheme.typography.bodyLarge)
-                        Text(summary(p), style = MaterialTheme.typography.bodySmall, maxLines = 2)
+                        val assignedPkgs = data.assignments.filterValues { it == p.name }.keys
+                        if (assignedPkgs.isEmpty()) {
+                            Text(
+                                "Not assigned to any app", style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        } else {
+                            Text(
+                                "Assigned to: ${assignedPkgs.joinToString(", ") { appLabel(ctx, it) }}",
+                                style = MaterialTheme.typography.bodySmall, maxLines = 2,
+                            )
+                        }
                         Text("deadzone ${"%.2f".format(p.deadzone)} · used by $used app(s)", style = MaterialTheme.typography.bodySmall)
                     }
                     TextButton(modifier = Modifier.heightIn(min = 48.dp), onClick = { editing = p.name to p }) { Text("Edit") }
@@ -119,14 +132,12 @@ fun ProfilesScreen(modifier: Modifier = Modifier) {
     }
 }
 
-/** "F1←D-pad up, Up←Left stick up" for every key with at least one bound source. */
-private fun summary(p: Profile): String {
-    val parts = Keys.ALL.mapNotNull { k ->
-        val srcs = p.sourcesFor(k.keyName)
-        if (srcs.isEmpty()) null else "${k.label}←${srcs.joinToString(", ") { SourceNames.label(it) }}"
-    }
-    return if (parts.isEmpty()) "no keys mapped" else parts.joinToString(", ")
-}
+/** Best-effort app label for a package, falling back to the package name. */
+private fun appLabel(ctx: Context, pkg: String): String =
+    runCatching {
+        val pm = ctx.packageManager
+        pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
+    }.getOrDefault(pkg)
 
 private fun uniqueName(base: String, names: List<String>): String {
     if (base !in names) return base
@@ -141,6 +152,14 @@ private fun builtinDefault(name: String?): Profile? = when (name) {
     "WASD" -> Profile.WASD
     else -> null
 }
+
+/** A just-learned bind ([src], plain control or chord) that's already bound to [oldKey] in this
+ *  profile, pending the user's choice to move it to [newKey] or leave it alone. */
+private data class BindConflict(val src: String, val oldKey: String, val newKey: String)
+
+/** A just-learned panic [chord] where at least one of its buttons already has a key binding in
+ *  this profile; [message] lists which. */
+private data class PanicConflict(val chord: String, val message: String)
 
 /**
  * Editor for one profile. Every change persists to the Store immediately: this editor never has
@@ -175,10 +194,11 @@ fun ProfileEditor(
     var binding by remember { mutableStateOf<String?>(null) } // target key name being bound
     var settingPanic by remember { mutableStateOf(false) } // panic-chord LearnDialog open
     var showUnassigned by remember { mutableStateOf(false) }
-    var showSwallowed by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
     var showWheelWarning by remember { mutableStateOf(false) }
     var showAllowQDialog by remember { mutableStateOf(false) }
+    var bindConflict by remember { mutableStateOf<BindConflict?>(null) } // pending rebind awaiting "Move"/"Cancel"
+    var panicConflict by remember { mutableStateOf<PanicConflict?>(null) } // pending panic chord awaiting "Use anyway"/"Cancel"
     var showSaved by remember { mutableStateOf(false) }
     var savedFlashJob by remember { mutableStateOf<Job?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
@@ -578,23 +598,6 @@ fun ProfileEditor(
                 }
             }
 
-            // ---- Swallowed controls footer ----
-            val swallowed = Sources.ALL.filter { draft.key(it.id) == Keys.NONE }
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    TextButton(modifier = Modifier.heightIn(min = 48.dp), onClick = { showSwallowed = !showSwallowed }) {
-                        Text(if (showSwallowed) "Hide swallowed controls (${swallowed.size})" else "Swallowed controls (${swallowed.size})…")
-                    }
-                    if (showSwallowed) {
-                        Text("These do nothing while this profile is active.", style = MaterialTheme.typography.bodySmall)
-                        Text(
-                            if (swallowed.isEmpty()) "None" else swallowed.joinToString(", ") { it.label },
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                    }
-                }
-            }
-
             Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(modifier = Modifier.heightIn(min = 48.dp), onClick = onDone) { Text("Done") }
@@ -610,11 +613,11 @@ fun ProfileEditor(
             title = Keys.label(keyName),
             onLearned = { src ->
                 val oldKey = draft.map[src]
-                changeNow { d -> d.bind(src, keyName) }
                 binding = null
                 if (oldKey != null && oldKey != keyName) {
-                    val msg = "Moved from ${Keys.label(oldKey)}"
-                    scope.launch { snackbarHostState.showSnackbar(msg) }
+                    bindConflict = BindConflict(src, oldKey, keyName)
+                } else {
+                    changeNow { d -> d.bind(src, keyName) }
                 }
             },
             onDismiss = { binding = null },
@@ -629,7 +632,13 @@ fun ProfileEditor(
             onLearned = { src ->
                 settingPanic = false
                 if (Sources.isValidPanicChord(src)) {
-                    changeNow { d -> d.copy(panicChord = src) }
+                    val conflicts = src.split('+').mapNotNull { part -> draft.map[part]?.let { part to it } }
+                    if (conflicts.isEmpty()) {
+                        changeNow { d -> d.copy(panicChord = src) }
+                    } else {
+                        val desc = conflicts.joinToString("; ") { (part, key) -> "${SourceNames.label(part)} is bound to ${Keys.label(key)}" }
+                        panicConflict = PanicConflict(src, "$desc; pressing it as part of the panic chord will still send that key. Use it anyway?")
+                    }
                 } else {
                     scope.launch { snackbarHostState.showSnackbar("Use buttons only") }
                 }
@@ -651,6 +660,36 @@ fun ProfileEditor(
                 }) { Text("Delete") }
             },
             dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Cancel") } },
+        )
+    }
+
+    bindConflict?.let { c ->
+        AlertDialog(
+            onDismissRequest = { bindConflict = null },
+            title = { Text("Already bound") },
+            text = { Text("${SourceNames.label(c.src)} is already bound to ${Keys.label(c.oldKey)}. Move it to ${Keys.label(c.newKey)}?") },
+            confirmButton = {
+                TextButton(onClick = {
+                    changeNow { d -> d.bind(c.src, c.newKey) }
+                    bindConflict = null
+                }) { Text("Move") }
+            },
+            dismissButton = { TextButton(onClick = { bindConflict = null }) { Text("Cancel") } },
+        )
+    }
+
+    panicConflict?.let { c ->
+        AlertDialog(
+            onDismissRequest = { panicConflict = null },
+            title = { Text("Panic chord warning") },
+            text = { Text(c.message) },
+            confirmButton = {
+                TextButton(onClick = {
+                    changeNow { d -> d.copy(panicChord = c.chord) }
+                    panicConflict = null
+                }) { Text("Use anyway") }
+            },
+            dismissButton = { TextButton(onClick = { panicConflict = null }) { Text("Cancel") } },
         )
     }
 
