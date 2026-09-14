@@ -22,8 +22,10 @@ import com.dpad.mgr.priv.PrivSource
 import com.dpad.mgr.ui.MainActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -31,6 +33,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import rikka.shizuku.Shizuku
+import rikka.shizuku.ShizukuProvider
 
 class DpadService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -43,6 +46,10 @@ class DpadService : Service() {
      *  avoid restarting the tail (and leaking a logcat process) on every re-check when the
      *  same privilege is still held. */
     private var watcherStartedFor: com.dpad.mgr.priv.PrivShell? = null
+
+    /** Job for [binderAcquisitionLoop], running whenever privilege is NONE and Shizuku is
+     *  installed; null when not needed (privilege held, or Shizuku not installed). */
+    private var binderAcquisitionJob: Job? = null
 
     /** Fires whenever the Shizuku binder (re)appears, including after the service was started
      *  before Shizuku itself was up. Re-runs the probe so privilege is picked up without the
@@ -70,7 +77,12 @@ class DpadService : Service() {
         )
         ServiceState.serviceRunning.value = true
 
-        scope.launch { probe.state.collect { ServiceState.priv.value = it } }
+        scope.launch {
+            probe.state.collect { st ->
+                ServiceState.priv.value = st
+                manageBinderAcquisitionLoop(st.source)
+            }
+        }
         scope.launch {
             supervisor.state.collect { s ->
                 ServiceState.daemon.value = s
@@ -206,6 +218,59 @@ class DpadService : Service() {
         supervisor.reset()
     }
 
+    /** Starts or stops [binderAcquisitionLoop] to match the current privilege source: running
+     *  only while privilege is NONE and Shizuku is installed. Called on every probe result, so
+     *  it both starts the loop (service start, or privilege dropping back to NONE e.g. Shizuku
+     *  restarting) and stops it (privilege acquired via either source). */
+    private fun manageBinderAcquisitionLoop(source: PrivSource) {
+        if (source != PrivSource.NONE) {
+            if (binderAcquisitionJob != null) Log.i(TAG, "shizuku: binder acquisition loop stopping (privilege=${source.name})")
+            binderAcquisitionJob?.cancel()
+            binderAcquisitionJob = null
+            return
+        }
+        if (binderAcquisitionJob?.isActive == true) return
+        if (!isShizukuInstalled()) return
+        Log.i(TAG, "shizuku: binder acquisition loop starting")
+        binderAcquisitionJob = scope.launch { binderAcquisitionLoop() }
+    }
+
+    /** Shizuku pushes its binder to apps when its server starts and when an app's activity
+     *  starts; a background-only service that came up before the Shizuku server (e.g. at boot)
+     *  is left out until the user happens to open our activity. This polls pingBinder() and, if
+     *  it's not up yet, proactively asks the Shizuku manager to deliver the binder to us. Polls
+     *  every 3s for the first 2 minutes (covers the common "server starting shortly after us at
+     *  boot" case quickly), then every 15s thereafter. Stops as soon as pingBinder() succeeds,
+     *  handing off to [recheck] to actually pick up the privilege (and to
+     *  [manageBinderAcquisitionLoop], driven by the resulting probe state, to decide whether to
+     *  restart the loop). */
+    private suspend fun binderAcquisitionLoop() {
+        val startMs = System.currentTimeMillis()
+        var attempt = 0
+        var lastRequestLogMs = 0L
+        while (true) {
+            val pinged = runCatching { Shizuku.pingBinder() }.getOrDefault(false)
+            if (pinged) {
+                Log.i(TAG, "shizuku: binder acquisition loop: ping ok, re-probing")
+                recheck("binder acquisition: ping ok")
+                return
+            }
+            attempt++
+            runCatching { ShizukuProvider.requestBinderForNonProviderProcess(applicationContext) }
+                .onFailure { Log.w(TAG, "shizuku: requestBinderForNonProviderProcess failed $it") }
+            val now = System.currentTimeMillis()
+            if (now - lastRequestLogMs >= 30_000) {
+                Log.i(TAG, "shizuku: requested binder (attempt $attempt)")
+                lastRequestLogMs = now
+            }
+            val elapsed = now - startMs
+            delay(if (elapsed < 120_000L) 3_000L else 15_000L)
+        }
+    }
+
+    private fun isShizukuInstalled(): Boolean =
+        runCatching { packageManager.getPackageInfo(SHIZUKU_PKG, 0) }.isSuccess
+
     /** Swiping the app from recents (task removed) must not stop the daemon: restart the
      *  service immediately so the mapping keeps running. Belt-and-suspenders alongside
      *  android:stopWithTask="false" on the service and excludeFromRecents on MainActivity. */
@@ -282,6 +347,7 @@ class DpadService : Service() {
 
     companion object {
         private const val TAG = "DpadMgr"
+        private const val SHIZUKU_PKG = "moe.shizuku.privileged.api"
         const val CH_STATUS = "status"
         const val CH_ALERT = "alert"
         const val NOTIF_ID = 1
