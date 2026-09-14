@@ -50,14 +50,23 @@ object Sources {
 
     /** Sources.ALL order first, then unknown (raw) names alphabetically. */
     val comparator: Comparator<String> = compareBy<String>({ ORDER[it] ?: Int.MAX_VALUE }, { it })
+
+    private val BUTTON_LIKE = Regex("^(btn\\.[a-zA-Z0-9_]+|key\\.0x[0-9a-fA-F]{1,3}|hat\\.(up|down|left|right)|lt|rt)$")
+
+    /** True if [src] is a button-like source: btn.*, key.0x…, hat.*, lt, rt — never a stick
+     *  direction (ls./rs.) or any other analog/raw axis. The only sources allowed in a panic chord. */
+    fun isButtonLike(src: String): Boolean = BUTTON_LIKE.matches(src)
+
+    /** True if [chord] is a valid panic chord: `a` or `a+b`, every part button-like. */
+    fun isValidPanicChord(chord: String): Boolean {
+        val parts = chord.split('+')
+        return parts.size in 1..2 && parts.all { isButtonLike(it) }
+    }
 }
 
 /** Source-name validation and labelling for both semantic (`hat.up`) and raw (`key.0x130`, `abs.0x12.pos`) names. */
 object SourceNames {
     val RAW = Regex("^(key\\.0x[0-9a-fA-F]{1,3}|abs\\.0x[0-9a-fA-F]{1,2}\\.(neg|pos))$")
-
-    /** Button-like sources that may act as a chord's hold control: btn.*, key.0x…, hat.*, lt, rt. */
-    private val HOLD = Regex("^(btn\\.[a-zA-Z0-9_]+|key\\.0x[0-9a-fA-F]{1,3}|hat\\.(up|down|left|right)|lt|rt)$")
 
     /** True if [id] is a chord (`<hold>+<src>`). */
     fun isChord(id: String): Boolean = id.indexOf('+') >= 0
@@ -69,7 +78,7 @@ object SourceNames {
         if (plus < 0) return isPlainValid(id)
         val hold = id.substring(0, plus)
         val rest = id.substring(plus + 1)
-        return HOLD.matches(hold) && !isChord(rest) && isPlainValid(rest)
+        return Sources.isButtonLike(hold) && !isChord(rest) && isPlainValid(rest)
     }
 
     private fun plainLabel(id: String): String = Sources.ALL.firstOrNull { it.id == id }?.label ?: id
@@ -82,6 +91,10 @@ object SourceNames {
         val rest = id.substring(plus + 1)
         return "Hold ${plainLabel(hold)} + ${plainLabel(rest)}"
     }
+
+    /** Panic-chord label: "A + B" (or just "A" for a single control) — plain per-source labels,
+     *  no "Hold" prefix (unlike [label], which is for key-binding chords). */
+    fun chordLabel(chord: String): String = chord.split('+').joinToString(" + ") { plainLabel(it) }
 }
 
 /** A key the user can pick: UI label <-> daemon KEY_ name. */
@@ -140,6 +153,10 @@ data class Profile(
     val modifier: String? = null,
     val modBindings: Map<String, String> = emptyMap(),
     val wheelRepeatMs: Int = 120,
+    /** Panic chord: `<src>` or `<src>+<src>`, both button-like (Sources.isButtonLike). Holding it
+     *  1s pauses mapping, 4s restarts the daemon. Null means no chord is configured. Required
+     *  before [touchOffsetEnabled] can be turned on -- see ProfilesScreen/CalibrateActivity. */
+    val panicChord: String? = null,
     /** Stylus/touch offset, calibrated via CalibrateActivity. Panel units (natural/portrait orientation). */
     val touchOffsetEnabled: Boolean = false,
     val touchDx: Int = 0,
@@ -179,7 +196,11 @@ data class Profile(
         append("rs.invert_y ").append(if (rsInvertY) 1 else 0).append('\n')
         append("rs.invert_x ").append(if (rsInvertX) 1 else 0).append('\n')
         append("wheel_repeat_ms ").append(wheelRepeatMs.coerceIn(60, 400)).append('\n')
-        if (touchOffsetEnabled) {
+        if (panicChord != null) {
+            append("panic ").append(panicChord).append('\n')
+        }
+        // Safety: the touch pass-through is never emitted without a panic chord to escape it.
+        if (touchOffsetEnabled && panicChord != null) {
             append("touch.offset ").append(touchDx).append(' ').append(touchDy).append('\n')
         }
     }

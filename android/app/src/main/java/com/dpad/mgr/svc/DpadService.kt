@@ -16,6 +16,7 @@ import com.dpad.mgr.core.BinaryInstaller
 import com.dpad.mgr.core.DaemonState
 import com.dpad.mgr.core.ForegroundWatcher
 import com.dpad.mgr.core.PadInspector
+import com.dpad.mgr.core.SourceNames
 import com.dpad.mgr.core.Store
 import com.dpad.mgr.core.Supervisor
 import com.dpad.mgr.priv.PrivProbe
@@ -342,7 +343,9 @@ class DpadService : Service() {
 
     private fun notifyPanic(profile: String) {
         val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
-        val text = "Touch offset disabled by panic chord (hold both back buttons). Re-enable in the app."
+        val chord = Store.data.value.profile(profile)?.panicChord
+        val chordPart = chord?.let { "hold ${SourceNames.chordLabel(it)}" } ?: "the panic chord"
+        val text = "Touch offset disabled by panic chord ($chordPart). Re-enable in the app."
         val n = Notification.Builder(this, CH_ALERT)
             .setSmallIcon(android.R.drawable.stat_notify_error)
             .setContentTitle("Touch offset disabled by panic chord")

@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -96,9 +97,26 @@ class CalibrateActivity : ComponentActivity() {
         controller.hide(WindowInsetsCompat.Type.systemBars())
         controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
 
-        if (Store.data.value.profile(profileName) == null) {
+        val profile = Store.data.value.profile(profileName)
+        if (profile == null) {
             Log.w(TAG, "calibrate: profile '$profileName' not found, aborting")
             finish()
+            return
+        }
+
+        if (profile.panicChord == null) {
+            Log.w(TAG, "calibrate: profile '$profileName' has no panic chord, aborting")
+            setContent {
+                MaterialTheme(colorScheme = darkColorScheme()) {
+                    Surface {
+                        AlertDialog(
+                            onDismissRequest = { finish() },
+                            title = { Text("Set a panic chord in the profile first") },
+                            confirmButton = { TextButton(onClick = { finish() }) { Text("OK") } },
+                        )
+                    }
+                }
+            }
             return
         }
 

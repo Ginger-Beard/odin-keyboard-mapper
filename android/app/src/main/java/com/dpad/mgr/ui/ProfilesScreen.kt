@@ -53,8 +53,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.focusTarget
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -170,6 +172,7 @@ fun ProfileEditor(
     val scope = rememberCoroutineScope()
     var persistedName by remember { mutableStateOf(original) } // name draft is currently saved under in the Store, if any
     var binding by remember { mutableStateOf<String?>(null) } // target key name being bound
+    var settingPanic by remember { mutableStateOf(false) } // panic-chord LearnDialog open
     var showLetters by remember { mutableStateOf(false) }
     var showSwallowed by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
@@ -472,6 +475,38 @@ fun ProfileEditor(
                 }
             }
 
+            // ---- Panic chord card ----
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Panic chord", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "Hold this to stop mapping from inside a game: 1 second pauses, 4 seconds restarts the daemon. Required before enabling the stylus offset.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        val chord = draft.panicChord
+                        if (chord != null) {
+                            InputChip(
+                                selected = false,
+                                onClick = {
+                                    changeNow { d -> d.copy(panicChord = null) }
+                                    if (draft.touchOffsetEnabled) {
+                                        changeNow(live = true) { d -> d.copy(touchOffsetEnabled = false) }
+                                        scope.launch { snackbarHostState.showSnackbar("Stylus offset turned off: no panic chord") }
+                                    }
+                                },
+                                label = { Text(SourceNames.chordLabel(chord)) },
+                                trailingIcon = { Icon(Icons.Default.Close, contentDescription = "Clear panic chord", Modifier.size(InputChipDefaults.IconSize)) },
+                            )
+                        } else {
+                            Text("Not set", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+                        }
+                        Spacer(Modifier.weight(1f))
+                        OutlinedButton(modifier = Modifier.heightIn(min = 48.dp), onClick = { settingPanic = true }) { Text("Set by pressing…") }
+                    }
+                }
+            }
+
             // ---- Stylus offset card ----
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -480,11 +515,17 @@ fun ProfileEditor(
                         Text("Enabled", Modifier.weight(1f))
                         Switch(
                             checked = draft.touchOffsetEnabled,
+                            enabled = draft.panicChord != null,
                             onCheckedChange = { v -> changeNow(live = true) { d -> d.copy(touchOffsetEnabled = v) } },
                         )
                     }
+                    if (draft.panicChord == null) {
+                        Text("Set a panic chord first", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                    }
                     Text(
-                        "Only active while the assigned game is in front. To turn it off from inside the game, hold both back buttons for 1 second. Turning Enabled off keeps these values, ready to restore.",
+                        "Only active while the assigned game is in front. To turn it off from inside the game, hold " +
+                            (draft.panicChord?.let { SourceNames.chordLabel(it) } ?: "the panic chord") +
+                            " for 1 second. Turning Enabled off keeps these values, ready to restore.",
                         style = MaterialTheme.typography.bodySmall,
                     )
                     Text("Offset, as seen in landscape", style = MaterialTheme.typography.bodySmall)
@@ -516,6 +557,7 @@ fun ProfileEditor(
                     )
                     OutlinedButton(
                         modifier = Modifier.heightIn(min = 48.dp),
+                        enabled = draft.panicChord != null,
                         onClick = {
                             // Flush any pending debounced edit first so calibration (a separate
                             // activity) has a fully up-to-date saved profile to read and write
@@ -570,6 +612,21 @@ fun ProfileEditor(
         )
     }
 
+    if (settingPanic) {
+        LearnDialog(
+            title = "panic chord",
+            onLearned = { src ->
+                settingPanic = false
+                if (Sources.isValidPanicChord(src)) {
+                    changeNow { d -> d.copy(panicChord = src) }
+                } else {
+                    scope.launch { snackbarHostState.showSnackbar("Use buttons only") }
+                }
+            },
+            onDismiss = { settingPanic = false },
+        )
+    }
+
     if (confirmDelete) {
         AlertDialog(
             onDismissRequest = { confirmDelete = false },
@@ -598,6 +655,7 @@ private fun WheelWarningLabel(onClick: () -> Unit) {
         "Warning: OSRS ban risk",
         color = MaterialTheme.colorScheme.error,
         style = MaterialTheme.typography.bodySmall,
+        fontWeight = FontWeight.Bold,
         modifier = Modifier.clickable(onClick = onClick),
     )
 }
@@ -605,22 +663,23 @@ private fun WheelWarningLabel(onClick: () -> Unit) {
 /** Explains why wheel (scroll) bindings carry OSRS ban risk: fixed pointer position on every scroll event. */
 @Composable
 private fun WheelWarningDialog(onDismiss: () -> Unit) {
+    val screenHeight = LocalConfiguration.current.screenHeightDp.dp
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Mouse wheel and OSRS") },
         text = {
-            Text(
-                "Wheel bindings are delivered to the game as mouse scroll events. Android attaches the " +
-                    "mouse pointer's screen position to every scroll event, and this app never moves the " +
-                    "pointer, so the game receives every zoom notch at the same coordinates, session after " +
-                    "session. Jagex bans accounts for automation, and their detection looks for input that " +
-                    "is too regular to be human. A stream of scroll events at one fixed position is not a " +
-                    "click and is not the behaviour that usually triggers bans, but it is not what a real " +
-                    "mouse produces either, and the mobile client's exact checks are not public. Keyboard " +
-                    "bindings carry no position and do not have this problem. If you play Old School " +
-                    "RuneScape, we recommend not binding wheel targets in that profile and using pinch zoom " +
-                    "instead. Use wheel bindings at your own risk."
-            )
+            Column(Modifier.heightIn(max = screenHeight * 0.6f).verticalScroll(rememberScrollState())) {
+                Text(
+                    "Wheel bindings reach the game as mouse scroll events. Android attaches the mouse " +
+                        "pointer's position to each one, and this app never moves the pointer, so every " +
+                        "zoom notch arrives at the same coordinates, every session. Jagex bans for " +
+                        "automation by looking for input that is too regular to be human. Scroll events " +
+                        "are not clicks and are not the usual trigger, but a fixed position is not what a " +
+                        "real mouse produces, and the mobile client's checks are not public. Keyboard " +
+                        "bindings carry no position and are safe. For Old School RuneScape we recommend " +
+                        "no wheel bindings; use pinch zoom instead. Use at your own risk."
+                )
+            }
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("OK") } },
     )

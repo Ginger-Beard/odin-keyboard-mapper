@@ -170,6 +170,9 @@ static bool target_is_wheel(int t) { return wheel_idx_from_target(t) >= 0; }
  * <src>; resolve_target() picks among the ones whose hold is currently held,
  * most-recently-pressed hold wins (see update_source()/resolve_target()). */
 #define MAX_CHORDS 64
+/* Sources that must be held together for the panic chord. Four is already
+ * more than anyone can hold on a handheld without also holding the device. */
+#define MAX_PANIC_SRC 4
 typedef struct {
     int hold;   /* source slot that must be held */
     int src;    /* source slot the chord applies to */
@@ -194,6 +197,16 @@ typedef struct {
     int n_raw;             /* raw sources in use (slots SRC_COUNT..SRC_COUNT+n_raw-1) */
     raw_source_t raw[MAX_RAW];
     char device_match[128]; /* substring of the pad name, or "vvvv:pppp" hex; empty = any */
+
+    /* Panic chord (`panic <src>[+<src>...]`): the hardware escape hatch. Every
+     * listed source held together for PANIC_CHORD_MS parks the daemon (serve:
+     * idle + panic counter; one-shot: exit 6); in serve mode holding on to
+     * PANIC_RESTART_MS exits 6 so the supervisor respawns with freshly created
+     * virtual devices -- the guaranteed cure for a clone that has somehow been
+     * left in a bad state. Per profile, no default: n_panic == 0 means the
+     * profile has no chord at all. */
+    int panic_src[MAX_PANIC_SRC];
+    int n_panic;
 
     /* `idle 1`: an explicit "this profile deliberately does nothing" marker so
      * --serve can be parked on a config file that still exists. Equivalent to
@@ -247,6 +260,13 @@ static const char *g_status_path = NULL;   /* --status-file, or NULL */
 static bool g_want_pad = false;            /* active profile has bindings */
 static bool g_want_touch = false;          /* active profile has touch.offset */
 static long g_panic_count = 0;             /* panic-chord firings since start */
+/* `contacts` is the one status field that changes without a transition, so the
+ * loop refreshes the file when it drifts -- rate-limited, since a status write
+ * is an fsync + rename and a stuck contact is a lasting condition, not a
+ * per-frame one. */
+#define STATUS_CONTACTS_MS 400
+static int g_status_contacts = -1;         /* contacts= as last written */
+static long long g_status_written_ms = -1; /* when the file was last written */
 static long long g_retry_due_ms = -1;      /* next acquisition retry, -1 = none */
 #define SERVE_RETRY_MS 500
 
@@ -275,15 +295,51 @@ static bool g_touch_quiet = false;
  * so the loop picks this up and drops to keys-only instead. */
 static bool g_touch_uinput_dead = false;
 
-/* Panic chord: while a touch offset is active and the panel is grabbed,
- * holding both back buttons (raw BTN_C/BTN_Z on the pad) for
- * PANIC_CHORD_MS disables the touch offset by tearing down touch
- * pass-through and exiting(6) so the supervisor can restart without it. */
-typedef enum { PANIC_CHORD_NONE, PANIC_CHORD_M1M2 } panic_chord_t;
+/* ---- clone contact bookkeeping ----
+ *
+ * The virtual touchscreen is a persistent device: it outlives every profile
+ * switch, panel re-detect and idle transition.  Anything left DOWN on it stays
+ * down as far as Android is concerned -- which is exactly how a single finger
+ * came to read as a *second* pointer ("touch is off by half the screen"), with
+ * nothing short of a daemon restart clearing it.  So the daemon mirrors what
+ * it has actually written to the clone -- the tracking id live in each slot,
+ * the BTN_TOUCH state, the implicit current slot -- and releases it on every
+ * path where forwarding stops. */
+#define TOUCH_MAX_SLOTS 64
+/* No-panel-events watchdog.  A finger resting perfectly still can go a long
+ * time with zero reports on a panel that filters stationary contacts, so this
+ * is deliberately far longer than any plausible long-press: it is a backstop
+ * for a release path we missed, not a touch timeout. */
+#define TOUCH_STUCK_MS 30000
+static int g_clone_tid[TOUCH_MAX_SLOTS];      /* tracking id live per slot ON THE CLONE, -1 = up */
+static bool g_clone_btn_touch = false;        /* last BTN_TOUCH value written to the clone */
+static int g_clone_cur_slot = -1;             /* clone's implicit ABS_MT_SLOT, -1 = unknown */
+static int g_touch_slot_min = 0;              /* panel's ABS_MT_SLOT minimum */
+static int g_touch_nslots = 0;                /* slots tracked, 0 until a panel has been seen */
+static int g_clone_next_tid = 0x40000000;     /* private id space: carry-over + clash remaps */
+static long long g_touch_last_event_ms = -1;  /* last panel event forwarded, -1 = none */
+
+/* Panic chord: the hardware escape hatch, configured per profile by the
+ * `panic <src>[+<src>...]` config line (see config_t::panic_src). Every listed
+ * source held together for PANIC_CHORD_MS parks the daemon -- serve mode goes
+ * idle and bumps the panic counter, one-shot mode exits 6 so the supervisor
+ * restarts without the touch offset. In serve mode holding on to
+ * PANIC_RESTART_MS exits 6 instead, destroying BOTH virtual devices on the way
+ * out so the watchdog respawns the daemon with fresh ones: the last-resort
+ * cure for a clone Android has gotten confused about. No `panic` line means no
+ * chord at all. */
 #define PANIC_CHORD_MS 1000
-static panic_chord_t g_panic_chord = PANIC_CHORD_M1M2;
-static bool g_chord_m1_held = false, g_chord_m2_held = false;
-static long long g_chord_start_ms = -1; /* -1 = not both held */
+#define PANIC_RESTART_MS 4000
+static bool g_panic_held[MAX_PANIC_SRC] = {0}; /* per cfg->panic_src position */
+static long long g_chord_start_ms = -1; /* -1 = not all held / not armed */
+static bool g_panic_idle_fired = false; /* the PANIC_CHORD_MS step already fired this hold */
+/* Serve mode's escalation window. Parking at PANIC_CHORD_MS lets go of the
+ * pad, which would also destroy the daemon's only view of whether the chord is
+ * still held -- so the pad fd is kept open but UNGRABBED (the pad behaves
+ * normally for every other app, we merely watch it) until PANIC_RESTART_MS.
+ * -1 = not parked. */
+static long long g_panic_watch_until_ms = -1;
+static const char *g_pidfile = NULL;     /* so the restart path can unlink it */
 
 /* Both handlers poke the self-pipe; write() is async-signal-safe and the
  * write end is non-blocking, so a full pipe (many signals, loop not yet
@@ -328,6 +384,8 @@ static void init_config(config_t *cfg) {
     cfg->touch_dx = 0;
     cfg->touch_dy = 0;
     cfg->touch_device[0] = '\0';
+    cfg->n_panic = 0;
+    for (int i = 0; i < MAX_PANIC_SRC; i++) cfg->panic_src[i] = -1;
 }
 
 static int n_sources(const config_t *cfg) { return SRC_COUNT + cfg->n_raw; }
@@ -457,6 +515,9 @@ static bool source_can_be_hold(int slot) {
  * offending line is abandoned rather than half-applied. */
 static bool g_cfg_lenient = false;
 static bool g_cfg_line_bad = false;
+/* --panic-chord: an override applied on top of every profile the daemon loads,
+ * for standalone/debug use. NULL = no override (the profile decides). */
+static const char *g_panic_cli_spec = NULL;
 
 static void cfg_problem(const char *path, int lineno, const char *fmt, ...) {
     va_list ap;
@@ -504,6 +565,75 @@ static int resolve_target_tok(const char *tok, const char *path, int lineno) {
 }
 
 /* Appends a chord; reports (and in strict mode exits on) a full table. */
+/* Parses a panic-chord spec -- "none"/"off", or one to MAX_PANIC_SRC
+ * button-like sources joined by '+' ("btn.m1+btn.m2", "btn.tl+btn.tr",
+ * "key.0x13d") -- into cfg->panic_src/n_panic. Stick directions are rejected
+ * for the same reason they cannot be chord holds: they are derived, not held.
+ * `spec` is copied before being tokenised, so string literals and the CLI's
+ * argv are both safe to pass. Returns false (cfg->n_panic left at 0) on any
+ * problem, having reported it through cfg_problem(). */
+static bool parse_panic_spec(config_t *cfg, const char *spec, const char *path, int lineno) {
+    cfg->n_panic = 0;
+    for (int i = 0; i < MAX_PANIC_SRC; i++) cfg->panic_src[i] = -1;
+    if (strcmp(spec, "none") == 0 || strcmp(spec, "off") == 0) return true;
+
+    char buf[160];
+    if (snprintf(buf, sizeof(buf), "%s", spec) >= (int)sizeof(buf)) {
+        cfg_problem(path, lineno, "panic chord spec too long");
+        return false;
+    }
+    int n = 0;
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, "+", &save); tok; tok = strtok_r(NULL, "+", &save)) {
+        if (n >= MAX_PANIC_SRC) {
+            cfg_problem(path, lineno, "panic chord takes at most %d sources", MAX_PANIC_SRC);
+            cfg->n_panic = 0;
+            return false;
+        }
+        int src = resolve_source(cfg, tok, path, lineno);
+        if (src < 0) { cfg->n_panic = 0; return false; }
+        if (!source_can_be_hold(src)) {
+            cfg_problem(path, lineno, "'%s' cannot be part of a panic chord "
+                                      "(stick directions can't be held)", tok);
+            cfg->n_panic = 0;
+            return false;
+        }
+        for (int i = 0; i < n; i++) {
+            if (cfg->panic_src[i] == src) {
+                cfg_problem(path, lineno, "panic chord lists '%s' twice", tok);
+                cfg->n_panic = 0;
+                return false;
+            }
+        }
+        cfg->panic_src[n++] = src;
+    }
+    if (n == 0) {
+        cfg_problem(path, lineno, "panic needs at least one source (or 'none')");
+        return false;
+    }
+    cfg->n_panic = n;
+    return true;
+}
+
+/* Renders cfg's panic chord back into its config spelling ("btn.m1+btn.m2",
+ * or "none"), for --print-config and the banners. */
+static void panic_spec_str(const config_t *cfg, char *out, size_t outsz) {
+    if (cfg->n_panic <= 0) { snprintf(out, outsz, "none"); return; }
+    out[0] = '\0';
+    for (int i = 0; i < cfg->n_panic; i++) {
+        size_t len = strlen(out);
+        snprintf(out + len, outsz > len ? outsz - len : 0, "%s%s",
+                 i ? "+" : "", source_name(cfg, cfg->panic_src[i]));
+    }
+}
+
+/* --panic-chord overrides whatever the profile asked for, on every profile the
+ * daemon loads. Validated once in main(), so it cannot fail here. */
+static void apply_panic_cli_override(config_t *cfg) {
+    if (!g_panic_cli_spec) return;
+    parse_panic_spec(cfg, g_panic_cli_spec, "--panic-chord", 0);
+}
+
 static void add_chord(config_t *cfg, int hold, int src, int target, const char *path, int lineno) {
     if (cfg->n_chords >= MAX_CHORDS) {
         cfg_problem(path, lineno, "too many chords (max %d)", MAX_CHORDS);
@@ -598,6 +728,10 @@ static bool load_config_file(const char *path, config_t *cfg, bool lenient) {
             cfg->touch_dx = atoi(tok2);
             cfg->touch_dy = atoi(tok3);
             cfg->touch_offset_set = true;
+            continue;
+        }
+        if (strcmp(tok1, "panic") == 0) {
+            parse_panic_spec(cfg, tok2, path, lineno);
             continue;
         }
         if (strcmp(tok1, "touch.device") == 0) {
@@ -729,6 +863,11 @@ static void print_config(const config_t *cfg, FILE *out) {
         fprintf(out, "%-12s %s\n", name, key_name(cfg->chords[i].target));
     }
     fprintf(out, "%-12s %d\n", "wheel_repeat_ms", cfg->wheel_repeat_ms);
+    {
+        char pb[160];
+        panic_spec_str(cfg, pb, sizeof(pb));
+        fprintf(out, "%-12s %s\n", "panic", pb);
+    }
     if (cfg->touch_offset_set)
         fprintf(out, "%-12s %d %d\n", "touch.offset", cfg->touch_dx, cfg->touch_dy);
     else
@@ -1486,6 +1625,26 @@ static void query_touch_axes(int fd) {
     if (ioctl(fd, EVIOCGABS(ABS_MT_POSITION_Y), &info) == 0) { g_touch_mty_info = info; g_touch_has_mty = true; }
     if (ioctl(fd, EVIOCGABS(ABS_X), &info) == 0) { g_touch_x_info = info; g_touch_has_x = true; }
     if (ioctl(fd, EVIOCGABS(ABS_Y), &info) == 0) { g_touch_y_info = info; g_touch_has_y = true; }
+    /* Slot geometry drives every per-slot array below. A panel that reports no
+     * ABS_MT_SLOT is single-slot MT-A; treat it as one slot so BTN_TOUCH and
+     * slot 0 are still tracked. */
+    if (ioctl(fd, EVIOCGABS(ABS_MT_SLOT), &info) == 0 && info.maximum >= info.minimum) {
+        g_touch_slot_min = info.minimum;
+        int n = info.maximum - info.minimum + 1;
+        g_touch_nslots = n > TOUCH_MAX_SLOTS ? TOUCH_MAX_SLOTS : n;
+    } else {
+        g_touch_slot_min = 0;
+        g_touch_nslots = 1;
+    }
+}
+
+/* True if an EVIOCGMTSLOTS position is inside the panel's own reported range.
+ * A slot can hold a stale id with a nonsense position across a re-open, and
+ * carrying that over is how a pointer ends up nailed to a screen edge. */
+static bool touch_pos_in_range(int x, int y) {
+    if (g_touch_has_mtx && (x < g_touch_mtx_info.minimum || x > g_touch_mtx_info.maximum)) return false;
+    if (g_touch_has_mty && (y < g_touch_mty_info.minimum || y > g_touch_mty_info.maximum)) return false;
+    return true;
 }
 
 /* Applies the configured offset to one event in place, clamped to that axis'
@@ -1606,7 +1765,16 @@ static int open_touch_uinput(int real_fd, const struct input_id *id, const char 
  * touchscreen alone. This is the whole of "turn touch off" in serve mode:
  * touch stops being intercepted, but the clone stays registered with the
  * kernel so no device appears or disappears. Safe against -1/false state. */
+static int touch_release_stuck_contacts(const char *why);
+static void touch_forget_contacts(void);
+static int touch_contacts_live(void);
+
 static void touch_release_panel(void) {
+    /* Order matters: the clone must be told the contacts ended BEFORE we stop
+     * being able to say so. This one call covers idle transitions, profile
+     * switches that drop touch.offset, panel re-detects, the panic chord and
+     * shutdown -- every path that used to leave a finger down forever. */
+    touch_release_stuck_contacts("panel released");
     if (g_touch_grabbed) { ioctl(g_touch_fd, EVIOCGRAB, 0); g_touch_grabbed = false; }
     if (g_touch_fd >= 0) { close(g_touch_fd); g_touch_fd = -1; }
 }
@@ -1637,54 +1805,167 @@ static void touch_fatal_exit(int code) {
  * mid-file function has to reach forward into it. */
 static void serve_go_idle(config_t *cfg);
 static void write_status(const config_t *cfg);
+static void release_all_virtual(config_t *cfg);
 
 /* One-shot mode: log the panic trigger and reuse touch_fatal_exit's cleanup
  * (release the panel grab, destroy the virtual touchscreen, ungrab the pad,
  * destroy the keyboard device) to exit(6) so the supervisor can persist
  * "touch offset disabled" and restart without it.
  *
- * Serve mode must not exit -- it owns devices that other profiles will want
- * again -- so it drops to IDLE instead: both grabs released, every held key
- * let go, the config file left exactly as the app wrote it, and the panic
- * counter bumped in the status file so the supervisor notices and decides
- * what to write next. */
+ * Serve mode must not exit here -- it owns devices that other profiles will
+ * want again -- so it drops to IDLE instead: both grabs released, every held
+ * key let go, every contact released on the clone, the config file left
+ * exactly as the app wrote it, and the panic counter bumped in the status file
+ * so the supervisor notices and decides what to write next.
+ *
+ * The pad fd survives this, ungrabbed, until PANIC_RESTART_MS: it is the only
+ * way to tell whether the user is still holding the chord and wants the harder
+ * cure (see panic_chord_restart). Nothing is mapped from it while parked. */
 static void panic_chord_fire(config_t *cfg) {
     if (g_serve) {
         g_panic_count++;
         fprintf(stderr, "dpadkeys: panic: idle\n");
         fflush(stderr);
+
+        /* serve_go_idle() -> release_all_virtual() deliberately forgets the
+         * chord; the escalation needs it kept, including the "already fired"
+         * latch -- without it the still-held chord re-fires every wakeup. */
+        long long chord_start = g_chord_start_ms;
+        bool fired = g_panic_idle_fired;
+        bool held[MAX_PANIC_SRC];
+        memcpy(held, g_panic_held, sizeof(held));
+        int keep_fd = -1;
+        if (g_pad_fd >= 0 && cfg->n_panic > 0) {
+            if (g_grabbed) { ioctl(g_pad_fd, EVIOCGRAB, 0); g_grabbed = false; }
+            keep_fd = g_pad_fd;
+            g_pad_fd = -1; /* hidden from serve_go_idle so it is not closed */
+        }
         serve_go_idle(cfg);
+        g_pad_fd = keep_fd;
+        if (keep_fd >= 0) {
+            g_panic_watch_until_ms = chord_start + PANIC_RESTART_MS;
+            g_chord_start_ms = chord_start;
+            g_panic_idle_fired = fired;
+            memcpy(g_panic_held, held, sizeof(held));
+        }
         write_status(cfg);
         return;
     }
-    fprintf(stderr, "dpadkeys: panic: back-button chord held, disabling touch offset\n");
+    fprintf(stderr, "dpadkeys: panic: chord held, disabling touch offset\n");
     fflush(stderr);
     touch_fatal_exit(6);
 }
 
-/* Tracks raw BTN_C ("m1")/BTN_Z ("m2") hold state and fires the panic chord
- * once both have been held continuously for PANIC_CHORD_MS while a touch
- * offset is active (configured and the panel currently grabbed). Called both
- * on every raw pad EV_KEY event (code, pressed) and, with code 0, from the
- * poll-timeout path so the chord fires purely from elapsed time even if no
- * further pad events arrive while both buttons are held. Returns true if the
- * chord fired, which in serve mode means the pad has just been released and
- * the caller must stop touching it for this event. */
-static bool check_panic_chord(config_t *cfg, int code, bool pressed) {
-    if (g_panic_chord != PANIC_CHORD_M1M2) return false;
-    if (code == BTN_C) g_chord_m1_held = pressed;
-    else if (code == BTN_Z) g_chord_m2_held = pressed;
+/* The long hold: serve mode's nuclear option. Both virtual devices are
+ * destroyed on the way out and the process exits 6, so the app's watchdog
+ * respawns a daemon whose clone Android has never seen a phantom pointer on.
+ * This is the guaranteed cure for any stuck-contact case the release paths
+ * above somehow miss, and it needs no app, no adb and no menu. */
+static void panic_chord_restart(config_t *cfg) {
+    g_panic_count++;
+    fprintf(stderr, "dpadkeys: panic: long hold, exiting to recreate devices\n");
+    fflush(stderr);
+    release_all_virtual(cfg);
+    touch_disable();               /* releases stuck contacts, drops panel, destroys clone */
+    g_want_pad = false;
+    g_want_touch = false;
+    g_panic_watch_until_ms = -1;
+    write_status(cfg);             /* last word to the supervisor before we go */
+    if (g_pad_fd >= 0) {
+        if (g_grabbed) ioctl(g_pad_fd, EVIOCGRAB, 0);
+        g_grabbed = false;
+        close(g_pad_fd);
+        g_pad_fd = -1;
+    }
+    destroy_uinput(g_uinput_fd);
+    g_uinput_fd = -1;
+    if (g_pidfile) unlink(g_pidfile);
+    exit(6);
+}
 
-    if (!(cfg->touch_offset_set && g_touch_grabbed) || !g_chord_m1_held || !g_chord_m2_held) {
+static void panic_set_held(const config_t *cfg, int slot, bool pressed) {
+    for (int i = 0; i < cfg->n_panic; i++)
+        if (cfg->panic_src[i] == slot) g_panic_held[i] = pressed;
+}
+
+/* Tracks the panic chord's sources straight off the raw pad event.
+ *
+ * Deliberately separate from update_source()/the mapping: the chord has to
+ * work for sources this profile does not bind at all, and while parked (pad
+ * ungrabbed, nothing dispatched) during the PANIC_CHORD_MS..PANIC_RESTART_MS
+ * window. Axis thresholds are read-only here -- hysteresis state belongs to
+ * the mapping path. */
+static void panic_track_event(config_t *cfg, const struct input_event *ev) {
+    if (cfg->n_panic <= 0) return;
+    if (ev->type == EV_KEY) {
+        if (ev->value == 2) return; /* autorepeat */
+        bool pressed = ev->value != 0;
+        int sem = semantic_for_key(ev->code);
+        if (sem >= 0) panic_set_held(cfg, sem, pressed);
+        for (int i = 0; i < cfg->n_raw; i++)
+            if (cfg->raw[i].kind == RAW_KEY && cfg->raw[i].code == ev->code)
+                panic_set_held(cfg, SRC_COUNT + i, pressed);
+        return;
+    }
+    if (ev->type != EV_ABS) return;
+    if (ev->code == ABS_HAT0X) {
+        panic_set_held(cfg, SRC_HAT_LEFT, ev->value < 0);
+        panic_set_held(cfg, SRC_HAT_RIGHT, ev->value > 0);
+    } else if (ev->code == ABS_HAT0Y) {
+        panic_set_held(cfg, SRC_HAT_UP, ev->value < 0);
+        panic_set_held(cfg, SRC_HAT_DOWN, ev->value > 0);
+    }
+    if (g_ax.lt.present && ev->code == g_ax.lt.code)
+        panic_set_held(cfg, SRC_LT, classify_trigger(ev->value, &g_ax.lt, cfg->deadzone));
+    if (g_ax.rt.present && ev->code == g_ax.rt.code)
+        panic_set_held(cfg, SRC_RT, classify_trigger(ev->value, &g_ax.rt, cfg->deadzone));
+    for (int i = 0; i < cfg->n_raw; i++) {
+        const raw_source_t *r = &cfg->raw[i];
+        if (r->kind != RAW_ABS || r->code != ev->code || !r->axis_known) continue;
+        panic_set_held(cfg, SRC_COUNT + i, raw_abs_pressed(r, ev->value, cfg->deadzone));
+    }
+}
+
+/* Fires the profile's panic chord once every listed source has been held
+ * continuously for PANIC_CHORD_MS, and (serve mode only) escalates to a
+ * device-recreating exit at PANIC_RESTART_MS if the hold continues. Called
+ * after panic_track_event() on every raw pad event and, with no event at all,
+ * from the poll-timeout path so the chord fires purely from elapsed time while
+ * the buttons are held down and nothing else arrives.
+ *
+ * Arming: in serve mode, whenever the daemon holds something the user may need
+ * to take back -- a grabbed pad (so keyboard-only profiles get the same escape
+ * hatch), a grabbed panel, or the parked window. One-shot mode keeps the
+ * original rule, since there the chord only ever existed to undo a touch
+ * offset. Returns true if the chord fired, which in serve mode means the pad
+ * has just been let go and the caller must stop using it for this event. */
+static bool check_panic_chord(config_t *cfg) {
+    bool armed = cfg->n_panic > 0 &&
+                 (g_serve ? (g_grabbed || g_touch_grabbed || g_panic_watch_until_ms >= 0)
+                          : (cfg->touch_offset_set && g_touch_grabbed));
+    if (armed) {
+        for (int i = 0; i < cfg->n_panic; i++)
+            if (!g_panic_held[i]) { armed = false; break; }
+    }
+    if (!armed) {
         g_chord_start_ms = -1;
+        g_panic_idle_fired = false;
         return false;
     }
     long long now = now_ms();
     if (g_chord_start_ms < 0) {
         g_chord_start_ms = now;
+        g_panic_idle_fired = false;
         return false;
     }
-    if (now - g_chord_start_ms < PANIC_CHORD_MS) return false;
+    long long held_ms = now - g_chord_start_ms;
+    if (g_serve && held_ms >= PANIC_RESTART_MS) {
+        panic_chord_restart(cfg); /* does not return */
+        return true;
+    }
+    if (held_ms < PANIC_CHORD_MS) return false;
+    if (g_panic_idle_fired) return false; /* already parked; waiting on the escalation */
+    g_panic_idle_fired = true;
     panic_chord_fire(cfg);
     return true;
 }
@@ -1710,27 +1991,134 @@ static bool touch_write(const struct input_event *evs, int n) {
     return false;
 }
 
-/* Mirrors the panel's live MT state onto the freshly created clone.
+/* ---- clone contact state ---- */
+
+/* Contacts the clone currently believes are down. Reported in the status file
+ * so the supervising app can see a stuck pointer without guessing. */
+static int touch_contacts_live(void) {
+    int n = 0;
+    for (int s = 0; s < TOUCH_MAX_SLOTS; s++)
+        if (g_clone_tid[s] >= 0) n++;
+    return n;
+}
+
+/* True if `tid` is already live on the clone in a slot other than `skip`.
+ * Tracking ids only have to be unique across *live* contacts, but a duplicate
+ * makes the kernel/Android merge two pointers, so ids are remapped on clash. */
+static bool touch_tid_live(int tid, int skip) {
+    if (tid < 0) return false;
+    for (int s = 0; s < TOUCH_MAX_SLOTS; s++)
+        if (s != skip && g_clone_tid[s] == tid) return true;
+    return false;
+}
+
+/* An id from the daemon's own space, used for contacts carried over at grab
+ * time (whose panel ids we deliberately do not reuse) and for remapping a
+ * forwarded id that would clash with one already live. */
+static int touch_alloc_tid(void) {
+    int id;
+    do {
+        id = g_clone_next_tid++;
+        if (g_clone_next_tid < 0) g_clone_next_tid = 0x40000000; /* stay positive */
+    } while (touch_tid_live(id, -1));
+    return id;
+}
+
+/* Drops the tracked state without writing: only for a clone that is already
+ * gone (uinput write failed ENODEV/EIO), where a release frame could not be
+ * delivered anyway. */
+static void touch_forget_contacts(void) {
+    for (int s = 0; s < TOUCH_MAX_SLOTS; s++) g_clone_tid[s] = -1;
+    g_clone_btn_touch = false;
+    g_clone_cur_slot = -1;
+    g_touch_last_event_ms = -1;
+}
+
+/* Emits, in one frame, ABS_MT_TRACKING_ID -1 for every slot the clone still
+ * has down plus BTN_TOUCH 0 if it was 1.
  *
- * At grab time a finger may already be down. The panel will then keep
- * streaming updates for that slot without ever re-sending its
- * ABS_MT_TRACKING_ID, and the clone (which starts with every slot empty)
- * would drop them as belonging to no contact. EVIOCGMTSLOTS reads the
- * panel's per-slot state, and for every slot with tracking id != -1 we emit
- * SLOT / TRACKING_ID / POSITION_X / POSITION_Y (offset) / TOUCH_MAJOR, plus
- * BTN_TOUCH 1, in a single synthetic frame. The current slot is restored
- * last so the clone's implicit slot matches the panel's before the live
- * stream resumes. Skipped (with a log line) when EVIOCGMTSLOTS is missing. */
+ * This is the fix for the phantom-pointer bug. The clone is a persistent
+ * device in serve mode, so any contact left down on it stays down in Android's
+ * view forever: every later real touch becomes a *second* pointer and
+ * single-touch handling follows the phantom, which is what "touch is off by
+ * half the screen, and Home doesn't fix it" actually was.
+ *
+ * Tracked state is cleared BEFORE the write, so the one-shot exit-5 contract
+ * (touch_write -> touch_fatal_exit -> touch_disable -> touch_release_panel)
+ * cannot recurse back in here. Returns the number of contacts released. */
+static int touch_release_stuck_contacts(const char *why) {
+    if (touch_contacts_live() == 0 && !g_clone_btn_touch) {
+        g_touch_last_event_ms = -1;
+        return 0;
+    }
+    if (g_touch_uinput_fd < 0 || g_touch_uinput_dead) { touch_forget_contacts(); return 0; }
+
+    struct input_event out[TOUCH_MAX_SLOTS * 2 + 2];
+    int n = 0, released = 0;
+    for (int s = 0; s < TOUCH_MAX_SLOTS; s++) {
+        if (g_clone_tid[s] < 0) continue;
+        memset(&out[n], 0, sizeof(out[n]));
+        out[n].type = EV_ABS; out[n].code = ABS_MT_SLOT; out[n].value = g_touch_slot_min + s; n++;
+        memset(&out[n], 0, sizeof(out[n]));
+        out[n].type = EV_ABS; out[n].code = ABS_MT_TRACKING_ID; out[n].value = -1; n++;
+        g_clone_cur_slot = g_touch_slot_min + s;
+        released++;
+    }
+    if (g_clone_btn_touch) {
+        memset(&out[n], 0, sizeof(out[n]));
+        out[n].type = EV_KEY; out[n].code = BTN_TOUCH; out[n].value = 0; n++;
+    }
+    memset(&out[n], 0, sizeof(out[n]));
+    out[n].type = EV_SYN; out[n].code = SYN_REPORT; out[n].value = 0; n++;
+
+    for (int s = 0; s < TOUCH_MAX_SLOTS; s++) g_clone_tid[s] = -1;
+    g_clone_btn_touch = false;
+    g_touch_last_event_ms = -1;
+
+    touch_write(out, n);
+    if (released > 0) {
+        fprintf(stderr, "dpadkeys: touch: released %d stuck contact(s) (%s)\n",
+                released, why ? why : "?");
+        fflush(stderr);
+    }
+    return released;
+}
+
+/* Reconciles the clone's contact state with the panel's at (re)grab time.
+ *
+ * Two things can be true at once here. A finger may already be down on the
+ * panel: it will keep streaming position updates for that slot without ever
+ * re-sending its ABS_MT_TRACKING_ID, so a clone that has the slot empty drops
+ * them all. And the clone may still have contacts of its own from before --
+ * it is never destroyed in serve mode -- which the panel has since forgotten.
+ *
+ * So: read the panel's per-slot state with EVIOCGMTSLOTS, take a slot as live
+ * only if its tracking id is >= 0 AND its position is inside the panel's own
+ * axis range, then in a single frame release every slot the clone has down but
+ * the panel does not, press every slot the panel has down and the clone does
+ * not, and refresh the position of the ones both agree on. Contacts pressed
+ * here get an id from the daemon's private space (touch_alloc_tid()), never
+ * the panel's, so they cannot collide with an id still live on the clone or
+ * with one the panel is about to send for a different finger.
+ *
+ * If EVIOCGMTSLOTS is unavailable we carry nothing and release everything:
+ * guessing is what produced phantom pointers in the first place. */
 static void touch_sync_initial_contacts(const config_t *cfg) {
 #ifdef EVIOCGMTSLOTS
     struct input_absinfo slotinfo;
-    if (ioctl(g_touch_fd, EVIOCGABS(ABS_MT_SLOT), &slotinfo) < 0) return;
+    if (ioctl(g_touch_fd, EVIOCGABS(ABS_MT_SLOT), &slotinfo) < 0 ||
+        slotinfo.maximum < slotinfo.minimum) {
+        touch_release_stuck_contacts("regrab, no slot info");
+        return;
+    }
     int nslots = slotinfo.maximum - slotinfo.minimum + 1;
-    if (nslots <= 0) return;
-    if (nslots > 64) nslots = 64;
+    if (nslots > TOUCH_MAX_SLOTS) nslots = TOUCH_MAX_SLOTS;
+    g_touch_slot_min = slotinfo.minimum;
+    g_touch_nslots = nslots;
 
     /* buf[0] is the requested ABS_MT_* code; buf[1..nslots] the slot values. */
-    int32_t tid[65], px[65], py[65], maj[65];
+    int32_t tid[TOUCH_MAX_SLOTS + 1], px[TOUCH_MAX_SLOTS + 1];
+    int32_t py[TOUCH_MAX_SLOTS + 1], maj[TOUCH_MAX_SLOTS + 1];
     bool have_maj = true;
     tid[0] = ABS_MT_TRACKING_ID;
     px[0] = ABS_MT_POSITION_X;
@@ -1739,25 +2127,52 @@ static void touch_sync_initial_contacts(const config_t *cfg) {
     size_t sz = (size_t)(nslots + 1) * sizeof(int32_t);
     if (ioctl(g_touch_fd, EVIOCGMTSLOTS(sz), tid) < 0) {
         fprintf(stderr, "dpadkeys: touch: EVIOCGMTSLOTS unavailable (%s); "
-                        "a finger already down at grab time will be ignored "
-                        "until it is lifted\n", strerror(errno));
+                        "carrying nothing over\n", strerror(errno));
+        fflush(stderr);
+        touch_release_stuck_contacts("regrab, EVIOCGMTSLOTS unavailable");
         return;
     }
-    if (ioctl(g_touch_fd, EVIOCGMTSLOTS(sz), px) < 0) return;
-    if (ioctl(g_touch_fd, EVIOCGMTSLOTS(sz), py) < 0) return;
+    if (ioctl(g_touch_fd, EVIOCGMTSLOTS(sz), px) < 0 ||
+        ioctl(g_touch_fd, EVIOCGMTSLOTS(sz), py) < 0) {
+        touch_release_stuck_contacts("regrab, no slot positions");
+        return;
+    }
     if (ioctl(g_touch_fd, EVIOCGMTSLOTS(sz), maj) < 0) have_maj = false;
 
-    struct input_event out[5 * 64 + 3];
-    int n = 0;
-    int active = 0;
+    bool panel_down[TOUCH_MAX_SLOTS];
+    for (int s = 0; s < nslots; s++)
+        panel_down[s] = tid[s + 1] >= 0 && touch_pos_in_range(px[s + 1], py[s + 1]);
+
+    struct input_event out[TOUCH_MAX_SLOTS * 5 + 3];
+    int n = 0, released = 0, carried = 0;
     for (int s = 0; s < nslots; s++) {
-        if (tid[s + 1] == -1) continue;
-        active++;
-        struct input_event e[5];
+        bool clone_down = g_clone_tid[s] >= 0;
+        if (!clone_down && !panel_down[s]) continue;
+
+        memset(&out[n], 0, sizeof(out[n]));
+        out[n].type = EV_ABS; out[n].code = ABS_MT_SLOT; out[n].value = slotinfo.minimum + s; n++;
+
+        if (clone_down && !panel_down[s]) {
+            /* Ours, not the panel's: a contact the clone was left holding. */
+            memset(&out[n], 0, sizeof(out[n]));
+            out[n].type = EV_ABS; out[n].code = ABS_MT_TRACKING_ID; out[n].value = -1; n++;
+            g_clone_tid[s] = -1;
+            released++;
+            continue;
+        }
+        if (!clone_down) {
+            /* New to the clone: press it under an id of our own. */
+            memset(&out[n], 0, sizeof(out[n]));
+            out[n].type = EV_ABS; out[n].code = ABS_MT_TRACKING_ID;
+            out[n].value = touch_alloc_tid(); n++;
+            g_clone_tid[s] = out[n - 1].value;
+            carried++;
+        }
+        /* Both down (same slot, same panel, so the same finger) or freshly
+         * pressed: refresh the position either way. */
+        struct input_event e[3];
         memset(e, 0, sizeof(e));
         int k = 0;
-        e[k].type = EV_ABS; e[k].code = ABS_MT_SLOT; e[k].value = slotinfo.minimum + s; k++;
-        e[k].type = EV_ABS; e[k].code = ABS_MT_TRACKING_ID; e[k].value = tid[s + 1]; k++;
         e[k].type = EV_ABS; e[k].code = ABS_MT_POSITION_X; e[k].value = px[s + 1]; k++;
         e[k].type = EV_ABS; e[k].code = ABS_MT_POSITION_Y; e[k].value = py[s + 1]; k++;
         if (have_maj) { e[k].type = EV_ABS; e[k].code = ABS_MT_TOUCH_MAJOR; e[k].value = maj[s + 1]; k++; }
@@ -1766,23 +2181,35 @@ static void touch_sync_initial_contacts(const config_t *cfg) {
             out[n++] = e[j];
         }
     }
-    if (active == 0) return;
 
-    /* Restore the panel's current slot, then BTN_TOUCH and the frame end. */
+    /* Restore the panel's current slot so the clone's implicit slot matches
+     * before the live stream resumes, then BTN_TOUCH, then end the frame. */
     memset(&out[n], 0, sizeof(out[n]));
     out[n].type = EV_ABS; out[n].code = ABS_MT_SLOT; out[n].value = slotinfo.value; n++;
-    memset(&out[n], 0, sizeof(out[n]));
-    out[n].type = EV_KEY; out[n].code = BTN_TOUCH; out[n].value = 1; n++;
+    g_clone_cur_slot = slotinfo.value;
+
+    bool want_btn = touch_contacts_live() > 0;
+    if (want_btn != g_clone_btn_touch) {
+        memset(&out[n], 0, sizeof(out[n]));
+        out[n].type = EV_KEY; out[n].code = BTN_TOUCH; out[n].value = want_btn ? 1 : 0; n++;
+        g_clone_btn_touch = want_btn;
+    }
     memset(&out[n], 0, sizeof(out[n]));
     out[n].type = EV_SYN; out[n].code = SYN_REPORT; out[n].value = 0; n++;
 
     touch_write(out, n);
-    fprintf(stderr, "dpadkeys: touch: carried over %d contact(s) live at grab time\n", active);
-    fflush(stderr);
+    g_touch_last_event_ms = touch_contacts_live() > 0 ? now_ms() : -1;
+    if (released > 0)
+        fprintf(stderr, "dpadkeys: touch: released %d stuck contact(s) (regrab reconcile)\n", released);
+    if (carried > 0)
+        fprintf(stderr, "dpadkeys: touch: carried over %d contact(s) live at grab time\n", carried);
+    if (released > 0 || carried > 0) fflush(stderr);
 #else
     (void)cfg;
+    touch_release_stuck_contacts("regrab, no EVIOCGMTSLOTS in headers");
     fprintf(stderr, "dpadkeys: touch: EVIOCGMTSLOTS not in headers; a finger "
                     "already down at grab time will be ignored until lifted\n");
+    fflush(stderr);
 #endif
 }
 
@@ -1851,11 +2278,25 @@ static touch_enable_result_t touch_enable(const config_t *cfg) {
  * a partial one), applies the configured X/Y offset in place, and replays the
  * batch to the clone with a single write() so frames stay contiguous and the
  * original timestamps/order are preserved verbatim. Loops until EAGAIN so a
- * burst larger than the buffer is drained in-order. Returns 0 normally, or -1
- * with errno set (notably ENODEV when the panel vanished) so the caller can
- * re-detect. */
+ * burst larger than the buffer is drained in-order.
+ *
+ * On the way through it mirrors the MT state it is writing (current slot, the
+ * tracking id live in each slot, BTN_TOUCH) so every "stop forwarding" path can
+ * release exactly what is still down, and fixes up two things the raw stream
+ * can get wrong from the clone's point of view:
+ *   - a new tracking id on a slot the clone still has down (the lift was lost
+ *     across a re-grab, or the panel simply restarted the contact): the old one
+ *     is closed with -1 in a frame of its own first, because two ids in one
+ *     frame collapse to the last and leave a pointer that never ends;
+ *   - an id that would duplicate one already live in another slot: remapped
+ *     into the daemon's private id space.
+ * Returns 0 normally, or -1 with errno set (notably ENODEV when the panel
+ * vanished) so the caller can re-detect. */
 static int forward_touch_batch(const config_t *cfg) {
     struct input_event batch[128];
+    /* Worst case each input event also emits an inserted release frame
+     * (TRACKING_ID -1 + SYN + SLOT) ahead of itself. */
+    static struct input_event out[128 * 4 + 8];
     for (;;) {
         ssize_t n = read(g_touch_fd, batch, sizeof(batch));
         if (n < 0) {
@@ -1866,9 +2307,53 @@ static int forward_touch_batch(const config_t *cfg) {
         if (n == 0) return 0;
         int n_ev = (int)((size_t)n / sizeof(struct input_event));
         if (n_ev <= 0) return 0;
-        for (int i = 0; i < n_ev; i++)
-            offset_touch_event(cfg, &batch[i]);
-        touch_write(batch, n_ev);
+        g_touch_last_event_ms = now_ms();
+
+        int k = 0;
+        for (int i = 0; i < n_ev; i++) {
+            struct input_event ev = batch[i];
+            offset_touch_event(cfg, &ev);
+
+            if (ev.type == EV_ABS && ev.code == ABS_MT_SLOT) {
+                g_clone_cur_slot = ev.value;
+                out[k++] = ev;
+                continue;
+            }
+            if (ev.type == EV_KEY && ev.code == BTN_TOUCH) {
+                g_clone_btn_touch = (ev.value != 0);
+                out[k++] = ev;
+                continue;
+            }
+            if (ev.type == EV_ABS && ev.code == ABS_MT_TRACKING_ID) {
+                int slot = g_clone_cur_slot - g_touch_slot_min;
+                if (slot < 0 || slot >= g_touch_nslots || slot >= TOUCH_MAX_SLOTS) {
+                    /* A slot outside the range the panel reports for itself:
+                     * forward it verbatim, but do not pretend to track it. */
+                    out[k++] = ev;
+                    continue;
+                }
+                if (ev.value < 0) {
+                    g_clone_tid[slot] = -1;
+                    out[k++] = ev;
+                    continue;
+                }
+                if (g_clone_tid[slot] >= 0) {
+                    memset(&out[k], 0, sizeof(out[k]));
+                    out[k].type = EV_ABS; out[k].code = ABS_MT_TRACKING_ID; out[k].value = -1; k++;
+                    memset(&out[k], 0, sizeof(out[k]));
+                    out[k].type = EV_SYN; out[k].code = SYN_REPORT; out[k].value = 0; k++;
+                    memset(&out[k], 0, sizeof(out[k]));
+                    out[k].type = EV_ABS; out[k].code = ABS_MT_SLOT; out[k].value = g_clone_cur_slot; k++;
+                    g_clone_tid[slot] = -1;
+                }
+                if (touch_tid_live(ev.value, slot)) ev.value = touch_alloc_tid();
+                g_clone_tid[slot] = ev.value;
+                out[k++] = ev;
+                continue;
+            }
+            out[k++] = ev;
+        }
+        touch_write(out, k);
         /* A full buffer means there may be more queued; anything shorter
          * means the queue is drained. */
         if ((size_t)n < sizeof(batch)) return 0;
@@ -1990,9 +2475,12 @@ static void print_touch_banner(const config_t *cfg) {
     else if (g_touch_has_x) snprintf(xb, sizeof(xb), "[%d,%d]", g_touch_x_info.minimum, g_touch_x_info.maximum);
     if (g_touch_has_mty) snprintf(yb, sizeof(yb), "[%d,%d]", g_touch_mty_info.minimum, g_touch_mty_info.maximum);
     else if (g_touch_has_y) snprintf(yb, sizeof(yb), "[%d,%d]", g_touch_y_info.minimum, g_touch_y_info.maximum);
-    char panic_b[24];
-    if (g_panic_chord == PANIC_CHORD_M1M2) snprintf(panic_b, sizeof(panic_b), "m1+m2 %dms", PANIC_CHORD_MS);
-    else snprintf(panic_b, sizeof(panic_b), "none");
+    char panic_b[192];
+    if (cfg->n_panic > 0) {
+        char pb[160];
+        panic_spec_str(cfg, pb, sizeof(pb));
+        snprintf(panic_b, sizeof(panic_b), "%s %dms", pb, PANIC_CHORD_MS);
+    } else snprintf(panic_b, sizeof(panic_b), "none");
     printf("dpadkeys: touch=%s \"%s\" off=(%d,%d) x=%s y=%s panic=%s\n",
            g_touch_path, g_touch_name, cfg->touch_dx, cfg->touch_dy, xb, yb, panic_b);
     fflush(stdout);
@@ -2047,10 +2535,10 @@ static void sanitize_device_name(char *dst, size_t dstsize, const char *src) {
 static void print_usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s --config FILE [--grab] [--list] [--device auto|/dev/input/eventN] "
-            "[--device-name NAME] [--verbose] [--pidfile PATH] [--print-config] [--panic-chord none|m1+m2]\n"
+            "[--device-name NAME] [--verbose] [--pidfile PATH] [--print-config] [--panic-chord none|SRC+SRC]\n"
             "       %s --profile fkeys|wasd [--grab] ...\n"
             "       %s --serve --config FILE [--pidfile PATH] [--status-file PATH] [--verbose]\n"
-            "                  [--device ...] [--device-name NAME] [--panic-chord none|m1+m2]\n"
+            "                  [--device ...] [--device-name NAME] [--panic-chord none|SRC+SRC]\n"
             "       %s --learn [--learn-timeout-ms N] [--learn-hold-ms N] [--config FILE] [--device ...] [--pidfile PATH]\n"
             "\n"
             "--serve keeps ONE daemon alive for as long as the supervising app holds its\n"
@@ -2075,11 +2563,20 @@ static void print_usage(const char *argv0) {
             "a bad line never fails a reload.\n"
             "\n"
             "--status-file PATH makes the daemon write, atomically, on every transition:\n"
-            "    state=idle|active touch=on|off keys=<n> panic=<count>\n"
+            "    state=idle|active touch=on|off keys=<n> panic=<count> contacts=<n>\n"
             "state/touch are the active profile's intent; `keys` counts the bindings that can\n"
-            "emit something; `panic` counts panic-chord firings. In serve mode the panic chord\n"
-            "does NOT exit -- it drops to idle, logs `panic: idle`, leaves the config file\n"
-            "untouched, and bumps `panic` so the supervisor can react.\n"
+            "emit something; `panic` counts panic-chord firings; `contacts` is how many\n"
+            "contacts the virtual touchscreen currently has down (0 at every transition -- a\n"
+            "nonzero value means a pointer is stuck).\n"
+            "\n"
+            "`panic <src>[+<src>...]` in the profile arms the hardware escape hatch: every\n"
+            "listed button-like source (btn.*, hat.*, lt, rt, key.0x.., abs.0x..; not stick\n"
+            "directions) held together for 1s parks the daemon, and in --serve holding on to\n"
+            "4s exits 6 with both virtual devices destroyed so a watchdog respawns fresh ones.\n"
+            "In --serve the 1s step drops to idle, logs `panic: idle`, leaves the config file\n"
+            "untouched and bumps `panic`; one-shot mode exits 6 straight away. There is no\n"
+            "default chord: with no `panic` line there is none. --panic-chord overrides the\n"
+            "profile's line for standalone use (`none`, `m1+m2`, or any source list).\n"
             "\n"
             "--learn is a separate process and needs the pad ungrabbed, so run it while the\n"
             "serve daemon is idle: write an idle config (`idle 1`) and send SIGUSR1 first if a\n"
@@ -2450,12 +2947,18 @@ static void write_status(const config_t *cfg) {
         fflush(stderr);
         return;
     }
-    fprintf(f, "state=%s touch=%s keys=%d panic=%ld\n",
+    /* `contacts` is the number of contacts the virtual touchscreen currently
+     * has down. It should be 0 at every transition -- a nonzero value in the
+     * status file is the app's direct signal that a pointer is stuck. */
+    fprintf(f, "state=%s touch=%s keys=%d panic=%ld contacts=%d\n",
             (g_want_pad || g_want_touch) ? "active" : "idle",
-            g_want_touch ? "on" : "off", count_bindings(cfg), g_panic_count);
+            g_want_touch ? "on" : "off", count_bindings(cfg), g_panic_count,
+            touch_contacts_live());
     fflush(f);
     fsync(fileno(f));
     fclose(f);
+    g_status_contacts = touch_contacts_live();
+    g_status_written_ms = now_ms();
     if (rename(tmp, g_status_path) < 0) {
         fprintf(stderr, "dpadkeys: serve: cannot rename status into place: %s\n", strerror(errno));
         fflush(stderr);
@@ -2465,10 +2968,12 @@ static void write_status(const config_t *cfg) {
 
 static void log_serve_state(const config_t *cfg) {
     if (g_want_pad || g_want_touch) {
-        char tb[48];
+        char tb[48], pb[160];
         if (g_want_touch) snprintf(tb, sizeof(tb), "on %d %d", cfg->touch_dx, cfg->touch_dy);
         else snprintf(tb, sizeof(tb), "off");
-        fprintf(stderr, "dpadkeys: serve: state=active keys=%d touch=%s\n", count_bindings(cfg), tb);
+        panic_spec_str(cfg, pb, sizeof(pb));
+        fprintf(stderr, "dpadkeys: serve: state=active keys=%d touch=%s panic=%s\n",
+                count_bindings(cfg), tb, cfg->n_panic > 0 ? pb : "none");
     } else {
         fprintf(stderr, "dpadkeys: serve: state=idle\n");
     }
@@ -2500,8 +3005,9 @@ static void release_all_virtual(config_t *cfg) {
     g_ax.ls_x.state = g_ax.ls_y.state = g_ax.rs_x.state = g_ax.rs_y.state = 0;
     g_ax.lt.state = g_ax.rt.state = 0;
     for (int i = 0; i < cfg->n_raw; i++) cfg->raw[i].axis.state = 0;
-    g_chord_m1_held = g_chord_m2_held = false;
+    memset(g_panic_held, 0, sizeof(g_panic_held));
     g_chord_start_ms = -1;
+    g_panic_idle_fired = false;
 }
 
 /* Raw-source problems that can only be spotted once the pad is open. In
@@ -2555,7 +3061,8 @@ static bool serve_acquire_pad(config_t *cfg, const char *device_override) {
 }
 
 static void serve_release_pad(config_t *cfg) {
-    if (g_pad_fd < 0) return;
+    if (g_pad_fd < 0) { g_panic_watch_until_ms = -1; return; }
+    g_panic_watch_until_ms = -1;
     release_all_virtual(cfg);
     if (g_grabbed) { ioctl(g_pad_fd, EVIOCGRAB, 0); g_grabbed = false; }
     close(g_pad_fd);
@@ -2659,6 +3166,7 @@ static void serve_reload(config_t *cfg, const char *config_path, const char *dev
         fflush(stderr);
         return;
     }
+    apply_panic_cli_override(&next);
     filter_targets_to_superset(&next, config_path);
     serve_apply(cfg, &next, device_override);
 }
@@ -2744,14 +3252,15 @@ static bool serve_create_touch_device(const config_t *cfg) {
  * Returns false if the pad was let go while handling the event (the panic
  * chord firing in serve mode), so the caller stops using g_pad_fd. */
 static bool dispatch_pad_event(config_t *cfg, const struct input_event *ev) {
+    /* The panic chord is evaluated from the RAW event, ahead of and entirely
+     * independent of what this profile maps its sources to; mapping still
+     * happens below for the same event. */
+    panic_track_event(cfg, ev);
+    if (check_panic_chord(cfg)) return false;
+
     if (ev->type == EV_KEY) {
         if (ev->value == 2)
             return true; /* ignore autorepeat */
-        /* Raw check ahead of (and independent of) whatever btn.m1/btn.m2
-         * are mapped to in this config; mapping still happens below. */
-        if (ev->code == BTN_C || ev->code == BTN_Z) {
-            if (check_panic_chord(cfg, ev->code, ev->value != 0)) return false;
-        }
         handle_raw_key(cfg, ev->code, ev->value != 0);
         for (int i = 0; i < BTN_MAP_LEN; i++) {
             if (BTN_MAP[i].code == ev->code) {
@@ -2812,6 +3321,9 @@ static void event_loop(config_t *cfg, const char *config_path, const char *devic
             g_touch_uinput_dead = false;
             fprintf(stderr, "dpadkeys: serve: virtual touchscreen is gone; touch support disabled\n");
             fflush(stderr);
+            /* Nothing can be written to it any more, so drop the tracked
+             * contacts rather than try to release them. */
+            touch_forget_contacts();
             touch_release_panel();
             destroy_uinput(g_touch_uinput_fd);
             g_touch_uinput_fd = -1;
@@ -2822,6 +3334,45 @@ static void event_loop(config_t *cfg, const char *config_path, const char *devic
             g_retry_due_ms = -1;
             serve_retry_acquire(cfg, device_override);
         }
+        /* Parked after a panic: the pad is open but ungrabbed purely so the
+         * escalation can be seen. Let it go as soon as the chord breaks or the
+         * window closes. */
+        if (g_panic_watch_until_ms >= 0) {
+            /* Ask about the escalation BEFORE deciding the window is over:
+             * both come due at the same instant, and closing first would drop
+             * exactly the hold the user is asking us to act on. Exits 6 if the
+             * chord has now been held for PANIC_RESTART_MS. */
+            check_panic_chord(cfg);
+            if (g_chord_start_ms < 0 || now_ms() >= g_panic_watch_until_ms) {
+                g_panic_watch_until_ms = -1;
+                if (g_pad_fd >= 0) { close(g_pad_fd); g_pad_fd = -1; }
+                g_grabbed = false;
+                g_chord_start_ms = -1;
+                g_panic_idle_fired = false;
+                memset(g_panic_held, 0, sizeof(g_panic_held));
+            }
+        }
+        /* `contacts` drifting from what the status file says (a finger went
+         * down or came up with no transition around it) is refreshed here so
+         * the app can actually see a stuck pointer. */
+        if (g_serve && g_status_path && touch_contacts_live() != g_status_contacts &&
+            (g_status_written_ms < 0 || now_ms() - g_status_written_ms >= STATUS_CONTACTS_MS))
+            write_status(cfg);
+        /* Safety net. A contact live on the clone while the panel is not
+         * grabbed means a release path was missed; one live with the panel
+         * grabbed but no panel traffic at all for TOUCH_STUCK_MS cannot be a
+         * real finger. Either way, let it go rather than leave Android holding
+         * a phantom pointer. */
+        if (touch_contacts_live() > 0 || g_clone_btn_touch) {
+            bool stale = !g_touch_grabbed ||
+                         (g_touch_last_event_ms >= 0 &&
+                          now_ms() - g_touch_last_event_ms >= TOUCH_STUCK_MS);
+            if (stale) {
+                int freed = touch_release_stuck_contacts(
+                        g_touch_grabbed ? "no panel events" : "panel not grabbed");
+                if (freed > 0 && g_serve) write_status(cfg);
+            }
+        }
 
         long long deadline = -1;
         for (int i = 0; i < WHEEL_COUNT; i++) {
@@ -2829,11 +3380,23 @@ static void event_loop(config_t *cfg, const char *config_path, const char *devic
                 deadline = g_wheel_next_due_ms[i];
         }
         if (g_chord_start_ms >= 0) {
-            /* Both m1/m2 already held: wake in time to fire the chord even
-             * if no further pad events arrive while they're held. */
-            long long chord_deadline = g_chord_start_ms + PANIC_CHORD_MS;
+            /* The chord is already fully held: wake in time to fire it (and
+             * then to escalate) even if no further pad events arrive. */
+            long long chord_deadline = g_chord_start_ms +
+                    (g_panic_idle_fired ? PANIC_RESTART_MS : PANIC_CHORD_MS);
             if (deadline < 0 || chord_deadline < deadline)
                 deadline = chord_deadline;
+        }
+        if (g_panic_watch_until_ms >= 0 && (deadline < 0 || g_panic_watch_until_ms < deadline))
+            deadline = g_panic_watch_until_ms;
+        if (g_serve && g_status_path && touch_contacts_live() != g_status_contacts) {
+            long long st_deadline = (g_status_written_ms < 0 ? 0 : g_status_written_ms) + STATUS_CONTACTS_MS;
+            if (deadline < 0 || st_deadline < deadline) deadline = st_deadline;
+        }
+        if ((touch_contacts_live() > 0 || g_clone_btn_touch) && g_touch_last_event_ms >= 0) {
+            long long stuck_deadline = g_touch_last_event_ms + TOUCH_STUCK_MS;
+            if (deadline < 0 || stuck_deadline < deadline)
+                deadline = stuck_deadline;
         }
         if (g_retry_due_ms >= 0 && (deadline < 0 || g_retry_due_ms < deadline))
             deadline = g_retry_due_ms;
@@ -2869,7 +3432,7 @@ static void event_loop(config_t *cfg, const char *config_path, const char *devic
             /* Nothing readable: fire any wheel repeats that came due, and
              * check whether the panic chord's hold time has elapsed. */
             if (g_chord_start_ms >= 0)
-                check_panic_chord(cfg, 0, true); /* code 0: re-check elapsed time only */
+                check_panic_chord(cfg); /* re-check elapsed time only */
             long long now = now_ms();
             for (int i = 0; i < WHEEL_COUNT; i++) {
                 if (g_wheel_count[i] > 0 && now >= g_wheel_next_due_ms[i]) {
@@ -2899,9 +3462,9 @@ static void event_loop(config_t *cfg, const char *config_path, const char *devic
                         continue;
                     }
                     fprintf(stderr, "dpadkeys: touch: panel disconnected, re-detecting...\n");
-                    if (g_touch_grabbed) { ioctl(g_touch_fd, EVIOCGRAB, 0); g_touch_grabbed = false; }
-                    close(g_touch_fd);
-                    g_touch_fd = -1;
+                    /* Releases whatever the clone still has down first: the
+                     * panel is gone, so nothing will ever lift those fingers. */
+                    touch_release_panel();
                     while (g_running && (g_touch_fd = find_touch(cfg, g_touch_path, sizeof(g_touch_path))) < 0) {
                         struct timespec ts = { 0, 500 * 1000 * 1000 };
                         nanosleep(&ts, NULL);
@@ -2996,6 +3559,14 @@ static void event_loop(config_t *cfg, const char *config_path, const char *devic
         if (n != (ssize_t)sizeof(ev))
             continue;
 
+        if (g_panic_watch_until_ms >= 0) {
+            /* Parked: the pad is ungrabbed and belongs to the system again.
+             * We only watch for the chord escalating to a restart. */
+            panic_track_event(cfg, &ev);
+            check_panic_chord(cfg);
+            continue;
+        }
+
         if (!dispatch_pad_event(cfg, &ev))
             continue; /* pad was released mid-event (panic chord) */
     }
@@ -3026,6 +3597,7 @@ static bool claim_pidfile(const char *pidfile) {
 static int run_serve(config_t *cfg, const char *config_path, const char *device_override,
                      const char *pidfile) {
     g_serve = true;
+    g_pidfile = pidfile; /* so panic_chord_restart() can clean up on its way out */
 
     /* Claimed before any device is created: two serve daemons would each
      * create their own pair, which is exactly the churn this mode exists to
@@ -3040,8 +3612,13 @@ static int run_serve(config_t *cfg, const char *config_path, const char *device_
     }
     bool touch_ok = serve_create_touch_device(cfg);
 
-    printf("dpadkeys: serve: keyboard+mouse ok, touch=%s, state=idle\n",
-           touch_ok ? g_touch_path : "none");
+    {
+        char pb[160];
+        panic_spec_str(cfg, pb, sizeof(pb));
+        printf("dpadkeys: serve: keyboard+mouse ok, touch=%s, state=idle panic=%s\n",
+               touch_ok ? g_touch_path : "none",
+               cfg->n_panic > 0 ? pb : "none");
+    }
     fflush(stdout);
 
     /* Apply the startup profile through the same path SIGUSR1 takes, from a
@@ -3056,6 +3633,10 @@ static int run_serve(config_t *cfg, const char *config_path, const char *device_
     event_loop(cfg, config_path, device_override, true);
 
     serve_go_idle(cfg);
+    /* Last word to the supervisor: state=idle, contacts=0. Without it the file
+     * keeps whatever was true at the last transition, and an app polling it
+     * would read a long-dead daemon's contact count as a stuck pointer. */
+    write_status(cfg);
     touch_disable();
     destroy_uinput(g_uinput_fd);
     g_uinput_fd = -1;
@@ -3070,6 +3651,9 @@ int main(int argc, char **argv) {
      * block SIGUSR1/SIGTERM; the mask is inherited across exec, so clear it or
      * our reload/exit signals stay pending forever. */
     { sigset_t none; sigemptyset(&none); sigprocmask(SIG_SETMASK, &none, NULL); }
+    /* Every slot starts empty; static zero-init would read as "tracking id 0
+     * is live in every slot". */
+    touch_forget_contacts();
     const char *config_path = NULL;
     const char *profile_name = NULL;
     bool grab = false;
@@ -3102,12 +3686,12 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--learn-hold-ms") == 0 && i + 1 < argc) learn_hold_ms = atoll(argv[++i]);
         else if (strcmp(argv[i], "--panic-chord") == 0 && i + 1 < argc) {
             const char *v = argv[++i];
-            if (strcmp(v, "none") == 0) g_panic_chord = PANIC_CHORD_NONE;
-            else if (strcmp(v, "m1+m2") == 0) g_panic_chord = PANIC_CHORD_M1M2;
-            else {
-                fprintf(stderr, "dpadkeys: --panic-chord must be 'none' or 'm1+m2'\n");
-                return 2;
-            }
+            /* Legacy spelling of what is now an ordinary source list. */
+            if (strcmp(v, "m1+m2") == 0) v = "btn.m1+btn.m2";
+            static config_t probe;
+            init_config(&probe);
+            if (!parse_panic_spec(&probe, v, "--panic-chord", 0)) return 2;
+            g_panic_cli_spec = v;
         }
         else { print_usage(argv[0]); return 1; }
     }
@@ -3156,6 +3740,8 @@ int main(int argc, char **argv) {
     else if (config_path) load_config_file(config_path, &cfg, false);
     else if (do_learn && !profile_name) init_config(&cfg); /* learn needs no mapping, only device.match */
     else load_profile(&cfg, profile_name ? profile_name : "fkeys");
+
+    apply_panic_cli_override(&cfg);
 
     if (print_config_flag) {
         print_config(&cfg, stdout);

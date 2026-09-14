@@ -47,6 +47,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.dpad.mgr.core.DaemonState
+import com.dpad.mgr.core.SourceNames
 import com.dpad.mgr.core.Store
 import com.dpad.mgr.priv.PrivSource
 import com.dpad.mgr.svc.DpadService
@@ -150,7 +151,9 @@ fun StatusScreen(modifier: Modifier = Modifier) {
                     val runningProfile = activeProfileName?.let { data.profile(it) }
                     if (runningProfile?.touchOffsetEnabled == true) {
                         Text("Touch offset: ${runningProfile.touchDx},${runningProfile.touchDy}", style = MaterialTheme.typography.bodySmall)
-                        Text("Panic: hold both back buttons 1 s", style = MaterialTheme.typography.bodySmall)
+                    }
+                    runningProfile?.panicChord?.let { chord ->
+                        Text("Panic: hold ${SourceNames.chordLabel(chord)} 1 s (4 s restarts)", style = MaterialTheme.typography.bodySmall)
                     }
                     if (active) {
                         Button(onClick = {
