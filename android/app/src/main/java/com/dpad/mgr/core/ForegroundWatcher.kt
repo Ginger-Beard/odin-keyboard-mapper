@@ -48,6 +48,47 @@ class ForegroundWatcher(ctx: Context, private val scope: CoroutineScope) {
         Log.i(TAG, "watcher: tail cmd=$TAIL_CMD")
         shell.startTail(::onLine)
         Log.i(TAG, "watcher: tail started via ${shell.source.name}")
+        scope.launch { seedForeground(shell) }
+    }
+
+    /**
+     * The logcat tail only sees app switches from the moment it starts, so a game already in
+     * the foreground when the tail (re)starts -- e.g. right after boot, before Shizuku's binder
+     * shows up, which can take up to a minute -- would otherwise never be detected until the
+     * user manually switches apps. Query the currently-resumed activity once via the privileged
+     * shell and feed it through the same ignore-list/launcher logic as a live event. Retries once
+     * after 2s if the first query comes back empty (dumpsys can be slow to answer right after
+     * boot too).
+     */
+    private suspend fun seedForeground(shell: PrivShell) {
+        if (trySeed(shell)) return
+        Log.i(TAG, "watcher: seed query returned nothing, retrying in 2s")
+        delay(2000)
+        if (this.shell !== shell) return // stop()/start() happened meanwhile; a fresh seed is already in flight
+        if (!trySeed(shell)) Log.i(TAG, "watcher: re-seed query returned nothing")
+    }
+
+    /** Returns true once a foreground line was found (and fed to [onLine]); false if the query was empty. */
+    private suspend fun trySeed(shell: PrivShell): Boolean {
+        val line = queryForegroundLine(shell) ?: return false
+        if (this.shell !== shell) return true // shell replaced mid-query; the new start() will seed on its own
+        val pkg = PKG_RE.find(line)!!.groupValues[1]
+        Log.i(TAG, "watcher: seeded foreground=$pkg")
+        onLine(line)
+        return true
+    }
+
+    // "topResumedActivity" is the Android 13+ single-source-of-truth field; older/OEM dumpsys
+    // builds instead print "mResumedActivity" or (observed on this device's ROM) a bare
+    // "ResumedActivity:" line -- grepping the "ResumedActivity" substring catches all three.
+    private suspend fun queryForegroundLine(shell: PrivShell): String? =
+        queryVia(shell, "topResumedActivity") ?: queryVia(shell, "ResumedActivity")
+
+    private suspend fun queryVia(shell: PrivShell, marker: String): String? {
+        val r = runCatching { shell.exec(listOf("sh", "-c", "dumpsys activity activities | grep $marker")) }
+            .getOrElse { return null }
+        if (!r.ok) return null
+        return r.out.lineSequence().firstOrNull { PKG_RE.containsMatchIn(it) }
     }
 
     suspend fun stop() {
