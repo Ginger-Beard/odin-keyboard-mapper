@@ -753,18 +753,15 @@ private fun KeyRow(
             }
         }
         if (disabled) {
-            Row(Modifier.padding(start = 88.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.fillMaxWidth().padding(start = 88.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     k.disabledReason!!, style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
                 )
                 if (onAllowClick != null) {
                     Spacer(Modifier.width(8.dp))
-                    Text(
-                        "Allow…", style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.clickable(onClick = onAllowClick),
-                    )
+                    TextButton(modifier = Modifier.heightIn(min = 48.dp), onClick = onAllowClick) { Text("Allow…") }
                 }
             }
         }
