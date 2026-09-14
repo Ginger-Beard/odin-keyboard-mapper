@@ -80,6 +80,9 @@ does not synthesize touches or otherwise inject input into the game
 surface — a previous project of the author's that did synthesize touches
 resulted in a ban. No warranty of any kind; use at your own risk.
 
+Wheel (scroll) bindings carry a fixed pointer position; see the in-app
+warning; not recommended for OSRS.
+
 ## Developer
 
 **Layout**

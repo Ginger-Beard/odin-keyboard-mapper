@@ -117,6 +117,9 @@ object Keys {
         else -> byName[keyName]?.label ?: keyName
     }
     fun isValid(keyName: String): Boolean = keyName == NONE || byName.containsKey(keyName)
+
+    /** The four scroll-wheel targets: bound via mouse scroll events, which carry the OSRS ban-risk warning. */
+    val WHEEL_TARGETS: Set<String> = setOf("WHEEL_UP", "WHEEL_DOWN", "HWHEEL_LEFT", "HWHEEL_RIGHT")
 }
 
 @Serializable
@@ -145,10 +148,7 @@ data class Profile(
     fun key(source: String): String = map[source] ?: Keys.NONE
 
     /** True if any binding targets a scroll-wheel key. */
-    fun usesWheel(): Boolean {
-        val wheelTargets = setOf("WHEEL_UP", "WHEEL_DOWN", "HWHEEL_LEFT", "HWHEEL_RIGHT")
-        return map.values.any { it in wheelTargets }
-    }
+    fun usesWheel(): Boolean = map.values.any { it in Keys.WHEEL_TARGETS }
 
     // ---- key-first accessors ----
 
@@ -190,12 +190,9 @@ data class Profile(
             map = mapOf(
                 "hat.up" to "KEY_F1", "hat.down" to "KEY_F2", "hat.left" to "KEY_F3", "hat.right" to "KEY_F4",
                 "ls.up" to "KEY_UP", "ls.down" to "KEY_DOWN", "ls.left" to "KEY_LEFT", "ls.right" to "KEY_RIGHT",
-                "btn.thumbl+ls.up" to "WHEEL_UP", "btn.thumbl+ls.down" to "WHEEL_DOWN",
-                "btn.thumbl+ls.left" to Keys.NONE, "btn.thumbl+ls.right" to Keys.NONE,
             ),
             deadzone = 0.5f,
             lsInvertY = true,
-            wheelRepeatMs = 120,
         )
         val WASD = Profile(
             name = "WASD",

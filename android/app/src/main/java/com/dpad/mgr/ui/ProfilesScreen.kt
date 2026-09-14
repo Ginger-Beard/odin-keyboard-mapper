@@ -2,6 +2,7 @@ package com.dpad.mgr.ui
 
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -172,6 +173,7 @@ fun ProfileEditor(
     var showLetters by remember { mutableStateOf(false) }
     var showSwallowed by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
+    var showWheelWarning by remember { mutableStateOf(false) }
     var showSaved by remember { mutableStateOf(false) }
     var savedFlashJob by remember { mutableStateOf<Job?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
@@ -400,6 +402,7 @@ fun ProfileEditor(
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text("Keys", style = MaterialTheme.typography.titleMedium)
+                    WheelWarningLabel(onClick = { showWheelWarning = true })
                     Text(
                         "To bind a combo, hold a button while pressing the control during Bind.",
                         style = MaterialTheme.typography.bodySmall,
@@ -411,6 +414,7 @@ fun ProfileEditor(
                             k, draft.sourcesFor(k.keyName),
                             onUnbind = { src -> changeNow { d -> d.unbind(src) } },
                             onBind = { binding = k.keyName },
+                            onWarningClick = if (k.keyName in Keys.WHEEL_TARGETS) ({ showWheelWarning = true }) else null,
                         )
                     }
                     TextButton(modifier = Modifier.heightIn(min = 48.dp), onClick = { showLetters = !showLetters }) {
@@ -423,6 +427,7 @@ fun ProfileEditor(
                                 k, draft.sourcesFor(k.keyName),
                                 onUnbind = { src -> changeNow { d -> d.unbind(src) } },
                                 onBind = { binding = k.keyName },
+                                onWarningClick = if (k.keyName in Keys.WHEEL_TARGETS) ({ showWheelWarning = true }) else null,
                             )
                         }
                     }
@@ -450,7 +455,10 @@ fun ProfileEditor(
                         },
                         valueRange = 0.2f..0.8f, steps = 11,
                     )
-                    Text("Wheel repeat: ${draft.wheelRepeatMs} ms", style = MaterialTheme.typography.bodyMedium)
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Wheel repeat: ${draft.wheelRepeatMs} ms", style = MaterialTheme.typography.bodyMedium)
+                        WheelWarningLabel(onClick = { showWheelWarning = true })
+                    }
                     Slider(
                         value = draft.wheelRepeatMs.toFloat(),
                         onValueChange = { v ->
@@ -577,14 +585,62 @@ fun ProfileEditor(
             dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Cancel") } },
         )
     }
+
+    if (showWheelWarning) {
+        WheelWarningDialog(onDismiss = { showWheelWarning = false })
+    }
 }
 
-/** One target key: label, chips for each bound source (with × to unbind), and a "+ Bind" button. */
+/** Red, clickable "Warning: OSRS ban risk" label; opens [WheelWarningDialog] when tapped. */
+@Composable
+private fun WheelWarningLabel(onClick: () -> Unit) {
+    Text(
+        "Warning: OSRS ban risk",
+        color = MaterialTheme.colorScheme.error,
+        style = MaterialTheme.typography.bodySmall,
+        modifier = Modifier.clickable(onClick = onClick),
+    )
+}
+
+/** Explains why wheel (scroll) bindings carry OSRS ban risk: fixed pointer position on every scroll event. */
+@Composable
+private fun WheelWarningDialog(onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Mouse wheel and OSRS") },
+        text = {
+            Text(
+                "Wheel bindings are delivered to the game as mouse scroll events. Android attaches the " +
+                    "mouse pointer's screen position to every scroll event, and this app never moves the " +
+                    "pointer, so the game receives every zoom notch at the same coordinates, session after " +
+                    "session. Jagex bans accounts for automation, and their detection looks for input that " +
+                    "is too regular to be human. A stream of scroll events at one fixed position is not a " +
+                    "click and is not the behaviour that usually triggers bans, but it is not what a real " +
+                    "mouse produces either, and the mobile client's exact checks are not public. Keyboard " +
+                    "bindings carry no position and do not have this problem. If you play Old School " +
+                    "RuneScape, we recommend not binding wheel targets in that profile and using pinch zoom " +
+                    "instead. Use wheel bindings at your own risk."
+            )
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("OK") } },
+    )
+}
+
+/** One target key: label, chips for each bound source (with × to unbind), and a "+ Bind" button.
+ *  [onWarningClick], when non-null, renders a red clickable "Warning: OSRS ban risk" label next to
+ *  the key name (used for the wheel targets). */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun KeyRow(k: KeyDef, sources: List<String>, onUnbind: (String) -> Unit, onBind: () -> Unit) {
+private fun KeyRow(
+    k: KeyDef, sources: List<String>, onUnbind: (String) -> Unit, onBind: () -> Unit,
+    onWarningClick: (() -> Unit)? = null,
+) {
     Row(Modifier.fillMaxWidth().padding(vertical = 2.dp).heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
         Text(k.label, Modifier.width(88.dp), style = MaterialTheme.typography.bodyMedium)
+        if (onWarningClick != null) {
+            WheelWarningLabel(onClick = onWarningClick)
+            Spacer(Modifier.width(4.dp))
+        }
         FlowRow(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             if (sources.isEmpty()) Text("—", style = MaterialTheme.typography.bodySmall)
             for (s in sources) SourceChip(s) { onUnbind(s) }

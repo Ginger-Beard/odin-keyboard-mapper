@@ -430,7 +430,7 @@ class Supervisor(
     // ---- pointer ----
 
     /**
-     * Re-applies setPointerHidden(true) every 700 ms while the active config uses a wheel target.
+     * Re-applies setPointerHidden(true) every 200 ms while the active config uses a wheel target.
      * Android resets the pointer icon back to the arrow on the first mouse event delivered to a
      * newly-focused window, so a single call isn't enough -- the first wheel notch would show
      * (and leave visible) the cursor.
@@ -443,7 +443,7 @@ class Supervisor(
             runCatching { shell.setPointerHidden(true) }
             Log.i(TAG, "pointer: hidden")
             while (isActive) {
-                delay(700)
+                delay(200)
                 runCatching { shell.setPointerHidden(true) }
             }
         }
