@@ -219,7 +219,7 @@ class Supervisor(
         rotationDebounceJob = scope.launch { delay(200); wake.trySend(Unit) }
     }
 
-    private fun touchRotationN(): Int = (displayRotation - 1) and 3
+    private fun touchRotationN(): Int = (displayRotation + 1) and 3  // clone is 180-stale at the forced-landscape home orientation, so correct there and not when flipped
 
     /** Appends the device's touch-rotation compensation to config text about to be written to
      *  CONF. Always appended (harmless when touch isn't in play/idle) so it's simplest to reason
