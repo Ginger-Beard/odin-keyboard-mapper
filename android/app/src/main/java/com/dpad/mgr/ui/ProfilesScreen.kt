@@ -122,7 +122,6 @@ fun ProfilesScreen(modifier: Modifier = Modifier) {
                                 style = MaterialTheme.typography.bodySmall, maxLines = 2,
                             )
                         }
-                        Text("deadzone ${"%.2f".format(p.deadzone)} · used by $used app(s)", style = MaterialTheme.typography.bodySmall)
                     }
                     TextButton(modifier = Modifier.heightIn(min = 48.dp), onClick = { editing = p.name to p }) { Text("Edit") }
                 }
