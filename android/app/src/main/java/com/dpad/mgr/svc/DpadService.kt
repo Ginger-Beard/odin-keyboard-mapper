@@ -90,7 +90,7 @@ class DpadService : Service() {
         installer = BinaryInstaller(this)
         watcher = ForegroundWatcher(this, scope)
         supervisor = Supervisor(
-            scope, { probe.state.value.shell }, installer,
+            this, scope, { probe.state.value.shell }, installer,
             deviceName = getString(R.string.app_name),
             onFailed = { reason -> notifyFailed(reason) },
             onPanic = { profile -> notifyPanic(profile) },
@@ -99,7 +99,7 @@ class DpadService : Service() {
         ServiceState.serviceRunning.value = true
 
         displayManager = getSystemService(DisplayManager::class.java)
-        supervisor.setDisplayRotation(currentRotation())
+        supervisor.seedRotation(currentRotation())
         displayManager.registerDisplayListener(displayListener, null)
 
         scope.launch {
@@ -113,8 +113,9 @@ class DpadService : Service() {
                 ServiceState.daemon.value = s
                 updateNotification(s)
                 // Re-seed the rotation whenever the serve daemon (re)spawns (fresh process, or a
-                // respawn after death/restart), so a stale rotation never survives a respawn.
-                if (s is DaemonState.Starting) supervisor.setDisplayRotation(currentRotation())
+                // respawn after death/restart): a fresh daemon always creates its touchscreen
+                // clone fresh at the current rotation, so this must not bump touch.generation.
+                if (s is DaemonState.Starting) supervisor.seedRotation(currentRotation())
                 // Clear the test countdown once the daemon state shows the test truly ended:
                 // fully idle, or running/starting the real assigned target (pkg != null). Backoff
                 // and Failed are left alone since they can happen mid-test as well as mid-run.

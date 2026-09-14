@@ -1,5 +1,6 @@
 package com.dpad.mgr.core
 
+import android.content.Context
 import android.util.Log
 import com.dpad.mgr.priv.PrivShell
 import kotlinx.coroutines.CoroutineScope
@@ -66,6 +67,7 @@ private data class Status(
  * devices are recreated.
  */
 class Supervisor(
+    ctx: Context,
     private val scope: CoroutineScope,
     private val shellProvider: () -> PrivShell?,
     private val installer: BinaryInstaller,
@@ -89,10 +91,15 @@ class Supervisor(
     @Volatile private var suspended = false
     @Volatile private var learning = false
     @Volatile private var restartRequested = false
-    /** Live display rotation (0..3), fed in by DpadService. -1 = not yet seeded, so the first
-     *  call from DpadService always applies (and logs) regardless of what it reads. Device state,
-     *  not part of the Profile model -- see [setDisplayRotation]. */
-    @Volatile private var displayRotation: Int = -1
+    private val prefs = ctx.applicationContext.getSharedPreferences("supervisor", Context.MODE_PRIVATE)
+    /** Monotonic; bumped whenever the display rotation moves to a value the current generation
+     *  wasn't created at. Persisted so a service respawn never reuses a generation number the
+     *  daemon may already have seen -- see [setDisplayRotation]/[seedRotation]. */
+    @Volatile private var touchGeneration: Int = prefs.getInt(KEY_TOUCH_GENERATION, 0)
+    /** The rotation [touchGeneration] was last set at. -1 = not yet seeded, so the very first
+     *  seed/rotation call always applies regardless of what it reads. Device state, not part of
+     *  the Profile model. */
+    @Volatile private var rotationAtGeneration: Int = -1
     private var rotationDebounceJob: Job? = null
 
     // ---- the one serve daemon ----
@@ -203,28 +210,44 @@ class Supervisor(
     }
 
     /**
-     * Feeds in the live display rotation (called by DpadService: once at service start, on every
-     * DisplayListener callback, and whenever the serve daemon (re)spawns). Reference orientation
-     * is rotation 1 (forced-landscape), since the panel itself is portrait-native -- so the
-     * compensation the daemon needs is `(rotation - 1) and 3`. This is device state, not part of
-     * the Profile model: it just gets appended to whatever config text is next written to CONF.
-     * If a touch-offset profile is currently active, debounces 200 ms then wakes the reconcile
-     * loop, which rewrites the current config in place via the existing apply() path (no respawn).
+     * Feeds in a genuine display rotation change (called by DpadService's DisplayListener
+     * callback only -- see [seedRotation] for service-start/daemon-respawn seeding). If the new
+     * rotation differs from the rotation [touchGeneration] was created at, bumps and persists
+     * [touchGeneration]: on the next SIGUSR1 reload the daemon sees the new generation number and
+     * destroys+recreates its virtual touchscreen fresh at the current rotation. Debounces 300 ms
+     * (to absorb rotation settling) then wakes the reconcile loop, which rewrites the current
+     * config (active profile or idle) in place via the existing apply() path (no daemon respawn).
      */
     fun setDisplayRotation(rotation: Int) {
-        if (displayRotation == rotation) return
-        displayRotation = rotation
-        Log.i(TAG, "supervisor: rotation=$rotation touch.rotation=${touchRotationN()}")
+        if (rotation == rotationAtGeneration) return
+        touchGeneration++
+        rotationAtGeneration = rotation
+        prefs.edit().putInt(KEY_TOUCH_GENERATION, touchGeneration).apply()
+        Log.i(TAG, "supervisor: rotation=$rotation -> touch.generation=$touchGeneration")
         rotationDebounceJob?.cancel()
-        rotationDebounceJob = scope.launch { delay(200); wake.trySend(Unit) }
+        rotationDebounceJob = scope.launch { delay(300); wake.trySend(Unit) }
     }
 
-    private fun touchRotationN(): Int = (displayRotation + 1) and 3  // clone is 180-stale at the forced-landscape home orientation, so correct there and not when flipped
+    /** Seeds the rotation bookkeeping without bumping [touchGeneration]: called at service start
+     *  and whenever the serve daemon (re)spawns, since a fresh daemon process always creates its
+     *  virtual touchscreen clone fresh at whatever rotation is current -- no generation bump (and
+     *  no config rewrite/signal) is needed, just keep [rotationAtGeneration] in sync so the next
+     *  genuine [setDisplayRotation] call is compared correctly. */
+    fun seedRotation(rotation: Int) {
+        rotationAtGeneration = rotation
+    }
 
-    /** Appends the device's touch-rotation compensation to config text about to be written to
-     *  CONF. Always appended (harmless when touch isn't in play/idle) so it's simplest to reason
-     *  about from logcat and the CONF file alike. */
-    private fun withTouchRotation(conf: String): String = conf + "touch.rotation ${touchRotationN()}\n"
+    /** touch.rotation is always 0 now: rotation compensation happens entirely via
+     *  [touchGeneration] bumps (the daemon recreates its touchscreen clone fresh at the current
+     *  rotation on reload) rather than a sign-based formula here. Kept as a function so the
+     *  config-writing path reads the same as before. */
+    private fun touchRotationN(): Int = 0
+
+    /** Appends the device's touch-generation and touch-rotation directives to config text about
+     *  to be written to CONF. Always appended (harmless when touch isn't in play/idle) so it's
+     *  simplest to reason about from logcat and the CONF file alike. */
+    private fun withTouchRotation(conf: String): String =
+        conf + "touch.generation $touchGeneration\n" + "touch.rotation ${touchRotationN()}\n"
 
     /**
      * Forces the daemon idle so a one-shot `--learn` invocation can grab the pad, and waits (up to
@@ -349,7 +372,8 @@ class Supervisor(
         _state.value = DaemonState.Starting
         val bin = installer.resolve(shell)
         if (bin == null) { onFailure("daemon binary not runnable", fast = true); return false }
-        if (!shell.writeFile(CONF, IDLE_CONF)) { onFailure("cannot write $CONF", fast = true); return false }
+        val idleConf = withTouchRotation(IDLE_CONF)
+        if (!shell.writeFile(CONF, idleConf)) { onFailure("cannot write $CONF", fast = true); return false }
         // kill a stale instance recorded in the pidfile (ours from a previous process, or the adb kit's)
         val stale = shell.exec(listOf("cat", PIDFILE)).out.trim().toIntOrNull()
         if (stale != null && stale > 1 && shell.isAlive(stale)) {
@@ -371,7 +395,7 @@ class Supervisor(
             return false
         }
         servePid = pid
-        appliedConf = IDLE_CONF
+        appliedConf = idleConf
         appliedTarget = null
         attempt = 0
         lastStatusRaw = ""
@@ -462,9 +486,10 @@ class Supervisor(
         Log.i(TAG, "supervisor: panic chord -> touch offset disabled for ${prof?.name ?: "?"}")
         if (prof != null) Store.saveProfile(prof.copy(touchOffsetEnabled = false), prof.name)
         failedLatched = true
-        shell.writeFile(CONF, IDLE_CONF)
+        val idleConf = withTouchRotation(IDLE_CONF)
+        shell.writeFile(CONF, idleConf)
         shell.exec(listOf("kill", "-USR1", servePid.toString()))
-        appliedConf = IDLE_CONF
+        appliedConf = idleConf
         appliedTarget = null
         Log.i(TAG, "supervisor: idle")
         restorePointer(shell)
@@ -515,7 +540,7 @@ class Supervisor(
      *  from logcat whether touch.offset made it into the config that was actually signalled. */
     private fun activateLogLine(profile: String, conf: String): String {
         val directives = setOf(
-            "deadzone", "ls.invert_y", "ls.invert_x", "rs.invert_y", "rs.invert_x", "wheel_repeat_ms", "touch.offset", "touch.rotation", "idle",
+            "deadzone", "ls.invert_y", "ls.invert_x", "rs.invert_y", "rs.invert_x", "wheel_repeat_ms", "touch.offset", "touch.rotation", "touch.generation", "idle",
         )
         var touch = "off"
         var keys = 0
@@ -558,6 +583,7 @@ class Supervisor(
         const val LOG = "/data/local/tmp/dpadkeys.log"
         private const val TARGET_DEBOUNCE_MS = 150L
         private const val STATUS_POLL_MS = 1000L
+        private const val KEY_TOUCH_GENERATION = "touch_generation"
         /** A config with no bindings and no touch.offset: the daemon serves but grabs nothing. */
         const val IDLE_CONF = "# generated by Odin DPad Keys (idle)\nidle 1\n"
     }

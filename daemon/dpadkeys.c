@@ -244,6 +244,19 @@ typedef struct {
      * exact pre-existing behaviour. See offset_touch_event(). Fed live over the
      * config file + SIGUSR1; never needs the clone recreated. */
     int touch_rotation;
+
+    /* touch.generation: a counter the app bumps whenever the virtual
+     * touchscreen must be thrown away and rebuilt -- in practice on every
+     * display rotation event. Android mishandles a long-lived cloned
+     * touchscreen across a rotation: the clone's coordinate handling toggles
+     * between correct and axis-swapped on each rotation event, independent of
+     * the rotation actually in force, so no static compensation can track it.
+     * A clone created AFTER the rotation has settled is always correct, so the
+     * cure is to recreate it on demand. Serve mode only (see
+     * serve_recreate_touch_clone); one-shot mode parses and ignores the key,
+     * since it creates its clone once per run anyway. Independent of
+     * touch.rotation, which stays supported and defaults to 0. */
+    int touch_generation;
 } config_t;
 
 /* --device-name NAME (default "Odin DPad Keys"): names the keyboard+mouse
@@ -344,6 +357,10 @@ static bool g_touch_quiet = false;
  * One-shot mode treats that as fatal (exit 5); a serve daemon must not exit,
  * so the loop picks this up and drops to keys-only instead. */
 static bool g_touch_uinput_dead = false;
+/* touch.generation as last acted on. A reload that names a different value
+ * rebuilds the clone (serve mode only); reported as gen= in the status file so
+ * the app can see which generation the live device belongs to. */
+static int g_touch_gen_applied = 0;
 
 /* ---- clone contact bookkeeping ----
  *
@@ -435,6 +452,7 @@ static void init_config(config_t *cfg) {
     cfg->touch_dy = 0;
     cfg->touch_device[0] = '\0';
     cfg->touch_rotation = 0;
+    cfg->touch_generation = 0;
     cfg->n_panic = 0;
     for (int i = 0; i < MAX_PANIC_SRC; i++) cfg->panic_src[i] = -1;
 }
@@ -786,6 +804,10 @@ static bool load_config_file(const char *path, config_t *cfg, bool lenient) {
             cfg->touch_rotation = ((r % 4) + 4) % 4;
             continue;
         }
+        if (strcmp(tok1, "touch.generation") == 0) {
+            cfg->touch_generation = atoi(tok2);
+            continue;
+        }
         if (strcmp(tok1, "panic") == 0) {
             parse_panic_spec(cfg, tok2, path, lineno);
             continue;
@@ -930,6 +952,7 @@ static void print_config(const config_t *cfg, FILE *out) {
         fprintf(out, "%-12s %s\n", "touch.offset", "off");
     fprintf(out, "%-12s %s\n", "touch.device", cfg->touch_device[0] ? cfg->touch_device : "auto");
     fprintf(out, "%-12s %d\n", "touch.rotation", cfg->touch_rotation);
+    fprintf(out, "%-12s %d\n", "touch.generation", cfg->touch_generation);
 }
 
 /* ---- uinput device ---- */
@@ -3405,11 +3428,14 @@ static void write_status(const config_t *cfg) {
      * not neutral, so the app can say "lift your finger" instead of looking
      * hung. Single-valued by contract; the panel wins if both are pending,
      * since that is the one the user has to act on. */
-    fprintf(f, "state=%s touch=%s keys=%d panic=%ld contacts=%d waiting=%s\n",
+    /* `gen` is the touch.generation the live virtual touchscreen was built
+     * for, so the app can confirm a rotation-triggered rebuild landed. */
+    fprintf(f, "state=%s touch=%s keys=%d panic=%ld contacts=%d waiting=%s gen=%d\n",
             (g_want_pad || g_want_touch) ? "active" : "idle",
             g_want_touch ? "on" : "off", count_bindings(cfg), g_panic_count,
             touch_contacts_live(),
-            g_touch_wait ? "panel" : (g_pad_wait ? "pad" : "none"));
+            g_touch_wait ? "panel" : (g_pad_wait ? "pad" : "none"),
+            g_touch_gen_applied);
     fflush(f);
     fsync(fileno(f));
     fclose(f);
@@ -3585,10 +3611,53 @@ static void serve_go_idle(config_t *cfg) {
     g_retry_due_ms = -1;
 }
 
+/* The clone factory lives further down with the rest of serve startup. */
+static bool serve_create_touch_device(const config_t *cfg);
+
+/* `touch.generation` changed: throw the virtual touchscreen away and build an
+ * identical one (same cloned capabilities, name and ids).
+ *
+ * This is the cure for Android mishandling a persistent clone across display
+ * rotation -- see config_t::touch_generation. The caller re-grabs afterwards
+ * through the ordinary touch_enable() path, so a rebuild while touch is
+ * active is exactly a normal activation (neutral-wait, grab, carry-over) and
+ * a rebuild while idle grabs nothing.
+ *
+ * Nothing can be forwarded across the swap: this runs inside the SIGUSR1
+ * transition at the top of the event loop, the panel fd is closed (by
+ * touch_release_panel) before the clone fd is destroyed, and the poll set is
+ * rebuilt from g_touch_fd on every loop iteration, so no fd of a destroyed
+ * device is ever read from or written to. */
+static void serve_recreate_touch_clone(const config_t *cfg) {
+    /* Releases every contact the clone still has down -- while it can still be
+     * written to -- then drops the panel grab and fd if we hold them. */
+    touch_release_panel();
+    touch_forget_contacts();   /* slot mirror, BTN_TOUCH, implicit slot */
+    g_clone_next_tid = 0x40000000; /* remap-id space: nothing to clash with any more */
+    destroy_uinput(g_touch_uinput_fd);
+    g_touch_uinput_fd = -1;
+    /* A write that failed against the device we just destroyed must not make
+     * the loop tear the replacement down on the next iteration. */
+    g_touch_uinput_dead = false;
+    bool ok = serve_create_touch_device(cfg);
+    if (!ok) {
+        fprintf(stderr, "dpadkeys: touch: could not recreate the virtual touchscreen; "
+                        "touch stays off until the next reload\n");
+        fflush(stderr);
+    }
+    g_touch_gen_applied = cfg->touch_generation;
+    if (ok) {
+        fprintf(stderr, "dpadkeys: touch: generation %d -> recreated virtual touchscreen\n",
+                cfg->touch_generation);
+        fflush(stderr);
+    }
+}
+
 /* Makes `newcfg` the active profile. The uinput devices are never touched
- * here -- that is the entire point of serve mode -- so this is purely: let
- * go of whatever the old profile held, swap the mappings in, then acquire
- * whatever the new one wants. */
+ * here -- that is the entire point of serve mode -- except when
+ * touch.generation asks for the clone to be rebuilt, so this is otherwise
+ * purely: let go of whatever the old profile held, swap the mappings in, then
+ * acquire whatever the new one wants. */
 static void serve_apply(config_t *cfg, const config_t *newcfg, const char *device_override) {
     bool match_changed = strcmp(cfg->device_match, newcfg->device_match) != 0;
     bool touch_dev_changed = strcmp(cfg->touch_device, newcfg->touch_device) != 0;
@@ -3599,6 +3668,12 @@ static void serve_apply(config_t *cfg, const config_t *newcfg, const char *devic
 
     g_want_pad = config_wants_pad(cfg);
     g_want_touch = !cfg->idle && cfg->touch_offset_set;
+
+    /* Before the no-clone test below, so a profile that wants touch is judged
+     * against the device this reload is about to build, and before the
+     * acquisition further down, so the re-grab targets the new clone. */
+    if (cfg->touch_generation != g_touch_gen_applied) serve_recreate_touch_clone(cfg);
+
     if (g_want_touch && g_touch_uinput_fd < 0) {
         fprintf(stderr, "dpadkeys: serve: profile asks for touch.offset but there is no "
                         "virtual touchscreen; ignoring\n");
@@ -4188,6 +4263,9 @@ static int run_serve(config_t *cfg, const char *config_path, const char *device_
         if (pidfile) unlink(pidfile);
         return 1;
     }
+    /* The clone about to be created belongs to the startup config's
+     * generation, so the startup serve_apply() below must not rebuild it. */
+    g_touch_gen_applied = cfg->touch_generation;
     bool touch_ok = serve_create_touch_device(cfg);
 
     {
