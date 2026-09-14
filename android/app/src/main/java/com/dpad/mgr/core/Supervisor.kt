@@ -318,10 +318,11 @@ class Supervisor(
             delay(300)
         }
         runCatching { shell.exec(listOf("rm", "-f", STATUS)) }
-        val argv = listOf(
-            bin, "--serve", "--config", CONF, "--pidfile", PIDFILE, "--status-file", STATUS,
-            "--device-name", deviceName,
-        )
+        val argv = buildList {
+            add(bin); add("--serve"); add("--config"); add(CONF); add("--pidfile"); add(PIDFILE)
+            add("--status-file"); add(STATUS); add("--device-name"); add(deviceName)
+            if (Store.data.value.allowQ) add("--allow-q")
+        }
         val pid = shell.spawn(argv, PIDFILE)
         startedAt = System.currentTimeMillis()
         delay(400)

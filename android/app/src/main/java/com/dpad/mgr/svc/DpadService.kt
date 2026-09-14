@@ -182,6 +182,29 @@ class DpadService : Service() {
                 supervisor.restartDaemon()
                 ServiceState.lastAction.value = "Restarting daemon…"
             }
+            ACTION_ALLOW_Q -> {
+                Log.i(TAG, "action: allow Q")
+                scope.launch {
+                    val shell = probe.state.value.shell
+                    if (shell != null) {
+                        val r = runCatching { shell.exec(listOf("settings", "put", "secure", "show_ime_with_hard_keyboard", "1")) }.getOrNull()
+                        if (r?.ok != true) Log.w(TAG, "allow-q: settings put failed rc=${r?.rc} ${r?.out?.trim()?.take(120)}")
+                    } else {
+                        Log.w(TAG, "allow-q: no privileged shell; show_ime_with_hard_keyboard not set")
+                    }
+                    Store.setAllowQ(true)
+                    Log.i(TAG, "supervisor: allowQ=true")
+                    supervisor.restartDaemon()
+                    ServiceState.lastAction.value = "Q key allowed; restarting daemon…"
+                }
+            }
+            ACTION_DISALLOW_Q -> {
+                Log.i(TAG, "action: disallow Q")
+                Store.setAllowQ(false)
+                Log.i(TAG, "supervisor: allowQ=false")
+                supervisor.restartDaemon()
+                ServiceState.lastAction.value = "Q key disallowed; restarting daemon…"
+            }
             ACTION_UPDATE_CONFIG_LIVE -> {
                 val name = intent.getStringExtra(EXTRA_PROFILE)
                 val p = name?.let { Store.data.value.profile(it) }
@@ -374,6 +397,8 @@ class DpadService : Service() {
         const val ACTION_RESUME = "com.dpad.mgr.action.RESUME"
         const val ACTION_UPDATE_CONFIG_LIVE = "com.dpad.mgr.action.UPDATE_CONFIG_LIVE"
         const val ACTION_RESTART_DAEMON = "com.dpad.mgr.action.RESTART_DAEMON"
+        const val ACTION_ALLOW_Q = "com.dpad.mgr.action.ALLOW_Q"
+        const val ACTION_DISALLOW_Q = "com.dpad.mgr.action.DISALLOW_Q"
         const val ACTION_STOP_SERVICE = "com.dpad.mgr.action.STOP_SERVICE"
         const val EXTRA_PROFILE = "profile"
         const val EXTRA_SECONDS = "seconds"

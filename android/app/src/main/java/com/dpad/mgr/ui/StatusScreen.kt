@@ -21,12 +21,14 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -91,6 +93,7 @@ fun StatusScreen(modifier: Modifier = Modifier) {
         mutableStateOf(data.profiles.firstOrNull { it.name == "OSRS" }?.name ?: data.profiles.firstOrNull()?.name ?: "")
     }
     var menu by remember { mutableStateOf(false) }
+    var showAllowQDialog by remember { mutableStateOf(false) }
     val snackbarHostState = remember { SnackbarHostState() }
 
     // Battery-optimization exemption state, refreshed on resume (the user grants it in a
@@ -201,6 +204,16 @@ fun StatusScreen(modifier: Modifier = Modifier) {
                     TextButton(onClick = { DpadService.send(ctx, DpadService.ACTION_RESTART_DAEMON) }) {
                         Text("Restart daemon")
                     }
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text("Q key allowed", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                        Switch(
+                            checked = data.allowQ,
+                            onCheckedChange = { v ->
+                                if (v) showAllowQDialog = true
+                                else DpadService.send(ctx, DpadService.ACTION_DISALLOW_Q)
+                            },
+                        )
+                    }
                 }
             }
             Card(Modifier.fillMaxWidth()) {
@@ -231,6 +244,30 @@ fun StatusScreen(modifier: Modifier = Modifier) {
             }
         }
         SnackbarHost(snackbarHostState, Modifier.align(Alignment.BottomCenter))
+    }
+
+    if (showAllowQDialog) {
+        AlertDialog(
+            onDismissRequest = { showAllowQDialog = false },
+            title = { Text("Allow the Q key") },
+            text = {
+                Text(
+                    "Binding Q makes Android treat this app's virtual keyboard as a full keyboard, " +
+                        "which normally hides the on-screen keyboard everywhere while the app runs. " +
+                        "To keep the on-screen keyboard working, Android's \"Use on-screen keyboard\" " +
+                        "option under Settings > System > Languages & input > Physical keyboard must " +
+                        "be on. Allowing Q turns that option on for you and restarts the mapping " +
+                        "daemon once (you may see one \"device connected\" notice)."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showAllowQDialog = false
+                    DpadService.send(ctx, DpadService.ACTION_ALLOW_Q)
+                }) { Text("Allow") }
+            },
+            dismissButton = { TextButton(onClick = { showAllowQDialog = false }) { Text("Cancel") } },
+        )
     }
 }
 

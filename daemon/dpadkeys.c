@@ -139,6 +139,20 @@ static const struct { const char *name; int code; } KEY_TABLE[] = {
     {"KEY_SLASH",KEY_SLASH},{"KEY_SEMICOLON",KEY_SEMICOLON},{"KEY_APOSTROPHE",KEY_APOSTROPHE},
     {"KEY_GRAVE",KEY_GRAVE},{"KEY_LEFTBRACE",KEY_LEFTBRACE},{"KEY_RIGHTBRACE",KEY_RIGHTBRACE},
     {"KEY_BACKSLASH",KEY_BACKSLASH},
+    {"KEY_F13",KEY_F13},{"KEY_F14",KEY_F14},{"KEY_F15",KEY_F15},{"KEY_F16",KEY_F16},
+    {"KEY_F17",KEY_F17},{"KEY_F18",KEY_F18},{"KEY_F19",KEY_F19},{"KEY_F20",KEY_F20},
+    {"KEY_F21",KEY_F21},{"KEY_F22",KEY_F22},{"KEY_F23",KEY_F23},{"KEY_F24",KEY_F24},
+    {"KEY_CAPSLOCK",KEY_CAPSLOCK},{"KEY_RIGHTSHIFT",KEY_RIGHTSHIFT},{"KEY_RIGHTCTRL",KEY_RIGHTCTRL},
+    {"KEY_RIGHTALT",KEY_RIGHTALT},{"KEY_LEFTMETA",KEY_LEFTMETA},{"KEY_RIGHTMETA",KEY_RIGHTMETA},
+    {"KEY_MENU",KEY_MENU},{"KEY_SYSRQ",KEY_SYSRQ},{"KEY_SCROLLLOCK",KEY_SCROLLLOCK},
+    {"KEY_PAUSE",KEY_PAUSE},{"KEY_NUMLOCK",KEY_NUMLOCK},
+    {"KEY_KP0",KEY_KP0},{"KEY_KP1",KEY_KP1},{"KEY_KP2",KEY_KP2},{"KEY_KP3",KEY_KP3},{"KEY_KP4",KEY_KP4},
+    {"KEY_KP5",KEY_KP5},{"KEY_KP6",KEY_KP6},{"KEY_KP7",KEY_KP7},{"KEY_KP8",KEY_KP8},{"KEY_KP9",KEY_KP9},
+    {"KEY_KPDOT",KEY_KPDOT},{"KEY_KPENTER",KEY_KPENTER},{"KEY_KPPLUS",KEY_KPPLUS},
+    {"KEY_KPMINUS",KEY_KPMINUS},{"KEY_KPASTERISK",KEY_KPASTERISK},{"KEY_KPSLASH",KEY_KPSLASH},
+    {"KEY_VOLUMEUP",KEY_VOLUMEUP},{"KEY_VOLUMEDOWN",KEY_VOLUMEDOWN},{"KEY_MUTE",KEY_MUTE},
+    {"KEY_PLAYPAUSE",KEY_PLAYPAUSE},{"KEY_NEXTSONG",KEY_NEXTSONG},{"KEY_PREVIOUSSONG",KEY_PREVIOUSSONG},
+    {"KEY_BACK",KEY_BACK},{"KEY_HOMEPAGE",KEY_HOMEPAGE},
 };
 #define KEY_TABLE_LEN (int)(sizeof(KEY_TABLE) / sizeof(KEY_TABLE[0]))
 #define TARGET_NONE -1
@@ -232,6 +246,7 @@ static int g_uinput_fd = -1;
 static int g_pad_fd = -1;
 static bool g_grabbed = false;
 static bool g_verbose = false;
+static bool g_allow_q = false;   /* --allow-q: include KEY_Q in the --serve keyboard superset */
 static bool g_source_pressed[MAX_SOURCES] = {0};
 static int g_key_count[KEY_CNT] = {0};
 static long long g_press_seq = 0;
@@ -918,9 +933,12 @@ static long long now_ms(void) {
  * text device). Leaving one letter out keeps the device a plain KEYBOARD
  * class, so the soft keyboard still comes up in the game's chat box while
  * every other letter we might want to bind is still emittable. KEY_Q is the
- * sacrifice because no profile in this kit binds it. */
+ * sacrifice because no profile in this kit binds it.
+ *
+ * --allow-q overrides this and lets KEY_Q back into the superset, for users
+ * who have confirmed Android's "Use on-screen keyboard" override is on. */
 static bool key_in_superset(int code) {
-    if (code == KEY_Q) return false;
+    if (code == KEY_Q) return g_allow_q;
     for (int i = 0; i < KEY_TABLE_LEN; i++)
         if (KEY_TABLE[i].code == code) return true;
     return false;
@@ -2538,7 +2556,7 @@ static void print_usage(const char *argv0) {
             "[--device-name NAME] [--verbose] [--pidfile PATH] [--print-config] [--panic-chord none|SRC+SRC]\n"
             "       %s --profile fkeys|wasd [--grab] ...\n"
             "       %s --serve --config FILE [--pidfile PATH] [--status-file PATH] [--verbose]\n"
-            "                  [--device ...] [--device-name NAME] [--panic-chord none|SRC+SRC]\n"
+            "                  [--device ...] [--device-name NAME] [--panic-chord none|SRC+SRC] [--allow-q]\n"
             "       %s --learn [--learn-timeout-ms N] [--learn-hold-ms N] [--config FILE] [--device ...] [--pidfile PATH]\n"
             "       %s --learn-chord [--learn-timeout-ms N] [--config FILE] [--device ...] [--pidfile PATH]\n"
             "\n"
@@ -3863,6 +3881,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) device_override = argv[++i];
         else if (strcmp(argv[i], "--device-name") == 0 && i + 1 < argc) device_name_arg = argv[++i];
         else if (strcmp(argv[i], "--verbose") == 0) g_verbose = true;
+        else if (strcmp(argv[i], "--allow-q") == 0) g_allow_q = true;
         else if (strcmp(argv[i], "--pidfile") == 0 && i + 1 < argc) pidfile = argv[++i];
         else if (strcmp(argv[i], "--print-config") == 0) print_config_flag = true;
         else if (strcmp(argv[i], "--learn") == 0) do_learn = true;

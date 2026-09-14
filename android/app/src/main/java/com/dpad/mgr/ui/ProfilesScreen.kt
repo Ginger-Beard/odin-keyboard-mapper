@@ -174,10 +174,11 @@ fun ProfileEditor(
     var persistedName by remember { mutableStateOf(original) } // name draft is currently saved under in the Store, if any
     var binding by remember { mutableStateOf<String?>(null) } // target key name being bound
     var settingPanic by remember { mutableStateOf(false) } // panic-chord LearnDialog open
-    var showLetters by remember { mutableStateOf(false) }
+    var showUnassigned by remember { mutableStateOf(false) }
     var showSwallowed by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
     var showWheelWarning by remember { mutableStateOf(false) }
+    var showAllowQDialog by remember { mutableStateOf(false) }
     var showSaved by remember { mutableStateOf(false) }
     var savedFlashJob by remember { mutableStateOf<Job?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
@@ -411,8 +412,12 @@ fun ProfileEditor(
                         style = MaterialTheme.typography.bodySmall,
                     )
                     Spacer(Modifier.height(4.dp))
-                    Text("Game keys", style = MaterialTheme.typography.titleSmall)
-                    for (k in Keys.PRIMARY) {
+                    val assignedKeys = Keys.ALL.filter { draft.sourcesFor(it.keyName).isNotEmpty() }
+                    val assignedNames = assignedKeys.map { it.keyName }.toSet()
+                    if (assignedKeys.isEmpty()) {
+                        Text("No keys mapped yet.", style = MaterialTheme.typography.bodySmall)
+                    }
+                    for (k in assignedKeys) {
                         KeyRow(
                             k, draft.sourcesFor(k.keyName),
                             onUnbind = { src -> changeNow { d -> d.unbind(src) } },
@@ -420,18 +425,25 @@ fun ProfileEditor(
                             onWarningClick = if (k.keyName in Keys.WHEEL_TARGETS) ({ showWheelWarning = true }) else null,
                         )
                     }
-                    TextButton(modifier = Modifier.heightIn(min = 48.dp), onClick = { showLetters = !showLetters }) {
-                        Text(if (showLetters) "Hide letters" else "Letters (A–Z)…")
+                    val unassignedCount = Keys.ALL.count { it.keyName !in assignedNames }
+                    TextButton(modifier = Modifier.heightIn(min = 48.dp), onClick = { showUnassigned = !showUnassigned }) {
+                        Text(if (showUnassigned) "Hide unassigned" else "Unassigned ($unassignedCount)")
                     }
-                    if (showLetters) {
-                        Text("Letters", style = MaterialTheme.typography.titleSmall)
-                        for (k in Keys.OTHER) {
-                            KeyRow(
-                                k, draft.sourcesFor(k.keyName),
-                                onUnbind = { src -> changeNow { d -> d.unbind(src) } },
-                                onBind = { binding = k.keyName },
-                                onWarningClick = if (k.keyName in Keys.WHEEL_TARGETS) ({ showWheelWarning = true }) else null,
-                            )
+                    if (showUnassigned) {
+                        for (group in Keys.GROUPS) {
+                            val groupUnassigned = group.keys.filter { it.keyName !in assignedNames }
+                            if (groupUnassigned.isEmpty()) continue
+                            Text(group.label, style = MaterialTheme.typography.titleSmall)
+                            for (k in groupUnassigned) {
+                                KeyRow(
+                                    k, draft.sourcesFor(k.keyName),
+                                    onUnbind = { src -> changeNow { d -> d.unbind(src) } },
+                                    onBind = { binding = k.keyName },
+                                    onWarningClick = if (k.keyName in Keys.WHEEL_TARGETS) ({ showWheelWarning = true }) else null,
+                                    forceEnabled = k.keyName == "KEY_Q" && storeData.allowQ,
+                                    onAllowClick = if (k.keyName == "KEY_Q" && !storeData.allowQ) ({ showAllowQDialog = true }) else null,
+                                )
+                            }
                         }
                     }
                 }
@@ -645,6 +657,30 @@ fun ProfileEditor(
     if (showWheelWarning) {
         WheelWarningDialog(onDismiss = { showWheelWarning = false })
     }
+
+    if (showAllowQDialog) {
+        AlertDialog(
+            onDismissRequest = { showAllowQDialog = false },
+            title = { Text("Allow the Q key") },
+            text = {
+                Text(
+                    "Binding Q makes Android treat this app's virtual keyboard as a full keyboard, " +
+                        "which normally hides the on-screen keyboard everywhere while the app runs. " +
+                        "To keep the on-screen keyboard working, Android's \"Use on-screen keyboard\" " +
+                        "option under Settings > System > Languages & input > Physical keyboard must " +
+                        "be on. Allowing Q turns that option on for you and restarts the mapping " +
+                        "daemon once (you may see one \"device connected\" notice)."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showAllowQDialog = false
+                    DpadService.send(ctx, DpadService.ACTION_ALLOW_Q)
+                }) { Text("Allow") }
+            },
+            dismissButton = { TextButton(onClick = { showAllowQDialog = false }) { Text("Cancel") } },
+        )
+    }
 }
 
 /** Red, clickable "Warning: OSRS ban risk" label; opens [WheelWarningDialog] when tapped. */
@@ -684,27 +720,54 @@ private fun WheelWarningDialog(onDismiss: () -> Unit) {
     )
 }
 
-/** One target key: label, chips for each bound source (with × to unbind), and a "+ Bind" button.
- *  [onWarningClick], when non-null, renders a red clickable "Warning: OSRS ban risk" label next to
- *  the key name (used for the wheel targets). */
+/** One target key: label, chips for each bound source (with × to unbind), and a "+ Bind" button —
+ *  or, if [KeyDef.disabledReason] is set and [forceEnabled] is false, a greyed label/reason and no
+ *  bind button (still shows any existing chips, so a legacy binding to a since-disabled key stays
+ *  visible and removable). If [onAllowClick] is non-null, a clickable "Allow…" link renders next to
+ *  the reason (used for KEY_Q's opt-in confirmation flow). [onWarningClick], when non-null, renders
+ *  a red clickable "Warning: OSRS ban risk" label next to the key name (used for the wheel targets). */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun KeyRow(
     k: KeyDef, sources: List<String>, onUnbind: (String) -> Unit, onBind: () -> Unit,
-    onWarningClick: (() -> Unit)? = null,
+    onWarningClick: (() -> Unit)? = null, forceEnabled: Boolean = false, onAllowClick: (() -> Unit)? = null,
 ) {
-    Row(Modifier.fillMaxWidth().padding(vertical = 2.dp).heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text(k.label, Modifier.width(88.dp), style = MaterialTheme.typography.bodyMedium)
-        if (onWarningClick != null) {
-            WheelWarningLabel(onClick = onWarningClick)
+    val disabled = k.disabledReason != null && !forceEnabled
+    Column(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+        Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                k.label, Modifier.width(88.dp), style = MaterialTheme.typography.bodyMedium,
+                color = if (disabled) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface,
+            )
+            if (onWarningClick != null) {
+                WheelWarningLabel(onClick = onWarningClick)
+                Spacer(Modifier.width(4.dp))
+            }
+            FlowRow(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                if (sources.isEmpty()) Text("—", style = MaterialTheme.typography.bodySmall)
+                for (s in sources) SourceChip(s) { onUnbind(s) }
+            }
             Spacer(Modifier.width(4.dp))
+            if (!disabled) {
+                OutlinedButton(modifier = Modifier.heightIn(min = 48.dp), onClick = onBind) { Text("+ Bind") }
+            }
         }
-        FlowRow(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            if (sources.isEmpty()) Text("—", style = MaterialTheme.typography.bodySmall)
-            for (s in sources) SourceChip(s) { onUnbind(s) }
+        if (disabled) {
+            Row(Modifier.padding(start = 88.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    k.disabledReason!!, style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (onAllowClick != null) {
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "Allow…", style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.clickable(onClick = onAllowClick),
+                    )
+                }
+            }
         }
-        Spacer(Modifier.width(4.dp))
-        OutlinedButton(modifier = Modifier.heightIn(min = 48.dp), onClick = onBind) { Text("+ Bind") }
     }
     HorizontalDivider()
 }

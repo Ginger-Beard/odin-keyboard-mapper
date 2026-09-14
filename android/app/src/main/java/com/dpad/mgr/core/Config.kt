@@ -97,14 +97,24 @@ object SourceNames {
     fun chordLabel(chord: String): String = chord.split('+').joinToString(" + ") { plainLabel(it) }
 }
 
-/** A key the user can pick: UI label <-> daemon KEY_ name. */
-data class KeyDef(val label: String, val keyName: String, val other: Boolean = false)
+/** A key the user can pick: UI label <-> daemon KEY_ name. [disabledReason], when non-null, means the
+ *  key is visible in pickers but cannot be bound (shown greyed out with the reason below its label).
+ *  Currently only KEY_Q (Android treats a keyboard with a Q key as "full" and hides the on-screen
+ *  keyboard everywhere), but the mechanism is generic so more can be marked later. */
+data class KeyDef(val label: String, val keyName: String, val disabledReason: String? = null)
+
+/** A labeled group of [KeyDef]s, for any full grouped key list (a key picker, or the profile
+ *  editor's "Unassigned" expansion). */
+data class KeyGroup(val label: String, val keys: List<KeyDef>)
 
 object Keys {
     const val NONE = "NONE"
 
-    /** "OSRS keys": the keys a typical OSRS mobile profile needs. */
-    val PRIMARY: List<KeyDef> = buildList {
+    private const val Q_DISABLED_REASON =
+        "Not bindable: Android treats a keyboard with a Q key as a full keyboard and hides the on-screen keyboard everywhere."
+
+    /** "Game keys": the keys a typical OSRS mobile profile needs. */
+    val GAME: List<KeyDef> = buildList {
         for (i in 1..12) add(KeyDef("F$i", "KEY_F$i"))
         for (i in 0..9) add(KeyDef("$i", "KEY_$i"))
         add(KeyDef("Up", "KEY_UP"))
@@ -114,15 +124,91 @@ object Keys {
         add(KeyDef("Enter", "KEY_ENTER"))
         add(KeyDef("Space", "KEY_SPACE"))
         add(KeyDef("Esc", "KEY_ESC"))
-        add(KeyDef("Wheel up", "WHEEL_UP"))
-        add(KeyDef("Wheel down", "WHEEL_DOWN"))
     }
-    /** "Letters": A-Z plus the horizontal wheel. */
-    val OTHER: List<KeyDef> = ('A'..'Z').map { KeyDef("$it", "KEY_$it", other = true) } + listOf(
-        KeyDef("Wheel left", "HWHEEL_LEFT", other = true),
-        KeyDef("Wheel right", "HWHEEL_RIGHT", other = true),
+    val LETTERS: List<KeyDef> = ('A'..'Z').map { c ->
+        if (c == 'Q') KeyDef("Q", "KEY_Q", disabledReason = Q_DISABLED_REASON) else KeyDef("$c", "KEY_$c")
+    }
+    val FUNCTION_HIGH: List<KeyDef> = (13..24).map { KeyDef("F$it", "KEY_F$it") }
+    val EDITING: List<KeyDef> = listOf(
+        KeyDef("Tab", "KEY_TAB"),
+        KeyDef("Backspace", "KEY_BACKSPACE"),
+        KeyDef("Insert", "KEY_INSERT"),
+        KeyDef("Delete", "KEY_DELETE"),
+        KeyDef("Home", "KEY_HOME"),
+        KeyDef("End", "KEY_END"),
+        KeyDef("Page Up", "KEY_PAGEUP"),
+        KeyDef("Page Down", "KEY_PAGEDOWN"),
     )
-    val ALL: List<KeyDef> = PRIMARY + OTHER
+    val MODIFIERS: List<KeyDef> = listOf(
+        KeyDef("Left Shift", "KEY_LEFTSHIFT"),
+        KeyDef("Right Shift", "KEY_RIGHTSHIFT"),
+        KeyDef("Left Ctrl", "KEY_LEFTCTRL"),
+        KeyDef("Right Ctrl", "KEY_RIGHTCTRL"),
+        KeyDef("Left Alt", "KEY_LEFTALT"),
+        KeyDef("Right Alt", "KEY_RIGHTALT"),
+        KeyDef("Left Meta", "KEY_LEFTMETA"),
+        KeyDef("Right Meta", "KEY_RIGHTMETA"),
+        KeyDef("Caps Lock", "KEY_CAPSLOCK"),
+        KeyDef("Menu", "KEY_MENU"),
+    )
+    val NUMPAD: List<KeyDef> = buildList {
+        for (i in 0..9) add(KeyDef("Num $i", "KEY_KP$i"))
+        add(KeyDef("Num .", "KEY_KPDOT"))
+        add(KeyDef("Num Enter", "KEY_KPENTER"))
+        add(KeyDef("Num +", "KEY_KPPLUS"))
+        add(KeyDef("Num -", "KEY_KPMINUS"))
+        add(KeyDef("Num *", "KEY_KPASTERISK"))
+        add(KeyDef("Num /", "KEY_KPSLASH"))
+        add(KeyDef("Num Lock", "KEY_NUMLOCK"))
+    }
+    val PUNCTUATION: List<KeyDef> = listOf(
+        KeyDef("-", "KEY_MINUS"),
+        KeyDef("=", "KEY_EQUAL"),
+        KeyDef("[", "KEY_LEFTBRACE"),
+        KeyDef("]", "KEY_RIGHTBRACE"),
+        KeyDef("\\", "KEY_BACKSLASH"),
+        KeyDef(";", "KEY_SEMICOLON"),
+        KeyDef("'", "KEY_APOSTROPHE"),
+        KeyDef("`", "KEY_GRAVE"),
+        KeyDef(",", "KEY_COMMA"),
+        KeyDef(".", "KEY_DOT"),
+        KeyDef("/", "KEY_SLASH"),
+    )
+    val MEDIA_SYSTEM: List<KeyDef> = listOf(
+        KeyDef("Volume Up", "KEY_VOLUMEUP"),
+        KeyDef("Volume Down", "KEY_VOLUMEDOWN"),
+        KeyDef("Mute", "KEY_MUTE"),
+        KeyDef("Play/Pause", "KEY_PLAYPAUSE"),
+        KeyDef("Next", "KEY_NEXTSONG"),
+        KeyDef("Previous", "KEY_PREVIOUSSONG"),
+        KeyDef("Back", "KEY_BACK"),
+        KeyDef("Home Page", "KEY_HOMEPAGE"),
+        KeyDef("Print Screen", "KEY_SYSRQ"),
+        KeyDef("Scroll Lock", "KEY_SCROLLLOCK"),
+        KeyDef("Pause", "KEY_PAUSE"),
+    )
+    /** The four scroll-wheel targets: bound via mouse scroll events, which carry the OSRS ban-risk warning. */
+    val WHEEL: List<KeyDef> = listOf(
+        KeyDef("Wheel up", "WHEEL_UP"),
+        KeyDef("Wheel down", "WHEEL_DOWN"),
+        KeyDef("Wheel left", "HWHEEL_LEFT"),
+        KeyDef("Wheel right", "HWHEEL_RIGHT"),
+    )
+
+    /** Every group, in display order, for any full grouped key list (a key picker, or the editor's
+     *  "Unassigned" expansion). */
+    val GROUPS: List<KeyGroup> = listOf(
+        KeyGroup("Game keys", GAME),
+        KeyGroup("Letters", LETTERS),
+        KeyGroup("Function F13–F24", FUNCTION_HIGH),
+        KeyGroup("Editing", EDITING),
+        KeyGroup("Modifiers", MODIFIERS),
+        KeyGroup("Numpad", NUMPAD),
+        KeyGroup("Punctuation", PUNCTUATION),
+        KeyGroup("Media & system", MEDIA_SYSTEM),
+        KeyGroup("Mouse wheel", WHEEL),
+    )
+    val ALL: List<KeyDef> = GROUPS.flatMap { it.keys }
     private val byName = ALL.associateBy { it.keyName }
 
     fun label(keyName: String?): String = when (keyName) {
@@ -131,8 +217,7 @@ object Keys {
     }
     fun isValid(keyName: String): Boolean = keyName == NONE || byName.containsKey(keyName)
 
-    /** The four scroll-wheel targets: bound via mouse scroll events, which carry the OSRS ban-risk warning. */
-    val WHEEL_TARGETS: Set<String> = setOf("WHEEL_UP", "WHEEL_DOWN", "HWHEEL_LEFT", "HWHEEL_RIGHT")
+    val WHEEL_TARGETS: Set<String> = WHEEL.map { it.keyName }.toSet()
 }
 
 @Serializable
@@ -229,6 +314,12 @@ data class AppData(
     val profiles: List<Profile> = Profile.DEFAULTS,
     /** package -> profile name. Absent = Off. */
     val assignments: Map<String, String> = emptyMap(),
+    /** Global (not per-profile) opt-in: when true, the --serve daemon is started with --allow-q,
+     *  making KEY_Q bindable. Off by default because binding Q makes Android treat the app's
+     *  virtual keyboard as "full" and hide the on-screen keyboard everywhere unless the user has
+     *  turned on Android's "Use on-screen keyboard" override (Settings > System > Languages &
+     *  input > Physical keyboard) -- see the confirmation dialog in ProfilesScreen.kt. */
+    val allowQ: Boolean = false,
 ) {
     fun profile(name: String?): Profile? = name?.let { n -> profiles.firstOrNull { it.name == n } }
     fun profileFor(pkg: String): Profile? = profile(assignments[pkg])

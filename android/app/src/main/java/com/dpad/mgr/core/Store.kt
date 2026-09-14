@@ -94,4 +94,6 @@ object Store {
     fun assign(pkg: String, profileName: String?) = update { d ->
         d.copy(assignments = if (profileName == null) d.assignments - pkg else d.assignments + (pkg to profileName))
     }
+
+    fun setAllowQ(v: Boolean) = update { d -> d.copy(allowQ = v) }
 }
