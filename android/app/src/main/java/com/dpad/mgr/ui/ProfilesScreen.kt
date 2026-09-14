@@ -405,7 +405,6 @@ fun ProfileEditor(
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text("Keys", style = MaterialTheme.typography.titleMedium)
-                    WheelWarningLabel(onClick = { showWheelWarning = true })
                     Text(
                         "To bind a combo, hold a button while pressing the control during Bind.",
                         style = MaterialTheme.typography.bodySmall,
@@ -458,10 +457,7 @@ fun ProfileEditor(
                         },
                         valueRange = 0.2f..0.8f, steps = 11,
                     )
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("Wheel repeat: ${draft.wheelRepeatMs} ms", style = MaterialTheme.typography.bodyMedium)
-                        WheelWarningLabel(onClick = { showWheelWarning = true })
-                    }
+                    Text("Wheel repeat: ${draft.wheelRepeatMs} ms", style = MaterialTheme.typography.bodyMedium)
                     Slider(
                         value = draft.wheelRepeatMs.toFloat(),
                         onValueChange = { v ->
