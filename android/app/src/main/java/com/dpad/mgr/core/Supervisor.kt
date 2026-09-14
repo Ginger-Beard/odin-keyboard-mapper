@@ -60,6 +60,9 @@ class Supervisor(
     private val scope: CoroutineScope,
     private val shellProvider: () -> PrivShell?,
     private val installer: BinaryInstaller,
+    /** Passed to the daemon as `--device-name`, so its virtual devices (the keyboard+mouse
+     *  device and the "<name> Touch" touchscreen clone) are named after this app. */
+    private val deviceName: String,
     private val onFailed: (String) -> Unit,
     private val onPanic: (profileName: String) -> Unit = {},
 ) {
@@ -315,7 +318,10 @@ class Supervisor(
             delay(300)
         }
         runCatching { shell.exec(listOf("rm", "-f", STATUS)) }
-        val argv = listOf(bin, "--serve", "--config", CONF, "--pidfile", PIDFILE, "--status-file", STATUS)
+        val argv = listOf(
+            bin, "--serve", "--config", CONF, "--pidfile", PIDFILE, "--status-file", STATUS,
+            "--device-name", deviceName,
+        )
         val pid = shell.spawn(argv, PIDFILE)
         startedAt = System.currentTimeMillis()
         delay(400)

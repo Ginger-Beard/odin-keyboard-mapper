@@ -55,6 +55,7 @@
 /* Tag stamped on our virtual touchscreen (UI_SET_PHYS, and UI_SET_UNIQ if a
  * kernel ever grows one) so the daemon can recognise its own device. */
 #define TOUCH_SELF_TAG "dpadkeys-touch"
+#define DEFAULT_DEVICE_NAME "Odin DPad Keys"
 
 static bool evdev_is_virtual(const char *devpath);
 
@@ -205,6 +206,13 @@ typedef struct {
     int touch_dx, touch_dy;
     char touch_device[64]; /* explicit /dev/input/eventN, or empty = auto */
 } config_t;
+
+/* --device-name NAME (default "Odin DPad Keys"): names the keyboard+mouse
+ * uinput device; the touchscreen clone is named "<NAME> Touch". Both are
+ * sanitized (control characters stripped) and truncated to fit
+ * UINPUT_MAX_NAME_SIZE-1 bytes -- see sanitize_device_name() in main(). */
+static char g_device_name[UINPUT_MAX_NAME_SIZE] = DEFAULT_DEVICE_NAME;
+static char g_touch_device_name[UINPUT_MAX_NAME_SIZE] = DEFAULT_DEVICE_NAME " Touch";
 
 static volatile sig_atomic_t g_running = 1;
 static int g_uinput_fd = -1;
@@ -779,7 +787,7 @@ static bool key_in_superset(int code) {
     return false;
 }
 
-/* Creates the "Odin DPad Keys" uinput device with exactly the EV_KEY codes
+/* Creates the g_device_name (default "Odin DPad Keys") uinput device with exactly the EV_KEY codes
  * flagged in `used` (KEY_CNT entries), plus -- when `want_pointer` -- the
  * EV_REL axes and mouse buttons a wheel target needs. Callers:
  * open_uinput() (one-shot mode: only the keys this config uses) and
@@ -825,7 +833,7 @@ static int open_uinput_dev(const bool *used, bool want_pointer) {
     usetup.id.vendor = 0;
     usetup.id.product = 0;
     usetup.id.version = 2;
-    strncpy(usetup.name, "Odin DPad Keys", sizeof(usetup.name) - 1);
+    strncpy(usetup.name, g_device_name, sizeof(usetup.name) - 1);
     if (ioctl(fd, UI_DEV_SETUP, &usetup) < 0) {
         perror("UI_DEV_SETUP");
         close(fd);
@@ -838,7 +846,7 @@ static int open_uinput_dev(const bool *used, bool want_pointer) {
     }
 #else
     struct uinput_user_dev uud = {0};
-    strncpy(uud.name, "Odin DPad Keys", sizeof(uud.name) - 1);
+    strncpy(uud.name, g_device_name, sizeof(uud.name) - 1);
     uud.id.bustype = BUS_VIRTUAL;
     uud.id.vendor = 0;
     uud.id.product = 0;
@@ -1500,7 +1508,8 @@ static void offset_touch_event(const config_t *cfg, struct input_event *ev) {
 
 /* Creates the virtual touchscreen once at startup, copying the real panel's
  * EV_KEY/EV_ABS capabilities (with identical absinfo via UI_ABS_SETUP) and
- * INPUT_PROP bits, name "fts_ts", and bus/vendor/product/version from the
+ * INPUT_PROP bits, name "<device name> Touch" (dev_name, see g_touch_device_name),
+ * and bus/vendor/product/version from the
  * panel's EVIOCGID. Kept alive across panel re-detects.
  *
  * Android: EventHub classifies this as a second internal (bus 0x18 is neither
@@ -1813,7 +1822,7 @@ static touch_enable_result_t touch_enable(const config_t *cfg) {
     query_touch_axes(g_touch_fd);
 
     if (g_touch_uinput_fd < 0) {
-        g_touch_uinput_fd = open_touch_uinput(g_touch_fd, &touch_id, "fts_ts");
+        g_touch_uinput_fd = open_touch_uinput(g_touch_fd, &touch_id, g_touch_device_name);
         if (g_touch_uinput_fd < 0) {
             fprintf(stderr, "dpadkeys: touch: could not create virtual touchscreen\n");
             close(g_touch_fd);
@@ -1821,7 +1830,7 @@ static touch_enable_result_t touch_enable(const config_t *cfg) {
             return TOUCH_ENABLE_ERR_UINPUT;
         }
         created_here = true;
-        fprintf(stderr, "dpadkeys: touch: created virtual touchscreen \"fts_ts\" (from %s)\n", g_touch_path);
+        fprintf(stderr, "dpadkeys: touch: created virtual touchscreen \"%s\" (from %s)\n", g_touch_device_name, g_touch_path);
     }
 
     if (ioctl(g_touch_fd, EVIOCGRAB, 1) < 0) {
@@ -2020,13 +2029,28 @@ static void print_banner(const char *pad_path, const char *pad_name, unsigned sh
 
 /* ---- main ---- */
 
+/* Copies src into dst (a dstsize-byte buffer), stripping ASCII control
+ * characters (including DEL) so a hostile/garbled --device-name can't smuggle
+ * one into a uinput device name, and truncating to fit dstsize (callers pass
+ * sizeof(g_device_name) == UINPUT_MAX_NAME_SIZE, so the result is always
+ * within uinput's UINPUT_MAX_NAME_SIZE-1 limit). Always NUL-terminates. */
+static void sanitize_device_name(char *dst, size_t dstsize, const char *src) {
+    size_t j = 0;
+    for (size_t i = 0; src[i] != '\0' && j + 1 < dstsize; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c < 0x20 || c == 0x7f) continue; /* strip control chars */
+        dst[j++] = (char)c;
+    }
+    dst[j] = '\0';
+}
+
 static void print_usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s --config FILE [--grab] [--list] [--device auto|/dev/input/eventN] "
-            "[--verbose] [--pidfile PATH] [--print-config] [--panic-chord none|m1+m2]\n"
+            "[--device-name NAME] [--verbose] [--pidfile PATH] [--print-config] [--panic-chord none|m1+m2]\n"
             "       %s --profile fkeys|wasd [--grab] ...\n"
             "       %s --serve --config FILE [--pidfile PATH] [--status-file PATH] [--verbose]\n"
-            "                  [--device ...] [--panic-chord none|m1+m2]\n"
+            "                  [--device ...] [--device-name NAME] [--panic-chord none|m1+m2]\n"
             "       %s --learn [--learn-timeout-ms N] [--learn-hold-ms N] [--config FILE] [--device ...] [--pidfile PATH]\n"
             "\n"
             "--serve keeps ONE daemon alive for as long as the supervising app holds its\n"
@@ -2034,6 +2058,10 @@ static void print_usage(const char *argv0) {
             "cloned touchscreen -- are created once at startup and destroyed only at exit, so\n"
             "switching profiles never makes an input device appear or disappear (which is what\n"
             "makes the system mapper toast \"<device> connected\" on every game launch).\n"
+            "\n"
+            "--device-name NAME renames the keyboard+mouse uinput device (default \"Odin DPad\n"
+            "Keys\"); the cloned touchscreen is always named \"NAME Touch\". Control characters\n"
+            "are stripped and the result is truncated to fit uinput's 79-character name limit.\n"
             "\n"
             "The config file is the active profile. Rewrite it and send SIGUSR1 to switch:\n"
             "the whole file is re-read and the daemon transitions between states.\n"
@@ -2697,15 +2725,15 @@ static bool serve_create_touch_device(const config_t *cfg) {
     if (ioctl(fd, EVIOCGNAME(sizeof(g_touch_name)), g_touch_name) < 0)
         snprintf(g_touch_name, sizeof(g_touch_name), "?");
     query_touch_axes(fd);
-    g_touch_uinput_fd = open_touch_uinput(fd, &touch_id, "fts_ts");
+    g_touch_uinput_fd = open_touch_uinput(fd, &touch_id, g_touch_device_name);
     close(fd);
     if (g_touch_uinput_fd < 0) {
         fprintf(stderr, "dpadkeys: serve: could not create the virtual touchscreen\n");
         fflush(stderr);
         return false;
     }
-    fprintf(stderr, "dpadkeys: serve: created virtual touchscreen \"fts_ts\" (cloned from %s \"%s\")\n",
-            g_touch_path, g_touch_name);
+    fprintf(stderr, "dpadkeys: serve: created virtual touchscreen \"%s\" (cloned from %s \"%s\")\n",
+            g_touch_device_name, g_touch_path, g_touch_name);
     fflush(stderr);
     return true;
 }
@@ -3053,6 +3081,7 @@ int main(int argc, char **argv) {
     long long learn_timeout_ms = 15000;
     long long learn_hold_ms = 150;
     const char *device_override = NULL;
+    const char *device_name_arg = NULL;
     const char *pidfile = NULL;
 
     for (int i = 1; i < argc; i++) {
@@ -3062,6 +3091,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--list") == 0) do_list = true;
         else if (strcmp(argv[i], "--dump") == 0) do_dump = true;
         else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) device_override = argv[++i];
+        else if (strcmp(argv[i], "--device-name") == 0 && i + 1 < argc) device_name_arg = argv[++i];
         else if (strcmp(argv[i], "--verbose") == 0) g_verbose = true;
         else if (strcmp(argv[i], "--pidfile") == 0 && i + 1 < argc) pidfile = argv[++i];
         else if (strcmp(argv[i], "--print-config") == 0) print_config_flag = true;
@@ -3082,6 +3112,10 @@ int main(int argc, char **argv) {
         else { print_usage(argv[0]); return 1; }
     }
     if (device_override && strcmp(device_override, "auto") == 0) device_override = NULL;
+
+    if (device_name_arg) sanitize_device_name(g_device_name, sizeof(g_device_name), device_name_arg);
+    if (g_device_name[0] == '\0') sanitize_device_name(g_device_name, sizeof(g_device_name), DEFAULT_DEVICE_NAME);
+    snprintf(g_touch_device_name, sizeof(g_touch_device_name), "%s Touch", g_device_name);
 
     if (do_dump) {
         struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_handler = on_signal;

@@ -131,6 +131,7 @@ line):
 --print-config             print the effective config and exit
 --panic-chord none|m1+m2  chord that disables an active touch offset
 --device auto|/dev/input/eventN
+--device-name NAME        name the virtual devices (default "Odin DPad Keys"; touch clone is "NAME Touch")
 --verbose
 --pidfile PATH
 ```

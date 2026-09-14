@@ -11,6 +11,7 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import com.dpad.mgr.R
 import com.dpad.mgr.core.BinaryInstaller
 import com.dpad.mgr.core.DaemonState
 import com.dpad.mgr.core.ForegroundWatcher
@@ -66,12 +67,13 @@ class DpadService : Service() {
         super.onCreate()
         Store.init(this)
         createChannels()
-        startForeground(NOTIF_ID, buildNotification("Odin DPad Keys active"))
+        startForeground(NOTIF_ID, buildNotification("${getString(R.string.app_name)} active"))
         probe = PrivProbe(this)
         installer = BinaryInstaller(this)
         watcher = ForegroundWatcher(this, scope)
         supervisor = Supervisor(
             scope, { probe.state.value.shell }, installer,
+            deviceName = getString(R.string.app_name),
             onFailed = { reason -> notifyFailed(reason) },
             onPanic = { profile -> notifyPanic(profile) },
         )
@@ -307,7 +309,7 @@ class DpadService : Service() {
         val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         return Notification.Builder(this, CH_STATUS)
             .setSmallIcon(android.R.drawable.ic_menu_directions)
-            .setContentTitle("Odin DPad Keys active")
+            .setContentTitle("${getString(R.string.app_name)} active")
             .setContentText(text)
             .setContentIntent(pi)
             .setOngoing(true)
