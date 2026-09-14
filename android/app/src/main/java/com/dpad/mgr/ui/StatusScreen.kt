@@ -85,6 +85,13 @@ private fun isIgnoringBatteryOptimizations(ctx: Context): Boolean {
     return pm.isIgnoringBatteryOptimizations(ctx.packageName)
 }
 
+/** Second hero-card line while the daemon is holding off the grab for a still-held touch/button. */
+private fun waitingLine(waitingFor: String?): String? = when (waitingFor) {
+    "panel" -> "Lift your finger from the screen to start mapping"
+    "pad" -> "Release the controller buttons to start mapping"
+    else -> null
+}
+
 private fun isDaemonActive(d: DaemonState): Boolean = when (d) {
     is DaemonState.Running, is DaemonState.Testing, is DaemonState.Starting, is DaemonState.Backoff -> true
     else -> false
@@ -170,7 +177,7 @@ fun StatusScreen(modifier: Modifier = Modifier, onOpenApps: () -> Unit = {}) {
                             tone = HeroTone.ACTIVE,
                             title = "Mapping ${appLabel(ctx, d.pkg)}",
                             subtitle = "Profile: ${d.profile}",
-                            extraLines = listOfNotNull(chordLine),
+                            extraLines = listOfNotNull(waitingLine(d.waitingFor), chordLine),
                             actionLabel = "Pause",
                             onAction = { DpadService.send(ctx, DpadService.ACTION_STOP_DAEMON) },
                         )
@@ -180,6 +187,7 @@ fun StatusScreen(modifier: Modifier = Modifier, onOpenApps: () -> Unit = {}) {
                         tone = HeroTone.ACTIVE,
                         title = "Testing ${d.profile}",
                         subtitle = "${remainingSec ?: 0} s left",
+                        extraLines = listOfNotNull(waitingLine(d.waitingFor)),
                         actionLabel = "Stop",
                         onAction = { DpadService.send(ctx, DpadService.ACTION_STOP_TEST) },
                     )

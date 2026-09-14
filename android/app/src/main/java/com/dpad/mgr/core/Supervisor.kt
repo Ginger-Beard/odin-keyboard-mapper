@@ -21,10 +21,12 @@ sealed class DaemonState {
     data object Starting : DaemonState()
     /** The serve daemon is up and idle: nothing grabbed, the pad works normally. */
     data object Idle : DaemonState()
-    /** Serving and actively mapping [profile] for foreground app [pkg]. */
-    data class Running(val pkg: String, val profile: String, val pid: Int) : DaemonState()
+    /** Serving and actively mapping [profile] for foreground app [pkg]. [waitingFor] is
+     *  `"panel"`/`"pad"` while the daemon is holding off the grab for a still-held touch or
+     *  button, null otherwise. */
+    data class Running(val pkg: String, val profile: String, val pid: Int, val waitingFor: String? = null) : DaemonState()
     /** Serving and actively mapping [profile] as a manual test / calibration verify. */
-    data class Testing(val profile: String, val pid: Int) : DaemonState()
+    data class Testing(val profile: String, val pid: Int, val waitingFor: String? = null) : DaemonState()
     data class Backoff(val attempt: Int, val untilMs: Long, val reason: String) : DaemonState()
     data class Failed(val reason: String) : DaemonState()
     /** The panic chord fired: the daemon went idle and touch offset was disabled for [profile]. */
@@ -45,8 +47,15 @@ sealed class DaemonState {
 
 private data class Target(val pkg: String?, val profile: Profile)
 
-/** One parsed line of the daemon's status file: `state=… touch=… keys=N panic=C`. */
-private data class Status(val state: String, val touch: String, val keys: Int, val panic: Int, val raw: String)
+/** One parsed line of the daemon's status file: `state=… touch=… keys=N panic=C waiting=panel|pad|none`. */
+private data class Status(
+    val state: String,
+    val touch: String,
+    val keys: Int,
+    val panic: Int,
+    val waiting: String?,
+    val raw: String,
+)
 
 /**
  * Owns exactly ONE long-lived `dpadkeys --serve` process per privilege session: it creates the
@@ -80,6 +89,11 @@ class Supervisor(
     @Volatile private var suspended = false
     @Volatile private var learning = false
     @Volatile private var restartRequested = false
+    /** Live display rotation (0..3), fed in by DpadService. -1 = not yet seeded, so the first
+     *  call from DpadService always applies (and logs) regardless of what it reads. Device state,
+     *  not part of the Profile model -- see [setDisplayRotation]. */
+    @Volatile private var displayRotation: Int = -1
+    private var rotationDebounceJob: Job? = null
 
     // ---- the one serve daemon ----
     private var servePid = -1
@@ -90,6 +104,8 @@ class Supervisor(
     private var appliedTarget: Target? = null
     private var lastPanic = 0
     private var lastStatusRaw = ""
+    /** Most recently read `waiting` value ("panel"/"pad"/null); also drives the once-per-change log. */
+    private var lastWaiting: String? = null
 
     private var pointerRefreshJob: Job? = null
     private var pointerHidden = false
@@ -185,6 +201,30 @@ class Supervisor(
         Log.i(TAG, "supervisor: resumed")
         wake.trySend(Unit)
     }
+
+    /**
+     * Feeds in the live display rotation (called by DpadService: once at service start, on every
+     * DisplayListener callback, and whenever the serve daemon (re)spawns). Reference orientation
+     * is rotation 1 (forced-landscape), since the panel itself is portrait-native -- so the
+     * compensation the daemon needs is `(rotation - 1) and 3`. This is device state, not part of
+     * the Profile model: it just gets appended to whatever config text is next written to CONF.
+     * If a touch-offset profile is currently active, debounces 200 ms then wakes the reconcile
+     * loop, which rewrites the current config in place via the existing apply() path (no respawn).
+     */
+    fun setDisplayRotation(rotation: Int) {
+        if (displayRotation == rotation) return
+        displayRotation = rotation
+        Log.i(TAG, "supervisor: rotation=$rotation touch.rotation=${touchRotationN()}")
+        rotationDebounceJob?.cancel()
+        rotationDebounceJob = scope.launch { delay(200); wake.trySend(Unit) }
+    }
+
+    private fun touchRotationN(): Int = (displayRotation - 1) and 3
+
+    /** Appends the device's touch-rotation compensation to config text about to be written to
+     *  CONF. Always appended (harmless when touch isn't in play/idle) so it's simplest to reason
+     *  about from logcat and the CONF file alike. */
+    private fun withTouchRotation(conf: String): String = conf + "touch.rotation ${touchRotationN()}\n"
 
     /**
      * Forces the daemon idle so a one-shot `--learn` invocation can grab the pad, and waits (up to
@@ -301,7 +341,7 @@ class Supervisor(
 
         // 3. make the active config match what should be active now
         val want = wanted()
-        val conf = want?.profile?.toConfigText() ?: IDLE_CONF
+        val conf = withTouchRotation(want?.profile?.toConfigText() ?: IDLE_CONF)
         if (conf != appliedConf) apply(shell, want, conf) else syncState(want)
     }
 
@@ -365,8 +405,8 @@ class Supervisor(
         if (failedLatched) return
         val s = when {
             want == null -> DaemonState.Idle
-            want.pkg != null -> DaemonState.Running(want.pkg, want.profile.name, servePid)
-            else -> DaemonState.Testing(want.profile.name, servePid)
+            want.pkg != null -> DaemonState.Running(want.pkg, want.profile.name, servePid, lastWaiting)
+            else -> DaemonState.Testing(want.profile.name, servePid, lastWaiting)
         }
         if (_state.value != s) _state.value = s
     }
@@ -382,7 +422,12 @@ class Supervisor(
             if (i <= 0) null else tok.substring(0, i) to tok.substring(i + 1)
         }.toMap()
         val state = kv["state"] ?: return null
-        return Status(state, kv["touch"] ?: "?", kv["keys"]?.toIntOrNull() ?: 0, kv["panic"]?.toIntOrNull() ?: 0, line)
+        val waiting = kv["waiting"]?.takeIf { it == "panel" || it == "pad" }
+        if (waiting != lastWaiting) {
+            lastWaiting = waiting
+            if (waiting != null) Log.i(TAG, "supervisor: waiting for $waiting")
+        }
+        return Status(state, kv["touch"] ?: "?", kv["keys"]?.toIntOrNull() ?: 0, kv["panic"]?.toIntOrNull() ?: 0, waiting, line)
     }
 
     /** Polls the status file for up to 1 s waiting for [expectState]; returns the last line read. */
@@ -470,7 +515,7 @@ class Supervisor(
      *  from logcat whether touch.offset made it into the config that was actually signalled. */
     private fun activateLogLine(profile: String, conf: String): String {
         val directives = setOf(
-            "deadzone", "ls.invert_y", "ls.invert_x", "rs.invert_y", "rs.invert_x", "wheel_repeat_ms", "touch.offset", "idle",
+            "deadzone", "ls.invert_y", "ls.invert_x", "rs.invert_y", "rs.invert_x", "wheel_repeat_ms", "touch.offset", "touch.rotation", "idle",
         )
         var touch = "off"
         var keys = 0

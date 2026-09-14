@@ -232,6 +232,18 @@ typedef struct {
     bool touch_offset_set;
     int touch_dx, touch_dy;
     char touch_device[64]; /* explicit /dev/input/eventN, or empty = auto */
+
+    /* touch.rotation: quarter-turns (0-3) the daemon must apply to incoming
+     * real-panel coordinates before replaying them to the clone, to compensate
+     * for the clone's stale device orientation after a display flip. This is a
+     * COMPENSATION delta owned by the app, not the raw display rotation: the
+     * app computes it as (currentDisplayRotation - referenceRotation) & 3,
+     * where referenceRotation is the orientation at which the clone last landed
+     * correctly (on the Odin's forced-landscape panel that is rotation 1, so in
+     * practice this is 0 normally and 2 after a 180 flip). 0 = passthrough, the
+     * exact pre-existing behaviour. See offset_touch_event(). Fed live over the
+     * config file + SIGUSR1; never needs the clone recreated. */
+    int touch_rotation;
 } config_t;
 
 /* --device-name NAME (default "Odin DPad Keys"): names the keyboard+mouse
@@ -284,6 +296,29 @@ static int g_status_contacts = -1;         /* contacts= as last written */
 static long long g_status_written_ms = -1; /* when the file was last written */
 static long long g_retry_due_ms = -1;      /* next acquisition retry, -1 = none */
 #define SERVE_RETRY_MS 500
+
+/* ---- grab-when-neutral ----
+ *
+ * EVIOCGRAB is not a snapshot: whatever is DOWN on a device at the instant we
+ * grab it never gets its release delivered to anyone else, because the release
+ * event arrives after the grab and is ours alone. Android is left holding a
+ * phantom pointer on the real panel (so every touch through the clone lands as
+ * a *second* pointer -- pinch/pan, "off by half a screen") or a phantom button
+ * on the real pad, for the whole active period.
+ *
+ * So the rule is: NEVER grab a device that is not neutral. Both devices are
+ * opened ungrabbed first; while a contact/button is still down the daemon
+ * merely consumes their events (reading an ungrabbed evdev node drains only
+ * our own client buffer -- Android still gets its copy) and re-checks the
+ * kernel's authoritative state after every SYN_REPORT, grabbing on the very
+ * frame that completes the release. Capped, because a device whose key/slot
+ * state is latched would otherwise never activate; past the cap we grab anyway
+ * and fall back to the old carry-over (touch_sync_initial_contacts). */
+#define GRAB_WAIT_MAX_MS 10000
+static bool g_pad_wait = false;             /* pad open + ungrabbed, waiting for neutral */
+static long long g_pad_wait_since_ms = -1;
+static bool g_touch_wait = false;           /* panel open + ungrabbed, waiting for release */
+static long long g_touch_wait_since_ms = -1;
 
 /* Self-pipe, so a signal that lands between the g_reload_req test and poll()
  * still wakes the loop. This matters far more in serve mode than it used to:
@@ -399,6 +434,7 @@ static void init_config(config_t *cfg) {
     cfg->touch_dx = 0;
     cfg->touch_dy = 0;
     cfg->touch_device[0] = '\0';
+    cfg->touch_rotation = 0;
     cfg->n_panic = 0;
     for (int i = 0; i < MAX_PANIC_SRC; i++) cfg->panic_src[i] = -1;
 }
@@ -745,6 +781,11 @@ static bool load_config_file(const char *path, config_t *cfg, bool lenient) {
             cfg->touch_offset_set = true;
             continue;
         }
+        if (strcmp(tok1, "touch.rotation") == 0) {
+            int r = atoi(tok2);
+            cfg->touch_rotation = ((r % 4) + 4) % 4;
+            continue;
+        }
         if (strcmp(tok1, "panic") == 0) {
             parse_panic_spec(cfg, tok2, path, lineno);
             continue;
@@ -888,6 +929,7 @@ static void print_config(const config_t *cfg, FILE *out) {
     else
         fprintf(out, "%-12s %s\n", "touch.offset", "off");
     fprintf(out, "%-12s %s\n", "touch.device", cfg->touch_device[0] ? cfg->touch_device : "auto");
+    fprintf(out, "%-12s %d\n", "touch.rotation", cfg->touch_rotation);
 }
 
 /* ---- uinput device ---- */
@@ -1274,6 +1316,64 @@ static bool classify_trigger(int raw, const axis_t *a, double deadzone) {
 #define DIR_D 2u
 #define DIR_L 4u
 #define DIR_R 8u
+
+/* One axis at rest? Queried straight from the kernel (EVIOCGABS), classified
+ * with the same thresholds the event path uses but with the hysteresis state
+ * forced to 0, so "at rest" here means the same thing as "would not fire a
+ * press" there. An axis we cannot read is treated as at rest: refusing to
+ * activate over an ioctl failure would be worse than the phantom it guards. */
+static bool abs_axis_at_rest(int fd, const axis_t *a, double deadzone) {
+    if (!a->present) return true;
+    struct input_absinfo info;
+    if (ioctl(fd, EVIOCGABS(a->code), &info) < 0) return true;
+    axis_t probe = *a;
+    probe.state = 0;
+    if (probe.unipolar) return !classify_trigger(info.value, &probe, deadzone);
+    return classify_stick(info.value, &probe, deadzone) == 0;
+}
+
+/* True if nothing on the pad is being held: no button among the device's own
+ * EV_KEY bits is down, every detected stick/trigger axis is inside the
+ * deadzone, and the hat is centred. `why` (optional) gets a short description
+ * of the first thing found held, for the cap warning.
+ *
+ * Requires detect_axes() to have run on `fd` -- all read-only ioctls, so it is
+ * safe to call before the grab. Raw `abs:` sources are not re-checked
+ * separately: in practice they name one of the axes below, and every raw
+ * `key:` source is covered by the EV_KEY scan. */
+static bool pad_neutral(int fd, const config_t *cfg, char *why, size_t whysz) {
+    if (why && whysz) why[0] = '\0';
+    unsigned long keybits[NLONGS(KEY_CNT)] = {0}, keystate[NLONGS(KEY_CNT)] = {0};
+    ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybits)), keybits);
+    if (ioctl(fd, EVIOCGKEY(sizeof(keystate)), keystate) >= 0) {
+        for (int c = 0; c < KEY_CNT; c++) {
+            if (!TEST_BIT(c, keybits) || !TEST_BIT(c, keystate)) continue;
+            if (why && whysz) snprintf(why, whysz, "key 0x%x is held", c);
+            return false;
+        }
+    }
+    static const char *anames[] = { "left stick X", "left stick Y", "right stick X",
+                                    "right stick Y", "left trigger", "right trigger" };
+    const axis_t *axes[6] = { &g_ax.ls_x, &g_ax.ls_y, &g_ax.rs_x,
+                              &g_ax.rs_y, &g_ax.lt, &g_ax.rt };
+    for (int i = 0; i < 6; i++) {
+        if (abs_axis_at_rest(fd, axes[i], cfg->deadzone)) continue;
+        if (why && whysz) snprintf(why, whysz, "%s is off rest", anames[i]);
+        return false;
+    }
+    if (g_ax.has_hat) {
+        struct input_absinfo info;
+        if (ioctl(fd, EVIOCGABS(ABS_HAT0X), &info) == 0 && info.value != 0) {
+            if (why && whysz) snprintf(why, whysz, "the d-pad is held");
+            return false;
+        }
+        if (ioctl(fd, EVIOCGABS(ABS_HAT0Y), &info) == 0 && info.value != 0) {
+            if (why && whysz) snprintf(why, whysz, "the d-pad is held");
+            return false;
+        }
+    }
+    return true;
+}
 
 /* 2-D stick -> 8-way digital. Magnitude gate (deadzone, with 0.1 hysteresis),
  * then the angle picks one of eight 45-degree sectors; diagonal sectors press
@@ -1665,9 +1765,22 @@ static bool touch_pos_in_range(int x, int y) {
     return true;
 }
 
-/* Applies the configured offset to one event in place, clamped to that axis'
- * reported range. Only the four position axes are touched; MAJOR, SLOT,
- * TRACKING_ID, BTN_TOUCH, timestamps and everything else pass through. */
+/* Applies the configured rotation-compensation and offset to one event in
+ * place, clamped to that axis' reported range. Only the four position axes are
+ * touched; MAJOR, SLOT, TRACKING_ID, BTN_TOUCH, timestamps and everything else
+ * pass through.
+ *
+ * Rotation (cfg->touch_rotation, quarter-turns) is applied FIRST, then the
+ * stylus offset, both in the clone's (panel-native) coordinate box:
+ *   0  passthrough -- byte-for-byte the old behaviour.
+ *   2  180 flip: each position axis is mirrored about its own centre
+ *      (v -> min+max-v). A 180 rotation is separable per axis, so BTN_TOUCH,
+ *      slots and tracking ids are untouched and no cross-axis state is needed.
+ *   1,3  90/270: cannot be represented on a panel-native (portrait) clone
+ *      without swapping the X/Y ranges, which would require recreating the
+ *      clone with landscape axes. Not reachable on the Odin (forced landscape
+ *      only ever flips 1<->3, i.e. delta 0 or 2); warned once and passed
+ *      through so a misconfig degrades to "no rotation" rather than garbage. */
 static void offset_touch_event(const config_t *cfg, struct input_event *ev) {
     if (ev->type != EV_ABS) return;
     int delta;
@@ -1677,7 +1790,19 @@ static void offset_touch_event(const config_t *cfg, struct input_event *ev) {
     else if (ev->code == ABS_X && g_touch_has_x) { delta = cfg->touch_dx; info = &g_touch_x_info; }
     else if (ev->code == ABS_Y && g_touch_has_y) { delta = cfg->touch_dy; info = &g_touch_y_info; }
     else return;
-    long v = (long)ev->value + delta;
+    long v = ev->value;
+    if (cfg->touch_rotation == 2) {
+        v = (long)info->minimum + (long)info->maximum - v;   /* mirror this axis */
+    } else if (cfg->touch_rotation == 1 || cfg->touch_rotation == 3) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "dpadkeys: touch: rotation %d (90/270) needs a landscape "
+                            "clone; ignoring, passing coordinates through\n", cfg->touch_rotation);
+            fflush(stderr);
+        }
+    }
+    v += delta;
     if (v < info->minimum) v = info->minimum;
     if (v > info->maximum) v = info->maximum;
     ev->value = (int)v;
@@ -1793,6 +1918,8 @@ static void touch_release_panel(void) {
      * switches that drop touch.offset, panel re-detects, the panic chord and
      * shutdown -- every path that used to leave a finger down forever. */
     touch_release_stuck_contacts("panel released");
+    g_touch_wait = false;
+    g_touch_wait_since_ms = -1;
     if (g_touch_grabbed) { ioctl(g_touch_fd, EVIOCGRAB, 0); g_touch_grabbed = false; }
     if (g_touch_fd >= 0) { close(g_touch_fd); g_touch_fd = -1; }
 }
@@ -2231,8 +2358,43 @@ static void touch_sync_initial_contacts(const config_t *cfg) {
 #endif
 }
 
+/* True if the panel has nothing on it: every MT slot's tracking id is -1 and
+ * BTN_TOUCH is 0, straight from the kernel. This is the pre-grab gate -- a
+ * panel that is not neutral must not be grabbed, or Android never sees the
+ * release of whatever is down and keeps a phantom pointer for the whole
+ * active period. A panel we cannot interrogate (no EVIOCGMTSLOTS) reads as
+ * neutral: the carry-over path already covers that case, and refusing to
+ * activate at all would be worse. */
+static bool touch_panel_neutral(int fd, const char **why) {
+    if (why) *why = NULL;
+    unsigned long keystate[NLONGS(KEY_CNT)] = {0};
+    if (ioctl(fd, EVIOCGKEY(sizeof(keystate)), keystate) >= 0 &&
+        TEST_BIT(BTN_TOUCH, keystate)) {
+        if (why) *why = "BTN_TOUCH is still down";
+        return false;
+    }
+#ifdef EVIOCGMTSLOTS
+    struct input_absinfo si;
+    if (ioctl(fd, EVIOCGABS(ABS_MT_SLOT), &si) < 0 || si.maximum < si.minimum) return true;
+    int nslots = si.maximum - si.minimum + 1;
+    if (nslots > TOUCH_MAX_SLOTS) nslots = TOUCH_MAX_SLOTS;
+    int32_t tid[TOUCH_MAX_SLOTS + 1];
+    tid[0] = ABS_MT_TRACKING_ID;
+    if (ioctl(fd, EVIOCGMTSLOTS((size_t)(nslots + 1) * sizeof(int32_t)), tid) < 0) return true;
+    for (int sl = 0; sl < nslots; sl++) {
+        if (tid[sl + 1] < 0) continue;
+        if (why) *why = "a contact is still down";
+        return false;
+    }
+#endif
+    return true;
+}
+
 typedef enum {
     TOUCH_ENABLE_OK = 0,
+    /* Panel open and being watched, not grabbed yet: a finger is still on it.
+     * Not a failure -- the event loop finishes the job. */
+    TOUCH_ENABLE_WAITING,
     TOUCH_ENABLE_ERR_NO_PANEL,
     TOUCH_ENABLE_ERR_UINPUT,
     TOUCH_ENABLE_ERR_GRAB,
@@ -2278,6 +2440,20 @@ static touch_enable_result_t touch_enable(const config_t *cfg) {
         fprintf(stderr, "dpadkeys: touch: created virtual touchscreen \"%s\" (from %s)\n", g_touch_device_name, g_touch_path);
     }
 
+    /* Never grab a panel with a finger on it (see GRAB_WAIT_MAX_MS). The fd
+     * stays open and ungrabbed; the event loop drains it and grabs on the
+     * frame that completes the release. The clone is left alone either way --
+     * in serve mode it is never ours to destroy, and in one-shot mode the wait
+     * resolves in the same loop. */
+    const char *why = NULL;
+    if (!touch_panel_neutral(g_touch_fd, &why)) {
+        g_touch_wait = true;
+        g_touch_wait_since_ms = now_ms();
+        fprintf(stderr, "dpadkeys: touch: waiting for the panel to be released before grabbing\n");
+        fflush(stderr);
+        return TOUCH_ENABLE_WAITING;
+    }
+
     if (ioctl(g_touch_fd, EVIOCGRAB, 1) < 0) {
         if (!g_touch_quiet) {
             perror("EVIOCGRAB (touch)");
@@ -2290,6 +2466,59 @@ static touch_enable_result_t touch_enable(const config_t *cfg) {
     g_touch_grabbed = true;
     touch_sync_initial_contacts(cfg);
     return TOUCH_ENABLE_OK;
+}
+
+/* Closes out a pending panel wait by taking the grab. `capped_why` is NULL for
+ * the normal case (the panel went neutral) and names what is still down when
+ * GRAB_WAIT_MAX_MS ran out and we are grabbing regardless -- only then does
+ * touch_sync_initial_contacts()'s carry-over have anything to carry.
+ * Returns false (panel dropped) if the grab itself fails. */
+static bool touch_finish_grab(const config_t *cfg, const char *capped_why) {
+    long long waited = g_touch_wait_since_ms >= 0 ? now_ms() - g_touch_wait_since_ms : 0;
+    if (ioctl(g_touch_fd, EVIOCGRAB, 1) < 0) {
+        perror("EVIOCGRAB (touch)");
+        fprintf(stderr, "dpadkeys: touch: cannot grab the panel after the wait\n");
+        fflush(stderr);
+        touch_release_panel();   /* clears g_touch_wait */
+        return false;
+    }
+    g_touch_grabbed = true;
+    g_touch_wait = false;
+    g_touch_wait_since_ms = -1;
+    if (capped_why)
+        fprintf(stderr, "dpadkeys: touch: still not released after %d ms (%s); grabbing anyway\n",
+                GRAB_WAIT_MAX_MS, capped_why);
+    else
+        fprintf(stderr, "dpadkeys: touch: grabbed after wait (%lld ms)\n", waited);
+    fflush(stderr);
+    touch_sync_initial_contacts(cfg);
+    return true;
+}
+
+/* Drains the ungrabbed panel while we wait for it to go neutral. Reading an
+ * evdev node we have not grabbed empties only our own client buffer, so
+ * Android keeps receiving the very events that end the stuck contact -- which
+ * is the whole point: it gets the release it would otherwise never see.
+ *
+ * State is re-read from the kernel after every SYN_REPORT rather than tracked
+ * from the stream, so the grab lands on the frame that completes the release
+ * and the rest of the batch (which belongs to whatever touch comes next) is
+ * simply dropped. Returns 1 grabbed, 0 still waiting, -1 panel gone. */
+static int touch_wait_drain(const config_t *cfg) {
+    struct input_event batch[64];
+    for (;;) {
+        ssize_t n = read(g_touch_fd, batch, sizeof(batch));
+        if (n <= 0) {
+            if (n < 0 && (errno == ENODEV || errno == EIO)) return -1;
+            return 0;
+        }
+        int cnt = (int)(n / (ssize_t)sizeof(struct input_event));
+        for (int i = 0; i < cnt; i++) {
+            if (batch[i].type != EV_SYN || batch[i].code != SYN_REPORT) continue;
+            if (!touch_panel_neutral(g_touch_fd, NULL)) continue;
+            return touch_finish_grab(cfg, NULL) ? 1 : -1;
+        }
+    }
 }
 
 /* Reads whatever the panel has queued (whole events only; evdev never returns
@@ -2386,14 +2615,15 @@ static int forward_touch_batch(const config_t *cfg) {
  * retried once after 50ms before giving up. Returns false (out params
  * untouched, errno describing the last open failure if any) only when both
  * attempts failed. */
-static bool read_touch_offset_line(const char *path, bool *out_set, int *out_dx, int *out_dy) {
+static bool read_touch_offset_line(const char *path, bool *out_set, int *out_dx, int *out_dy,
+                                   int *out_rot) {
     for (int attempt = 0; attempt < 2; attempt++) {
         FILE *f = fopen(path, "r");
         int open_errno = errno;
         char line[256];
         bool saw_any_line = false;
         bool found = false, off = true;
-        int dx = 0, dy = 0;
+        int dx = 0, dy = 0, rot = 0;
         if (f) {
             while (fgets(line, sizeof(line), f)) {
                 saw_any_line = true;
@@ -2401,7 +2631,13 @@ static bool read_touch_offset_line(const char *path, bool *out_set, int *out_dx,
                 if (hash) *hash = '\0';
                 char *save = NULL;
                 char *tok1 = strtok_r(line, " \t\r\n", &save);
-                if (!tok1 || strcmp(tok1, "touch.offset") != 0) continue;
+                if (!tok1) continue;
+                if (strcmp(tok1, "touch.rotation") == 0) {
+                    char *tok2 = strtok_r(NULL, " \t\r\n", &save);
+                    if (tok2) { int r = atoi(tok2); rot = ((r % 4) + 4) % 4; }
+                    continue;
+                }
+                if (strcmp(tok1, "touch.offset") != 0) continue;
                 char *tok2 = strtok_r(NULL, " \t\r\n", &save);
                 if (!tok2) continue;
                 if (strcmp(tok2, "off") == 0 || strcmp(tok2, "none") == 0) {
@@ -2416,6 +2652,7 @@ static bool read_touch_offset_line(const char *path, bool *out_set, int *out_dx,
             *out_set = found && !off;
             *out_dx = dx;
             *out_dy = dy;
+            *out_rot = rot;
             return true;
         }
         if (attempt == 0) {
@@ -2440,8 +2677,8 @@ static bool read_touch_offset_line(const char *path, bool *out_set, int *out_dx,
  * file can't be read even after read_touch_offset_line()'s retry. */
 static void reload_touch_config(const char *config_path, config_t *cfg) {
     if (!config_path) return;
-    bool new_set; int new_dx = 0, new_dy = 0;
-    if (!read_touch_offset_line(config_path, &new_set, &new_dx, &new_dy)) {
+    bool new_set; int new_dx = 0, new_dy = 0, new_rot = 0;
+    if (!read_touch_offset_line(config_path, &new_set, &new_dx, &new_dy, &new_rot)) {
         if (errno) fprintf(stderr, "dpadkeys: SIGUSR1: cannot reopen config '%s': %s\n",
                             config_path, strerror(errno));
         else fprintf(stderr, "dpadkeys: SIGUSR1: config '%s' still empty after retry; "
@@ -2451,15 +2688,26 @@ static void reload_touch_config(const char *config_path, config_t *cfg) {
     }
 
     bool was_on = cfg->touch_offset_set;
+    int old_rot = cfg->touch_rotation;
     cfg->touch_offset_set = new_set;
     cfg->touch_dx = new_dx;
     cfg->touch_dy = new_dy;
+    cfg->touch_rotation = new_rot;
     clamp_touch_offset(cfg, "SIGUSR1");
+    /* Rotation is applied live in the forward path (offset_touch_event), so a
+     * rotation-only change needs no re-grab and never recreates the clone --
+     * exactly the "does not churn the clone" property we want on a flip. */
+    if (new_rot != old_rot) {
+        fprintf(stderr, "dpadkeys: touch: rotation now %d\n", new_rot);
+        fflush(stderr);
+    }
 
     if (!was_on && new_set) {
-        if (touch_enable(cfg) == TOUCH_ENABLE_OK) {
-            fprintf(stderr, "dpadkeys: touch: enabled live path=%s off=(%d,%d)\n",
-                    g_touch_path, cfg->touch_dx, cfg->touch_dy);
+        touch_enable_result_t r = touch_enable(cfg);
+        if (r == TOUCH_ENABLE_OK || r == TOUCH_ENABLE_WAITING) {
+            fprintf(stderr, "dpadkeys: touch: enabled live path=%s off=(%d,%d)%s\n",
+                    g_touch_path, cfg->touch_dx, cfg->touch_dy,
+                    r == TOUCH_ENABLE_WAITING ? " (waiting for the panel to be released)" : "");
         } else {
             fprintf(stderr, "dpadkeys: touch: failed to enable live; staying off\n");
             cfg->touch_offset_set = false;
@@ -2582,7 +2830,7 @@ static void print_usage(const char *argv0) {
             "a bad line never fails a reload.\n"
             "\n"
             "--status-file PATH makes the daemon write, atomically, on every transition:\n"
-            "    state=idle|active touch=on|off keys=<n> panic=<count> contacts=<n>\n"
+            "    state=idle|active touch=on|off keys=<n> panic=<count> contacts=<n> waiting=panel|pad|none\n"
             "state/touch are the active profile's intent; `keys` counts the bindings that can\n"
             "emit something; `panic` counts panic-chord firings; `contacts` is how many\n"
             "contacts the virtual touchscreen currently has down (0 at every transition -- a\n"
@@ -3153,10 +3401,15 @@ static void write_status(const config_t *cfg) {
     /* `contacts` is the number of contacts the virtual touchscreen currently
      * has down. It should be 0 at every transition -- a nonzero value in the
      * status file is the app's direct signal that a pointer is stuck. */
-    fprintf(f, "state=%s touch=%s keys=%d panic=%ld contacts=%d\n",
+    /* `waiting` names the device the daemon is holding off on because it is
+     * not neutral, so the app can say "lift your finger" instead of looking
+     * hung. Single-valued by contract; the panel wins if both are pending,
+     * since that is the one the user has to act on. */
+    fprintf(f, "state=%s touch=%s keys=%d panic=%ld contacts=%d waiting=%s\n",
             (g_want_pad || g_want_touch) ? "active" : "idle",
             g_want_touch ? "on" : "off", count_bindings(cfg), g_panic_count,
-            touch_contacts_live());
+            touch_contacts_live(),
+            g_touch_wait ? "panel" : (g_pad_wait ? "pad" : "none"));
     fflush(f);
     fsync(fileno(f));
     fclose(f);
@@ -3225,47 +3478,94 @@ static void serve_warn_raw_problems(const config_t *cfg) {
     if (bad) { fprintf(stderr, "dpadkeys: serve: %s\n", bad); fflush(stderr); }
 }
 
-/* One non-blocking attempt to open and grab the pad. Non-blocking matters:
- * the one-shot path can afford to spin until a pad shows up, but a serve
- * daemon that blocked here would stop answering SIGUSR1 -- the app could not
- * even park it back to idle. A failure just asks for a retry. */
-static bool serve_acquire_pad(config_t *cfg, const char *device_override) {
-    if (g_pad_fd >= 0) return true;
-    memset(g_pad_path, 0, sizeof(g_pad_path));
-    memset(g_pad_name, 0, sizeof(g_pad_name));
-    if (device_override) {
-        g_pad_fd = open(device_override, O_RDWR);
-        if (g_pad_fd < 0) return false;
-        snprintf(g_pad_path, sizeof(g_pad_path), "%s", device_override);
-        bool has_south;
-        device_info(g_pad_fd, &g_pad_vendor, &g_pad_product, g_pad_name, sizeof(g_pad_name), &has_south);
-    } else {
-        g_pad_fd = find_pad(cfg->device_match, O_RDWR, g_pad_path, sizeof(g_pad_path),
-                            g_pad_name, sizeof(g_pad_name), &g_pad_vendor, &g_pad_product);
-        if (g_pad_fd < 0) return false;
-    }
-    /* The grab is all-or-nothing here exactly as in one-shot mode: an
-     * ungrabbed active profile would let the pad's own events reach the game
-     * alongside our keys. */
+/* Takes the grab on a pad that is already open (freshly, or after a
+ * wait-for-neutral) and derives everything that depends on holding it.
+ * `capped_why` is NULL normally and names what is still held when
+ * GRAB_WAIT_MAX_MS ran out and we are grabbing anyway. Returns false (and
+ * drops the pad) if the grab fails. */
+static bool pad_finish_grab(config_t *cfg, const char *capped_why) {
+    long long waited = g_pad_wait_since_ms >= 0 ? now_ms() - g_pad_wait_since_ms : 0;
+    bool was_waiting = g_pad_wait;
     if (ioctl(g_pad_fd, EVIOCGRAB, 1) < 0) {
         close(g_pad_fd);
         g_pad_fd = -1;
+        g_pad_wait = false;
+        g_pad_wait_since_ms = -1;
         return false;
     }
     g_grabbed = true;
+    g_pad_wait = false;
+    g_pad_wait_since_ms = -1;
+    /* Re-derived after the grab, not before: the axis metadata query_abs()
+     * does (notably the unipolar resting-value heuristic) is only honest once
+     * the pad is actually at rest. */
     detect_axes(g_pad_fd, &g_ax);
     raw_query_axes(g_pad_fd, cfg);
     propagate_trigger_unipolar(cfg, &g_ax);
     serve_warn_raw_problems(cfg);
+    if (capped_why)
+        fprintf(stderr, "dpadkeys: pad: still not neutral after %d ms (%s); grabbing anyway\n",
+                GRAB_WAIT_MAX_MS, capped_why);
+    else if (was_waiting)
+        fprintf(stderr, "dpadkeys: pad: grabbed after wait (%lld ms)\n", waited);
     fprintf(stderr, "dpadkeys: serve: pad=%s name=\"%s\" vid=0x%04x pid=0x%04x grabbed\n",
             g_pad_path, g_pad_name, g_pad_vendor, g_pad_product);
     fflush(stderr);
     return true;
 }
 
+typedef enum {
+    PAD_ACQ_OK = 0,
+    PAD_ACQ_WAITING,   /* open and ungrabbed: something on it is still held */
+    PAD_ACQ_FAIL,
+} pad_acquire_t;
+
+/* One non-blocking attempt to open and grab the pad. Non-blocking matters:
+ * the one-shot path can afford to spin until a pad shows up, but a serve
+ * daemon that blocked here would stop answering SIGUSR1 -- the app could not
+ * even park it back to idle. A failure just asks for a retry. */
+static pad_acquire_t serve_acquire_pad(config_t *cfg, const char *device_override) {
+    if (g_pad_fd >= 0) return g_pad_wait ? PAD_ACQ_WAITING : PAD_ACQ_OK;
+    memset(g_pad_path, 0, sizeof(g_pad_path));
+    memset(g_pad_name, 0, sizeof(g_pad_name));
+    if (device_override) {
+        g_pad_fd = open(device_override, O_RDWR);
+        if (g_pad_fd < 0) return PAD_ACQ_FAIL;
+        snprintf(g_pad_path, sizeof(g_pad_path), "%s", device_override);
+        bool has_south;
+        device_info(g_pad_fd, &g_pad_vendor, &g_pad_product, g_pad_name, sizeof(g_pad_name), &has_south);
+    } else {
+        g_pad_fd = find_pad(cfg->device_match, O_RDWR, g_pad_path, sizeof(g_pad_path),
+                            g_pad_name, sizeof(g_pad_name), &g_pad_vendor, &g_pad_product);
+        if (g_pad_fd < 0) return PAD_ACQ_FAIL;
+    }
+    /* Never grab a pad with a button or stick held: the release would land
+     * inside our grab and Android would keep that button down for the whole
+     * active period (see GRAB_WAIT_MAX_MS). detect_axes() first -- pad_neutral
+     * needs the axis layout, and every ioctl it does is read-only. */
+    detect_axes(g_pad_fd, &g_ax);
+    char why[80];
+    if (!pad_neutral(g_pad_fd, cfg, why, sizeof(why))) {
+        g_pad_wait = true;
+        g_pad_wait_since_ms = now_ms();
+        fprintf(stderr, "dpadkeys: pad: waiting for neutral before grabbing\n");
+        fflush(stderr);
+        return PAD_ACQ_WAITING;
+    }
+    /* The grab is all-or-nothing here exactly as in one-shot mode: an
+     * ungrabbed active profile would let the pad's own events reach the game
+     * alongside our keys. */
+    return pad_finish_grab(cfg, NULL) ? PAD_ACQ_OK : PAD_ACQ_FAIL;
+}
+
 static void serve_release_pad(config_t *cfg) {
+    g_pad_wait = false;
+    g_pad_wait_since_ms = -1;
     if (g_pad_fd < 0) { g_panic_watch_until_ms = -1; return; }
     g_panic_watch_until_ms = -1;
+    /* Order matters, the mirror image of the grab rule: every virtual key we
+     * are holding goes up BEFORE the ungrab, so the game never sees our key
+     * and the pad's own button down at the same instant. */
     release_all_virtual(cfg);
     if (g_grabbed) { ioctl(g_pad_fd, EVIOCGRAB, 0); g_grabbed = false; }
     close(g_pad_fd);
@@ -3319,18 +3619,19 @@ static void serve_apply(config_t *cfg, const config_t *newcfg, const char *devic
             raw_query_axes(g_pad_fd, cfg);
             propagate_trigger_unipolar(cfg, &g_ax);
             serve_warn_raw_problems(cfg);
-        } else if (!serve_acquire_pad(cfg, device_override)) {
+        } else if (serve_acquire_pad(cfg, device_override) == PAD_ACQ_FAIL) {
             fprintf(stderr, "dpadkeys: serve: no pad yet; will keep trying\n");
             fflush(stderr);
             serve_schedule_retry();
         }
     }
-    if (g_want_touch && !g_touch_grabbed) {
-        if (touch_enable(cfg) == TOUCH_ENABLE_OK) {
+    if (g_want_touch && !g_touch_grabbed && !g_touch_wait) {
+        touch_enable_result_t r = touch_enable(cfg);
+        if (r == TOUCH_ENABLE_OK) {
             fprintf(stderr, "dpadkeys: serve: touch grabbed %s off=(%d,%d)\n",
                     g_touch_path, cfg->touch_dx, cfg->touch_dy);
             fflush(stderr);
-        } else {
+        } else if (r != TOUCH_ENABLE_WAITING) {
             fprintf(stderr, "dpadkeys: serve: could not grab the panel; will keep trying\n");
             fflush(stderr);
             serve_schedule_retry();
@@ -3384,15 +3685,20 @@ static void serve_retry_acquire(config_t *cfg, const char *device_override) {
     bool log_now = (last_log_ms < 0 || now - last_log_ms >= 10000);
     bool pending = false;
 
+    /* A device we are merely waiting on (open, ungrabbed, not neutral) is not
+     * pending acquisition -- the event loop owns it until it goes neutral. */
     if (g_want_pad && g_pad_fd < 0) {
-        if (serve_acquire_pad(cfg, device_override)) write_status(cfg);
-        else pending = true;
+        pad_acquire_t pr = serve_acquire_pad(cfg, device_override);
+        if (pr == PAD_ACQ_FAIL) pending = true;
+        else write_status(cfg);
     }
-    if (g_want_touch && !g_touch_grabbed) {
+    if (g_want_touch && !g_touch_grabbed && !g_touch_wait) {
         g_touch_quiet = !log_now;
         touch_enable_result_t r = touch_enable(cfg);
         g_touch_quiet = false;
-        if (r == TOUCH_ENABLE_OK) {
+        if (r == TOUCH_ENABLE_WAITING) {
+            write_status(cfg);
+        } else if (r == TOUCH_ENABLE_OK) {
             fprintf(stderr, "dpadkeys: serve: touch grabbed %s off=(%d,%d)\n",
                     g_touch_path, cfg->touch_dx, cfg->touch_dy);
             fflush(stderr);
@@ -3577,6 +3883,32 @@ static void event_loop(config_t *cfg, const char *config_path, const char *devic
             }
         }
 
+        /* Wait-for-neutral caps. A device whose key or slot state is latched
+         * (a panel that never clears BTN_TOUCH, a pad reporting a button that
+         * is not physically down) would otherwise keep the profile inactive
+         * forever, so past GRAB_WAIT_MAX_MS we grab regardless and fall back
+         * to the old behaviour: the clone carries the contacts over, and the
+         * pad's phantom button is the lesser evil against never activating. */
+        if (g_pad_wait && g_pad_fd >= 0 && g_pad_wait_since_ms >= 0 &&
+            now_ms() - g_pad_wait_since_ms >= GRAB_WAIT_MAX_MS) {
+            char why[80];
+            bool ok_now = pad_neutral(g_pad_fd, cfg, why, sizeof(why));
+            if (!pad_finish_grab(cfg, ok_now ? NULL : (why[0] ? why : "unknown"))) {
+                fprintf(stderr, "dpadkeys: serve: could not grab the pad; will keep trying\n");
+                fflush(stderr);
+                serve_schedule_retry();
+            }
+            if (g_serve) write_status(cfg);
+        }
+        if (g_touch_wait && g_touch_fd >= 0 && g_touch_wait_since_ms >= 0 &&
+            now_ms() - g_touch_wait_since_ms >= GRAB_WAIT_MAX_MS) {
+            const char *why = NULL;
+            bool ok_now = touch_panel_neutral(g_touch_fd, &why);
+            if (!touch_finish_grab(cfg, ok_now ? NULL : (why ? why : "unknown")) && g_serve)
+                serve_schedule_retry();
+            if (g_serve) write_status(cfg);
+        }
+
         long long deadline = -1;
         for (int i = 0; i < WHEEL_COUNT; i++) {
             if (g_wheel_count[i] > 0 && (deadline < 0 || g_wheel_next_due_ms[i] < deadline))
@@ -3603,6 +3935,16 @@ static void event_loop(config_t *cfg, const char *config_path, const char *devic
         }
         if (g_retry_due_ms >= 0 && (deadline < 0 || g_retry_due_ms < deadline))
             deadline = g_retry_due_ms;
+        /* A device held non-neutral may emit nothing at all while it is held,
+         * so the cap needs its own wakeup rather than riding on an event. */
+        if (g_pad_wait && g_pad_wait_since_ms >= 0) {
+            long long d = g_pad_wait_since_ms + GRAB_WAIT_MAX_MS;
+            if (deadline < 0 || d < deadline) deadline = d;
+        }
+        if (g_touch_wait && g_touch_wait_since_ms >= 0) {
+            long long d = g_touch_wait_since_ms + GRAB_WAIT_MAX_MS;
+            if (deadline < 0 || d < deadline) deadline = d;
+        }
         int timeout_ms = -1;
         if (deadline >= 0) {
             long long now = now_ms();
@@ -3619,7 +3961,7 @@ static void event_loop(config_t *cfg, const char *config_path, const char *devic
             pfds[nfds].fd = g_pad_fd; pfds[nfds].events = POLLIN; pfds[nfds].revents = 0;
             pad_slot = nfds++;
         }
-        if (g_touch_fd >= 0 && g_touch_grabbed) {
+        if (g_touch_fd >= 0 && (g_touch_grabbed || g_touch_wait)) {
             pfds[nfds].fd = g_touch_fd; pfds[nfds].events = POLLIN; pfds[nfds].revents = 0;
             touch_slot = nfds++;
         }
@@ -3650,6 +3992,22 @@ static void event_loop(config_t *cfg, const char *config_path, const char *devic
             char drain[64];
             while (read(g_sigpipe[0], drain, sizeof(drain)) > 0) { }
             continue; /* re-evaluate g_running / g_reload_req at the top */
+        }
+
+        if (touch_slot >= 0 && (pfds[touch_slot].revents & POLLIN) && g_touch_wait) {
+            /* Not grabbed yet: consume the panel's events (Android still gets
+             * its own copy, including the release we are waiting for) and take
+             * the grab on the frame that leaves it neutral. */
+            int wr = touch_wait_drain(cfg);
+            if (wr < 0) {
+                touch_release_panel();
+                fprintf(stderr, "dpadkeys: touch: lost the panel while waiting for it "
+                                "to be released\n");
+                fflush(stderr);
+                if (g_serve) serve_schedule_retry();
+            }
+            if (wr != 0 && g_serve) write_status(cfg);
+            continue;
         }
 
         if (touch_slot >= 0 && (pfds[touch_slot].revents & POLLIN)) {
@@ -3767,6 +4125,23 @@ static void event_loop(config_t *cfg, const char *config_path, const char *devic
              * We only watch for the chord escalating to a restart. */
             panic_track_event(cfg, &ev);
             check_panic_chord(cfg);
+            continue;
+        }
+
+        if (g_pad_wait) {
+            /* Open but not grabbed because something was held when we got
+             * here. Nothing is mapped or swallowed meanwhile -- the pad is
+             * still the system's. Re-read the kernel's state at each frame
+             * boundary and grab the moment it reads neutral. */
+            if (ev.type == EV_SYN && ev.code == SYN_REPORT &&
+                pad_neutral(g_pad_fd, cfg, NULL, 0)) {
+                if (!pad_finish_grab(cfg, NULL)) {
+                    fprintf(stderr, "dpadkeys: serve: could not grab the pad; will keep trying\n");
+                    fflush(stderr);
+                    serve_schedule_retry();
+                }
+                if (g_serve) write_status(cfg);
+            }
             continue;
         }
 
@@ -4104,7 +4479,7 @@ int main(int argc, char **argv) {
      * anything else), while the live path just logs and stays off. */
     if (cfg.touch_offset_set) {
         touch_enable_result_t r = touch_enable(&cfg);
-        if (r != TOUCH_ENABLE_OK) {
+        if (r != TOUCH_ENABLE_OK && r != TOUCH_ENABLE_WAITING) {
             fprintf(stderr, "dpadkeys: touch: startup touch init failed. Exiting.\n");
             touch_fatal_exit(r == TOUCH_ENABLE_ERR_GRAB ? 4 : 1);
         }

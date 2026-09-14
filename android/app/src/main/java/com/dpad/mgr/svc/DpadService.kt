@@ -8,9 +8,11 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import android.view.Display
 import com.dpad.mgr.R
 import com.dpad.mgr.core.BinaryInstaller
 import com.dpad.mgr.core.DaemonState
@@ -62,6 +64,21 @@ class DpadService : Service() {
         scope.launch { recheck("shizuku binder received") }
     }
 
+    private lateinit var displayManager: DisplayManager
+
+    /** Feeds the live display rotation into the Supervisor so it can compensate touch coordinates
+     *  when the handheld is physically flipped. Only the default display matters here. */
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) {}
+        override fun onDisplayRemoved(displayId: Int) {}
+        override fun onDisplayChanged(displayId: Int) {
+            if (displayId != Display.DEFAULT_DISPLAY) return
+            supervisor.setDisplayRotation(currentRotation())
+        }
+    }
+
+    private fun currentRotation(): Int = displayManager.getDisplay(Display.DEFAULT_DISPLAY)?.rotation ?: 0
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -81,6 +98,10 @@ class DpadService : Service() {
         ServiceState.supervisor = supervisor
         ServiceState.serviceRunning.value = true
 
+        displayManager = getSystemService(DisplayManager::class.java)
+        supervisor.setDisplayRotation(currentRotation())
+        displayManager.registerDisplayListener(displayListener, null)
+
         scope.launch {
             probe.state.collect { st ->
                 ServiceState.priv.value = st
@@ -91,6 +112,9 @@ class DpadService : Service() {
             supervisor.state.collect { s ->
                 ServiceState.daemon.value = s
                 updateNotification(s)
+                // Re-seed the rotation whenever the serve daemon (re)spawns (fresh process, or a
+                // respawn after death/restart), so a stale rotation never survives a respawn.
+                if (s is DaemonState.Starting) supervisor.setDisplayRotation(currentRotation())
                 // Clear the test countdown once the daemon state shows the test truly ended:
                 // fully idle, or running/starting the real assigned target (pkg != null). Backoff
                 // and Failed are left alone since they can happen mid-test as well as mid-run.
@@ -315,6 +339,7 @@ class DpadService : Service() {
         supervisor.shutdown()
         ServiceState.supervisor = null
         runCatching { Shizuku.removeBinderReceivedListener(shizukuBinderListener) }
+        runCatching { displayManager.unregisterDisplayListener(displayListener) }
         scope.cancel()
         super.onDestroy()
     }
