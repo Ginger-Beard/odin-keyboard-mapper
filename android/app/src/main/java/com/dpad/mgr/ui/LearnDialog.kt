@@ -28,11 +28,18 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
 /**
- * "Press a control" dialog: runs `dpadkeys --learn` and reports the first control pressed.
- * Cancel / dismiss cancels the coroutine, which kills the learn process.
+ * "Press a control" dialog: by default runs `dpadkeys --learn` and reports the first control
+ * pressed; pass [learn] (e.g. [Learn.runLearnChord]) and [instructions] to repurpose it for a
+ * different capture mode. Cancel / dismiss cancels the coroutine, which kills the learn process.
  */
 @Composable
-fun LearnDialog(title: String, onLearned: (String) -> Unit, onDismiss: () -> Unit) {
+fun LearnDialog(
+    title: String,
+    onLearned: (String) -> Unit,
+    onDismiss: () -> Unit,
+    instructions: String = "Press the button, D-pad direction, stick direction or trigger on the pad to bind to $title.",
+    learn: suspend (android.content.Context, (String) -> Unit) -> Result<String> = Learn::runLearn,
+) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var attempt by remember { mutableIntStateOf(0) }
@@ -44,7 +51,7 @@ fun LearnDialog(title: String, onLearned: (String) -> Unit, onDismiss: () -> Uni
         error = null
         status = "Starting…"
         job = scope.launch {
-            val r = Learn.runLearn(ctx.applicationContext) { status = it }
+            val r = learn(ctx.applicationContext) { status = it }
             r.onSuccess { src -> onLearned(src) }
                 .onFailure { e -> error = e.message ?: "learn failed" }
         }
@@ -56,7 +63,7 @@ fun LearnDialog(title: String, onLearned: (String) -> Unit, onDismiss: () -> Uni
         title = { Text("Press a control") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Press the button, D-pad direction, stick direction or trigger on the pad to bind to $title.")
+                Text(instructions)
                 val err = error
                 if (err == null) {
                     Row(verticalAlignment = Alignment.CenterVertically) {

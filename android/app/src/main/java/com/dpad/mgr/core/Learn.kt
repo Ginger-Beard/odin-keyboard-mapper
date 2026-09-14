@@ -83,6 +83,60 @@ object Learn {
     }
 
     /**
+     * Learn-a-chord: runs `dpadkeys --learn-chord` (pad ungrabbed, same idle-the-serve-daemon
+     * dance as [runLearn]) and returns the button-like sources pressed together, in press order
+     * (e.g. "btn.tl+btn.tr"), the moment they're all released or after a fixed 1.5s collection
+     * window -- see the daemon's --learn-chord for the exact semantics.
+     */
+    suspend fun runLearnChord(ctx: Context, onStatus: (String) -> Unit): Result<String> {
+        val shell = ServiceState.priv.value.shell
+            ?: return Result.failure(LearnError("No privileged shell (Shizuku/root not available)"))
+        val bin = ServiceState.binaryPath.value
+            ?: return Result.failure(LearnError("Daemon binary not ready — check the Status tab"))
+
+        val sup = ServiceState.supervisor
+        if (sup == null) {
+            if (daemonBusy()) return Result.failure(LearnError("Daemon is still running; stop it and try again"))
+        } else {
+            if (daemonBusy()) onStatus("Going idle…")
+            if (!sup.beginLearn()) {
+                sup.endLearn()
+                return Result.failure(LearnError("Daemon did not go idle; stop it and try again"))
+            }
+            Log.i(TAG, "learn-chord: daemon idle for learn")
+        }
+        try {
+            return runLearnChordIdle(shell, bin, onStatus)
+        } finally {
+            sup?.endLearn()
+        }
+    }
+
+    /** The actual one-shot `--learn-chord` invocation; the serve daemon is already idle here. */
+    private suspend fun runLearnChordIdle(shell: PrivShell, bin: String, onStatus: (String) -> Unit): Result<String> {
+        runCatching { shell.exec(listOf("rm", "-f", PIDFILE)) }
+
+        onStatus("Waiting for a press…")
+        val argv = listOf(bin, "--learn-chord", "--learn-timeout-ms", TIMEOUT_MS.toString(), "--pidfile", PIDFILE)
+        val r = try {
+            withContext(Dispatchers.IO) { shell.execLong(argv, 20_000) }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            withContext(NonCancellable) { cancelLearn(shell) }
+            throw e
+        }
+        val lastNonEmpty = r.out.lineSequence().map { it.trim() }.lastOrNull { it.isNotEmpty() } ?: ""
+        Log.i(TAG, "learn-chord: rc=${r.rc} out=${r.out.lineSequence().firstOrNull()?.take(120) ?: ""} last=${lastNonEmpty.take(120)}")
+        val src = LEARNED.find(r.out)?.groupValues?.get(1)
+        Log.i(TAG, "learn-chord: parsed source=${src ?: "no learned line"}")
+        if (src == null) return Result.failure(LearnError("learn failed (rc=${r.rc}): ${r.out.trim().lines().lastOrNull()?.take(160) ?: ""}"))
+        return when {
+            src == "NONE" -> Result.failure(LearnError("Nothing pressed within ${TIMEOUT_MS / 1000} s"))
+            src.split('+').all { Sources.isButtonLike(it) } -> Result.success(src)
+            else -> Result.failure(LearnError("Unrecognised control '$src'"))
+        }
+    }
+
+    /**
      * Fire-and-forget kill of a running learn, for the dialog's Cancel button. Retries briefly
      * because the daemon only writes its pidfile once it has found the pad.
      */

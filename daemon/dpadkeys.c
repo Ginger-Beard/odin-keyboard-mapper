@@ -2540,6 +2540,7 @@ static void print_usage(const char *argv0) {
             "       %s --serve --config FILE [--pidfile PATH] [--status-file PATH] [--verbose]\n"
             "                  [--device ...] [--device-name NAME] [--panic-chord none|SRC+SRC]\n"
             "       %s --learn [--learn-timeout-ms N] [--learn-hold-ms N] [--config FILE] [--device ...] [--pidfile PATH]\n"
+            "       %s --learn-chord [--learn-timeout-ms N] [--config FILE] [--device ...] [--pidfile PATH]\n"
             "\n"
             "--serve keeps ONE daemon alive for as long as the supervising app holds its\n"
             "privilege. Both virtual devices -- the \"Odin DPad Keys\" keyboard+mouse and the\n"
@@ -2589,8 +2590,19 @@ static void print_usage(const char *argv0) {
             "\"learned btn.tl+hat.up\". --learn-hold-ms (default 150) is how long a lone\n"
             "control must still be held, with nothing else pressed yet, before it is a\n"
             "candidate hold for a later chord; release it first with nothing else having\n"
-            "happened and it is reported as a plain \"learned btn.thumbl\" instead.\n",
-            argv0, argv0, argv0, argv0);
+            "happened and it is reported as a plain \"learned btn.thumbl\" instead.\n"
+            "\n"
+            "--learn-chord captures a whole chord at once instead of one trigger: it waits\n"
+            "for the first button-like press (btn.*, hat.*, lt, rt, key.0x.. -- stick\n"
+            "directions are never chord-eligible and are ignored, same as raw axes with no\n"
+            "button-like classification), then keeps adding further button-like presses to\n"
+            "the set, in the order pressed, for as long as at least one member is still\n"
+            "held. It finalizes -- \"learned btn.tl+btn.tr\", or \"learned btn.tl\" for a lone\n"
+            "button -- the moment every collected button has been released, or 1500ms after\n"
+            "the first press, whichever comes first. --learn-timeout-ms only bounds the wait\n"
+            "for that first press; nothing pressed before it elapses is \"learned NONE\"\n"
+            "(exit 3).\n",
+            argv0, argv0, argv0, argv0, argv0);
 }
 
 /* ---- learn mode ---- */
@@ -2848,6 +2860,179 @@ static int learn_mode(int fd, const axes_t *ax, long long timeout_ms, long long 
         printf("learned NONE\n");
         fflush(stdout);
         return 3;
+    }
+    printf("learned %s\n", out);
+    fflush(stdout);
+    return 0;
+}
+
+/* ---- learn-chord mode ---- */
+
+#define LEARN_CHORD_MAX 8
+#define LEARN_CHORD_WINDOW_MS 1500
+
+static bool learn_chord_any_held(const bool *held, int n) {
+    for (int i = 0; i < n; i++)
+        if (held[i]) return true;
+    return false;
+}
+
+static void learn_chord_release(char order[][48], bool *held, int n, const char *name) {
+    for (int i = 0; i < n; i++)
+        if (strcmp(order[i], name) == 0) { held[i] = false; return; }
+    /* Not a member -- either not part of the chord, or already-held before
+     * --learn-chord started (so never recorded a press): ignore, same as any
+     * other release of a control that isn't in the set. */
+}
+
+/* Adds `name` to the chord (or, if already a member, marks it held again).
+ * Starts the fixed collection window on the very first press. */
+static int learn_chord_press(char order[][48], bool *held, int n, const char *name,
+                              long long now, long long *chord_deadline) {
+    for (int i = 0; i < n; i++)
+        if (strcmp(order[i], name) == 0) { held[i] = true; return n; }
+    if (n == 0) *chord_deadline = now + LEARN_CHORD_WINDOW_MS;
+    if (n < LEARN_CHORD_MAX) {
+        snprintf(order[n], 48, "%s", name);
+        held[n] = true;
+        n++;
+    }
+    return n;
+}
+
+/* Waits (pad ungrabbed) for the first button-like press (btn.*, hat.*, lt,
+ * rt, key.0x..; stick directions and any other non-button-like control are
+ * ignored throughout), then keeps adding further button-like presses to the
+ * chord, in the order pressed, for as long as at least one member is still
+ * held. Finalizes -- prints `learned a+b[+c]` (a lone button prints
+ * `learned a`) and returns 0 -- the moment every collected button has been
+ * released, or LEARN_CHORD_WINDOW_MS after the first press, whichever comes
+ * first. `timeout_ms` bounds only the wait for that first press; nothing
+ * pressed before it elapses prints `learned NONE` and returns 3. See
+ * print_usage() for examples. */
+static int learn_chord_mode(int fd, const axes_t *ax, long long timeout_ms) {
+    struct { bool known; double center, half; int min, max; bool unipolar; int state; } axes[ABS_CNT];
+    memset(axes, 0, sizeof(axes));
+    unsigned long absbits[NLONGS(ABS_CNT)] = {0};
+    ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits);
+    const double dz = 0.5;
+    for (int c = 0; c < ABS_CNT; c++) {
+        if (!TEST_BIT(c, absbits)) continue;
+        struct input_absinfo info;
+        if (ioctl(fd, EVIOCGABS(c), &info) < 0) continue;
+        axes[c].known = true;
+        axes[c].min = info.minimum;
+        axes[c].max = info.maximum;
+        axes[c].center = (info.minimum + info.maximum) / 2.0;
+        axes[c].half = (info.maximum - info.minimum) / 2.0;
+        if (axes[c].half <= 0) axes[c].half = 1.0;
+        double range = info.maximum - info.minimum;
+        axes[c].unipolar = info.minimum >= 0 && info.maximum > 0 &&
+                            info.value <= info.minimum + 0.05 * range;
+        if (ax->lt.present && c == ax->lt.code) axes[c].unipolar = ax->lt.unipolar;
+        else if (ax->rt.present && c == ax->rt.code) axes[c].unipolar = ax->rt.unipolar;
+        if (axes[c].unipolar) {
+            double r = axes[c].max - axes[c].min;
+            double frac = (info.value - axes[c].min) / (r > 0 ? r : 1.0);
+            axes[c].state = frac >= dz ? 1 : 0;
+        } else {
+            double v = (info.value - axes[c].center) / axes[c].half;
+            axes[c].state = v >= dz ? 1 : (v <= -dz ? -1 : 0);
+        }
+    }
+
+    char order[LEARN_CHORD_MAX][48];
+    bool held[LEARN_CHORD_MAX] = {0};
+    int n = 0;
+    long long chord_deadline = -1; /* set once the first button is pressed */
+    long long wait_deadline = now_ms() + timeout_ms;
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+
+    while (g_running) {
+        long long now = now_ms();
+        long long cur_deadline = n == 0 ? wait_deadline : chord_deadline;
+        if (now >= cur_deadline) break;
+        int pr = poll(&pfd, 1, (int)(cur_deadline - now));
+        if (pr < 0) { if (errno == EINTR) continue; break; }
+        if (pr == 0) break;
+        struct input_event ev;
+        ssize_t rd = read(fd, &ev, sizeof(ev));
+        if (rd != (ssize_t)sizeof(ev)) {
+            if (rd < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+            break; /* ENODEV etc. */
+        }
+        now = now_ms();
+
+        if (ev.type == EV_KEY) {
+            if (ev.value == 2) continue; /* autorepeat */
+            char name[48];
+            learn_key_name(ev.code, name, sizeof(name));
+            if (ev.value == 1) n = learn_chord_press(order, held, n, name, now, &chord_deadline);
+            else learn_chord_release(order, held, n, name);
+            if (n > 0 && !learn_chord_any_held(held, n)) break;
+            continue;
+        }
+
+        if (ev.type != EV_ABS || ev.code >= ABS_CNT || !axes[ev.code].known) continue;
+        if (learn_is_stick_axis(ax, ev.code)) continue; /* never chord-eligible */
+
+        if (axes[ev.code].unipolar) {
+            /* Real trigger axis: press-only, same 50%-pull threshold as the
+             * daemon. A release when the trigger isn't a chord member (e.g.
+             * already held when --learn-chord started) is silently ignored
+             * by learn_chord_release(). */
+            double r = axes[ev.code].max - axes[ev.code].min;
+            if (r <= 0) r = 1.0;
+            double frac = (ev.value - axes[ev.code].min) / r;
+            int st = axes[ev.code].state;
+            int ns = st ? (frac >= dz - 0.1 ? 1 : 0) : (frac >= dz ? 1 : 0);
+            if (ns == st) continue;
+            axes[ev.code].state = ns;
+            char name[48];
+            learn_abs_name(ax, ev.code, 1, name, sizeof(name));
+            if (ns == 1) n = learn_chord_press(order, held, n, name, now, &chord_deadline);
+            else learn_chord_release(order, held, n, name);
+            if (n > 0 && !learn_chord_any_held(held, n)) break;
+            continue;
+        }
+
+        /* bipolar hat / HAT2-fallback trigger / raw abs axis: button-like,
+         * so track press+release like an EV_KEY control. A direct sign flip
+         * is a release of the old direction followed by a press of the new
+         * one. */
+        {
+            double v = (ev.value - axes[ev.code].center) / axes[ev.code].half;
+            int st = axes[ev.code].state;
+            int ns = st == 1 ? (v >= dz - 0.1 ? 1 : 0)
+                   : st == -1 ? (v <= -(dz - 0.1) ? -1 : 0)
+                   : (v >= dz ? 1 : (v <= -dz ? -1 : 0));
+            if (ns == st) continue;
+            axes[ev.code].state = ns;
+            if (st != 0) {
+                char rname[48];
+                learn_abs_name(ax, ev.code, st, rname, sizeof(rname));
+                learn_chord_release(order, held, n, rname);
+            }
+            if (ns != 0) {
+                char pname[48];
+                learn_abs_name(ax, ev.code, ns, pname, sizeof(pname));
+                n = learn_chord_press(order, held, n, pname, now, &chord_deadline);
+            }
+            if (n > 0 && !learn_chord_any_held(held, n)) break;
+        }
+    }
+
+    if (n == 0) {
+        printf("learned NONE\n");
+        fflush(stdout);
+        return 3;
+    }
+    char out[256] = {0};
+    size_t off = 0;
+    for (int i = 0; i < n; i++) {
+        int w = snprintf(out + off, sizeof(out) - off, "%s%s", i ? "+" : "", order[i]);
+        if (w < 0 || (size_t)w >= sizeof(out) - off) break;
+        off += (size_t)w;
     }
     printf("learned %s\n", out);
     fflush(stdout);
@@ -3661,6 +3846,7 @@ int main(int argc, char **argv) {
     bool do_dump = false;
     bool print_config_flag = false;
     bool do_learn = false;
+    bool do_learn_chord = false;
     bool do_serve = false;
     long long learn_timeout_ms = 15000;
     long long learn_hold_ms = 150;
@@ -3680,6 +3866,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--pidfile") == 0 && i + 1 < argc) pidfile = argv[++i];
         else if (strcmp(argv[i], "--print-config") == 0) print_config_flag = true;
         else if (strcmp(argv[i], "--learn") == 0) do_learn = true;
+        else if (strcmp(argv[i], "--learn-chord") == 0) do_learn_chord = true;
         else if (strcmp(argv[i], "--serve") == 0) do_serve = true;
         else if (strcmp(argv[i], "--status-file") == 0 && i + 1 < argc) g_status_path = argv[++i];
         else if (strcmp(argv[i], "--learn-timeout-ms") == 0 && i + 1 < argc) learn_timeout_ms = atoll(argv[++i]);
@@ -3720,10 +3907,14 @@ int main(int argc, char **argv) {
             fprintf(stderr, "dpadkeys: --serve requires --config FILE (the active profile)\n");
             return 2;
         }
-        if (do_learn) {
-            fprintf(stderr, "dpadkeys: --serve and --learn are separate processes; run --learn on its own\n");
+        if (do_learn || do_learn_chord) {
+            fprintf(stderr, "dpadkeys: --serve and --learn/--learn-chord are separate processes; run them on their own\n");
             return 2;
         }
+    }
+    if (do_learn && do_learn_chord) {
+        fprintf(stderr, "dpadkeys: --learn and --learn-chord are separate processes; run one at a time\n");
+        return 2;
     }
 
     static config_t cfg;
@@ -3738,7 +3929,7 @@ int main(int argc, char **argv) {
         filter_targets_to_superset(&cfg, config_path);
     }
     else if (config_path) load_config_file(config_path, &cfg, false);
-    else if (do_learn && !profile_name) init_config(&cfg); /* learn needs no mapping, only device.match */
+    else if ((do_learn || do_learn_chord) && !profile_name) init_config(&cfg); /* learn needs no mapping, only device.match */
     else load_profile(&cfg, profile_name ? profile_name : "fkeys");
 
     apply_panic_cli_override(&cfg);
@@ -3782,14 +3973,15 @@ int main(int argc, char **argv) {
         return run_serve(&cfg, config_path, device_override, pidfile);
 
     /* learn never grabs and never writes, so a read-only open suffices there */
-    int open_flags = do_learn ? O_RDONLY : O_RDWR;
-    long long find_deadline = do_learn ? now_ms() + learn_timeout_ms : -1;
+    bool learning = do_learn || do_learn_chord;
+    int open_flags = learning ? O_RDONLY : O_RDWR;
+    long long find_deadline = learning ? now_ms() + learn_timeout_ms : -1;
 
     if (device_override) {
         g_pad_fd = open(device_override, open_flags);
         if (g_pad_fd < 0) {
             perror("open device");
-            if (do_learn) { printf("learned NONE\n"); return 3; }
+            if (learning) { printf("learned NONE\n"); return 3; }
             return 1;
         }
         strncpy(g_pad_path, device_override, sizeof(g_pad_path) - 1);
@@ -3828,6 +4020,20 @@ int main(int argc, char **argv) {
                 g_pad_path, g_pad_name, g_pad_vendor, g_pad_product, learn_timeout_ms);
         long long remaining = find_deadline - now_ms();
         int rc = learn_mode(g_pad_fd, &g_ax, remaining > 0 ? remaining : 0, learn_hold_ms);
+        close(g_pad_fd);
+        if (pidfile) unlink(pidfile);
+        return rc;
+    }
+
+    if (do_learn_chord) {
+        if (pidfile) {
+            FILE *f = fopen(pidfile, "w");
+            if (f) { fprintf(f, "%d\n", getpid()); fclose(f); }
+        }
+        fprintf(stderr, "dpadkeys: learn-chord pad=%s name=\"%s\" vid=0x%04x pid=0x%04x timeout=%lldms\n",
+                g_pad_path, g_pad_name, g_pad_vendor, g_pad_product, learn_timeout_ms);
+        long long remaining = find_deadline - now_ms();
+        int rc = learn_chord_mode(g_pad_fd, &g_ax, remaining > 0 ? remaining : 0);
         close(g_pad_fd);
         if (pidfile) unlink(pidfile);
         return rc;

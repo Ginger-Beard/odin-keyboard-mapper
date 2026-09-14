@@ -65,6 +65,7 @@ import com.dpad.mgr.core.Calibration
 import com.dpad.mgr.core.DaemonState
 import com.dpad.mgr.core.KeyDef
 import com.dpad.mgr.core.Keys
+import com.dpad.mgr.core.Learn
 import com.dpad.mgr.core.Profile
 import com.dpad.mgr.core.SourceNames
 import com.dpad.mgr.core.Sources
@@ -611,6 +612,8 @@ fun ProfileEditor(
     if (settingPanic) {
         LearnDialog(
             title = "panic chord",
+            instructions = "Press and hold the button or buttons you want as the panic chord, then release.",
+            learn = Learn::runLearnChord,
             onLearned = { src ->
                 settingPanic = false
                 if (Sources.isValidPanicChord(src)) {
