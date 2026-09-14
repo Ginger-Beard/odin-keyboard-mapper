@@ -101,6 +101,13 @@ class Supervisor(
      *  the Profile model. */
     @Volatile private var rotationAtGeneration: Int = -1
     private var rotationDebounceJob: Job? = null
+    /** Current default-display logical size + rotation, fed by [setDisplayMetrics]/[seedDisplayMetrics]
+     *  (DpadService's DisplayListener and service-start/daemon-respawn seeding, respectively) and
+     *  emitted as `touch.display W H R` on every config write -- see [withTouchRotation]. Device
+     *  state, not part of the Profile model; 0/0/0 until first seeded (harmless: idle config). */
+    @Volatile private var touchDisplayW: Int = 0
+    @Volatile private var touchDisplayH: Int = 0
+    @Volatile private var touchDisplayRotation: Int = 0
 
     // ---- the one serve daemon ----
     private var servePid = -1
@@ -210,30 +217,39 @@ class Supervisor(
     }
 
     /**
-     * Feeds in a genuine display rotation change (called by DpadService's DisplayListener
-     * callback only -- see [seedRotation] for service-start/daemon-respawn seeding). If the new
-     * rotation differs from the rotation [touchGeneration] was created at, bumps and persists
-     * [touchGeneration]: on the next SIGUSR1 reload the daemon sees the new generation number and
-     * destroys+recreates its virtual touchscreen fresh at the current rotation. Debounces 300 ms
-     * (to absorb rotation settling) then wakes the reconcile loop, which rewrites the current
-     * config (active profile or idle) in place via the existing apply() path (no daemon respawn).
+     * Feeds in a genuine display size/rotation change (called by DpadService's DisplayListener
+     * callback only -- see [seedDisplayMetrics] for service-start/daemon-respawn seeding). Always
+     * updates [touchDisplayW]/[touchDisplayH]/[touchDisplayRotation] (emitted as `touch.display`
+     * on every config write). If the new rotation differs from the rotation [touchGeneration] was
+     * created at, additionally bumps and persists [touchGeneration]: on the next SIGUSR1 reload
+     * the daemon sees the new generation number and destroys+recreates its virtual touchscreen
+     * fresh at the current rotation. Debounces 300 ms (to absorb rotation settling) then wakes the
+     * reconcile loop, which rewrites the current config (active profile or idle) in place via the
+     * existing apply() path (no daemon respawn).
      */
-    fun setDisplayRotation(rotation: Int) {
-        if (rotation == rotationAtGeneration) return
-        touchGeneration++
-        rotationAtGeneration = rotation
-        prefs.edit().putInt(KEY_TOUCH_GENERATION, touchGeneration).apply()
-        Log.i(TAG, "supervisor: rotation=$rotation -> touch.generation=$touchGeneration")
+    fun setDisplayMetrics(width: Int, height: Int, rotation: Int) {
+        touchDisplayW = width
+        touchDisplayH = height
+        touchDisplayRotation = rotation
+        if (rotation != rotationAtGeneration) {
+            touchGeneration++
+            rotationAtGeneration = rotation
+            prefs.edit().putInt(KEY_TOUCH_GENERATION, touchGeneration).apply()
+            Log.i(TAG, "supervisor: rotation=$rotation -> touch.generation=$touchGeneration")
+        }
         rotationDebounceJob?.cancel()
         rotationDebounceJob = scope.launch { delay(300); wake.trySend(Unit) }
     }
 
-    /** Seeds the rotation bookkeeping without bumping [touchGeneration]: called at service start
-     *  and whenever the serve daemon (re)spawns, since a fresh daemon process always creates its
-     *  virtual touchscreen clone fresh at whatever rotation is current -- no generation bump (and
-     *  no config rewrite/signal) is needed, just keep [rotationAtGeneration] in sync so the next
-     *  genuine [setDisplayRotation] call is compared correctly. */
-    fun seedRotation(rotation: Int) {
+    /** Seeds the display size/rotation bookkeeping without bumping [touchGeneration]: called at
+     *  service start and whenever the serve daemon (re)spawns, since a fresh daemon process
+     *  always creates its virtual touchscreen clone fresh at whatever rotation is current -- no
+     *  generation bump is needed, just keep [rotationAtGeneration] (so the next genuine
+     *  [setDisplayMetrics] call is compared correctly) and the touch.display fields in sync. */
+    fun seedDisplayMetrics(width: Int, height: Int, rotation: Int) {
+        touchDisplayW = width
+        touchDisplayH = height
+        touchDisplayRotation = rotation
         rotationAtGeneration = rotation
     }
 
@@ -243,11 +259,14 @@ class Supervisor(
      *  config-writing path reads the same as before. */
     private fun touchRotationN(): Int = 0
 
-    /** Appends the device's touch-generation and touch-rotation directives to config text about
-     *  to be written to CONF. Always appended (harmless when touch isn't in play/idle) so it's
-     *  simplest to reason about from logcat and the CONF file alike. */
+    /** Appends the device's touch-generation, touch-rotation, and touch-display directives to
+     *  config text about to be written to CONF. `touch.display W H R` tells the daemon the
+     *  default display's current logical size and Surface rotation, so it presents touch (and
+     *  applies touch.offset) in DISPLAY pixels. Always appended (harmless when touch isn't in
+     *  play/idle) so it's simplest to reason about from logcat and the CONF file alike. */
     private fun withTouchRotation(conf: String): String =
-        conf + "touch.generation $touchGeneration\n" + "touch.rotation ${touchRotationN()}\n"
+        conf + "touch.generation $touchGeneration\n" + "touch.rotation ${touchRotationN()}\n" +
+            "touch.display $touchDisplayW $touchDisplayH $touchDisplayRotation\n"
 
     /**
      * Forces the daemon idle so a one-shot `--learn` invocation can grab the pad, and waits (up to
@@ -540,7 +559,7 @@ class Supervisor(
      *  from logcat whether touch.offset made it into the config that was actually signalled. */
     private fun activateLogLine(profile: String, conf: String): String {
         val directives = setOf(
-            "deadzone", "ls.invert_y", "ls.invert_x", "rs.invert_y", "rs.invert_x", "wheel_repeat_ms", "touch.offset", "touch.rotation", "touch.generation", "idle",
+            "deadzone", "ls.invert_y", "ls.invert_x", "rs.invert_y", "rs.invert_x", "wheel_repeat_ms", "touch.offset", "touch.rotation", "touch.generation", "touch.display", "idle",
         )
         var touch = "off"
         var keys = 0

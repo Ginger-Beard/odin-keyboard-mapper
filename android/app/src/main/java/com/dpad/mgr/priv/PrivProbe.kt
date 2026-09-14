@@ -56,5 +56,13 @@ class PrivProbe(ctx: Context) {
         result
     }
 
+    /** Tears down the Shizuku user-service binding (if one was ever created), calling
+     *  `Shizuku.unbindUserService(..., remove = true)` via [ShizukuShell.release] so the helper
+     *  process is killed on a clean service stop rather than surviving until Shizuku's own
+     *  timeout. No-op if Shizuku was never probed/bound (root-only sessions). */
+    fun release() {
+        shizuku?.release()
+    }
+
     companion object { private const val TAG = "DpadMgr" }
 }

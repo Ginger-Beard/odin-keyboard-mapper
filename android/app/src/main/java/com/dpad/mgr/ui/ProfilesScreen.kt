@@ -76,7 +76,6 @@ import com.dpad.mgr.svc.ServiceState
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlin.math.roundToInt
 
 @Composable
 fun ProfilesScreen(modifier: Modifier = Modifier) {
@@ -98,7 +97,7 @@ fun ProfilesScreen(modifier: Modifier = Modifier) {
         Row(Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
                 modifier = Modifier.heightIn(min = 48.dp),
-                onClick = { editing = null to Profile(name = uniqueName("New profile", data.profiles.map { it.name })) },
+                onClick = { editing = null to Profile(name = uniqueName("New profile", data.profiles.map { it.name }), touchSpace = "display") },
             ) { Text("New profile") }
         }
         LazyColumn(contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 16.dp)) {
@@ -226,17 +225,11 @@ fun ProfileEditor(
     )
     val nameClash = draft.name.isBlank() || (draft.name != persistedName && draft.name in existingNames)
 
-    // Stylus offset, in SCREEN pixels as perceived in landscape: the stored profile only ever
-    // holds PANEL-space touchDx/touchDy, so display/edit values are the panel value rotated back
-    // into screen space via Calibration.rotateDeltaInverse (the inverse of the same rotation
-    // Calibration.rotateDelta/CalibrateActivity use to go the other way). Rotation is read once
-    // from this Activity's display; a composable context can't otherwise learn it, so this mirrors
-    // CalibrateActivity's `activity.display?.rotation` read, with ROTATION_90 (this device's
-    // landscape) as the fallback if display is unavailable.
-    val touchRotation = remember { ctx.display?.rotation ?: Calibration.ROTATION_90 }
-    val (storedScreenXF, storedScreenYF) = Calibration.rotateDeltaInverse(stored.touchDx.toFloat(), stored.touchDy.toFloat(), touchRotation)
-    val storedScreenX = storedScreenXF.roundToInt()
-    val storedScreenY = storedScreenYF.roundToInt()
+    // Stylus offset, in DISPLAY pixels as seen on screen in the game's orientation: the stored
+    // profile holds touchDx/touchDy directly in this space (see Profile.touchSpace / Store's
+    // panel->display migration), so no rotation mapping is needed here any more.
+    val storedScreenX = stored.touchDx
+    val storedScreenY = stored.touchDy
     var touchXText by remember { mutableStateOf<String?>(null) }
     var touchXJob by remember { mutableStateOf<Job?>(null) }
     var touchYText by remember { mutableStateOf<String?>(null) }
@@ -298,26 +291,22 @@ fun ProfileEditor(
         flashSaved()
     }
 
-    /** Reads the CURRENTLY stored profile's touch offset back out as a screen-space (horizontal,
-     *  vertical) pair, same rotation as [storedScreenX]/[storedScreenY] above but read fresh --
-     *  used so that committing one axis while the other has its own pending debounce still writes
-     *  the other axis's up-to-date value instead of a stale closure-captured one. */
+    /** Reads the CURRENTLY stored profile's touch offset back out as a display-space (horizontal,
+     *  vertical) pair, read fresh -- used so that committing one axis while the other has its own
+     *  pending debounce still writes the other axis's up-to-date value instead of a stale
+     *  closure-captured one. */
     fun freshScreenXY(): Pair<Int, Int> {
         val name = persistedName ?: return 0 to 0
         val p = Store.data.value.profile(name) ?: return 0 to 0
-        val (sx, sy) = Calibration.rotateDeltaInverse(p.touchDx.toFloat(), p.touchDy.toFloat(), touchRotation)
-        return sx.roundToInt() to sy.roundToInt()
+        return p.touchDx to p.touchDy
     }
 
-    /** Rotates a SCREEN-space (horizontal, vertical) pair back to PANEL space, clamps to
-     *  Calibration.MAX_OFFSET (rotateDelta only swaps/flips-sign components, so clamping either
-     *  space by the same bound is equivalent), and writes+live-pushes it exactly like the Enabled
-     *  switch does. */
+    /** Clamps a display-space (horizontal, vertical) pair to Calibration.MAX_OFFSET and
+     *  writes+live-pushes it exactly like the Enabled switch does. */
     fun writeTouchOffset(sx: Int, sy: Int) {
-        val (pdxF, pdyF) = Calibration.rotateDelta(sx.toFloat(), sy.toFloat(), touchRotation)
-        val pdx = pdxF.roundToInt().coerceIn(-Calibration.MAX_OFFSET, Calibration.MAX_OFFSET)
-        val pdy = pdyF.roundToInt().coerceIn(-Calibration.MAX_OFFSET, Calibration.MAX_OFFSET)
-        changeNow(live = true) { d -> d.copy(touchDx = pdx, touchDy = pdy) }
+        val dx = sx.coerceIn(-Calibration.MAX_OFFSET, Calibration.MAX_OFFSET)
+        val dy = sy.coerceIn(-Calibration.MAX_OFFSET, Calibration.MAX_OFFSET)
+        changeNow(live = true) { d -> d.copy(touchDx = dx, touchDy = dy) }
     }
 
     fun commitTouchX(sx: Int) {

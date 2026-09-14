@@ -242,10 +242,18 @@ data class Profile(
      *  1s pauses mapping, 4s restarts the daemon. Null means no chord is configured. Required
      *  before [touchOffsetEnabled] can be turned on -- see ProfilesScreen/CalibrateActivity. */
     val panicChord: String? = null,
-    /** Stylus/touch offset, calibrated via CalibrateActivity. Panel units (natural/portrait orientation). */
+    /** Stylus/touch offset, calibrated via CalibrateActivity. Display-pixel units (as seen on
+     *  screen in the game's orientation) -- see [touchSpace]. */
     val touchOffsetEnabled: Boolean = false,
     val touchDx: Int = 0,
     val touchDy: Int = 0,
+    /** Coordinate space [touchDx]/[touchDy] are stored in: "panel" (legacy, natural/portrait
+     *  panel units) or "display" (current display px, as the daemon now expects via
+     *  `touch.display`). Defaults to "panel" so an old serialized profile missing this field is
+     *  recognized as needing migration on load -- see [Store]'s migration, which converts the
+     *  offset and flips this to "display". Every profile constructed fresh by app code should
+     *  pass "display" explicitly (never rely on this default) since it needs no migration. */
+    val touchSpace: String = "panel",
 ) {
     fun key(source: String): String = map[source] ?: Keys.NONE
 
@@ -299,11 +307,13 @@ data class Profile(
             ),
             deadzone = 0.5f,
             lsInvertY = true,
+            touchSpace = "display",
         )
         val WASD = Profile(
             name = "WASD",
             map = mapOf("hat.up" to "KEY_W", "hat.down" to "KEY_S", "hat.left" to "KEY_A", "hat.right" to "KEY_D"),
             deadzone = 0.5f,
+            touchSpace = "display",
         )
         val DEFAULTS = listOf(OSRS, WASD)
     }

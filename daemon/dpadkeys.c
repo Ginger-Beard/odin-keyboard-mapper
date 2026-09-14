@@ -257,6 +257,26 @@ typedef struct {
      * since it creates its clone once per run anyway. Independent of
      * touch.rotation, which stays supported and defaults to 0. */
     int touch_generation;
+
+    /* touch.display W H R: switches the clone from panel-space to
+     * display-space coordinates. Why: Android maps our cloned touchscreen
+     * onto the display with AXIS SCALING ONLY (no rotation), while the real
+     * panel gets the proper rotation from its input-device orientation
+     * config -- so a clone that merely mirrors panel-native coordinates
+     * lands in the wrong place whenever the display's natural orientation
+     * differs from the panel's. touch.display makes the daemon do that
+     * rotation itself: W,H are the display size in pixels in its current
+     * orientation, R is the display's rotation (quarter-turns) relative to
+     * the panel's own natural (portrait) frame. When set, the clone is
+     * CREATED with ABS_MT_POSITION_X/Y (and ABS_X/Y, if present) ranged
+     * [0,W-1]/[0,H-1], and every forwarded position is remapped from panel
+     * raw coordinates into that box before touch.offset/touch.rotation are
+     * applied (see transform_touch_event_display()). Absent (touch_display_set
+     * == false) means exactly the historical panel-space clone. Changing W/H/R
+     * on a live serve reload recreates the clone (see serve_apply), because
+     * the ABS ranges are fixed at creation time. */
+    bool touch_display_set;
+    int touch_display_w, touch_display_h, touch_display_r;
 } config_t;
 
 /* --device-name NAME (default "Odin DPad Keys"): names the keyboard+mouse
@@ -265,6 +285,7 @@ typedef struct {
  * UINPUT_MAX_NAME_SIZE-1 bytes -- see sanitize_device_name() in main(). */
 static char g_device_name[UINPUT_MAX_NAME_SIZE] = DEFAULT_DEVICE_NAME;
 static char g_touch_device_name[UINPUT_MAX_NAME_SIZE] = DEFAULT_DEVICE_NAME " Touch";
+static bool g_touch_name_overridden = false; /* --touch-name given: don't derive from --device-name */
 
 static volatile sig_atomic_t g_running = 1;
 static int g_uinput_fd = -1;
@@ -361,6 +382,12 @@ static bool g_touch_uinput_dead = false;
  * rebuilds the clone (serve mode only); reported as gen= in the status file so
  * the app can see which generation the live device belongs to. */
 static int g_touch_gen_applied = 0;
+/* touch.display as last acted on (mirrors g_touch_gen_applied): the clone is
+ * rebuilt on a serve reload whenever these disagree with the incoming
+ * profile's touch_display_* (see serve_apply). Set at serve startup and
+ * inside serve_recreate_touch_clone(), never touched otherwise. */
+static bool g_touch_display_applied_set = false;
+static int g_touch_display_applied_w = 0, g_touch_display_applied_h = 0, g_touch_display_applied_r = 0;
 
 /* ---- clone contact bookkeeping ----
  *
@@ -453,6 +480,10 @@ static void init_config(config_t *cfg) {
     cfg->touch_device[0] = '\0';
     cfg->touch_rotation = 0;
     cfg->touch_generation = 0;
+    cfg->touch_display_set = false;
+    cfg->touch_display_w = 0;
+    cfg->touch_display_h = 0;
+    cfg->touch_display_r = 0;
     cfg->n_panic = 0;
     for (int i = 0; i < MAX_PANIC_SRC; i++) cfg->panic_src[i] = -1;
 }
@@ -808,6 +839,29 @@ static bool load_config_file(const char *path, config_t *cfg, bool lenient) {
             cfg->touch_generation = atoi(tok2);
             continue;
         }
+        if (strcmp(tok1, "touch.display") == 0) {
+            if (strcmp(tok2, "off") == 0 || strcmp(tok2, "none") == 0) {
+                cfg->touch_display_set = false;
+                cfg->touch_display_w = cfg->touch_display_h = cfg->touch_display_r = 0;
+                continue;
+            }
+            char *tok3 = strtok_r(NULL, " \t\r\n", &save);
+            char *tok4 = strtok_r(NULL, " \t\r\n", &save);
+            if (!tok3 || !tok4) {
+                cfg_problem(path, lineno, "touch.display needs three values (W H R)");
+                continue;
+            }
+            int w = atoi(tok2), h = atoi(tok3), r = atoi(tok4);
+            if (w <= 0 || h <= 0) {
+                cfg_problem(path, lineno, "touch.display W/H must be positive (got %d %d)", w, h);
+                continue;
+            }
+            cfg->touch_display_w = w;
+            cfg->touch_display_h = h;
+            cfg->touch_display_r = ((r % 4) + 4) % 4;
+            cfg->touch_display_set = true;
+            continue;
+        }
         if (strcmp(tok1, "panic") == 0) {
             parse_panic_spec(cfg, tok2, path, lineno);
             continue;
@@ -953,6 +1007,11 @@ static void print_config(const config_t *cfg, FILE *out) {
     fprintf(out, "%-12s %s\n", "touch.device", cfg->touch_device[0] ? cfg->touch_device : "auto");
     fprintf(out, "%-12s %d\n", "touch.rotation", cfg->touch_rotation);
     fprintf(out, "%-12s %d\n", "touch.generation", cfg->touch_generation);
+    if (cfg->touch_display_set)
+        fprintf(out, "%-12s %d %d %d\n", "touch.display",
+                cfg->touch_display_w, cfg->touch_display_h, cfg->touch_display_r);
+    else
+        fprintf(out, "%-12s %s\n", "touch.display", "off");
 }
 
 /* ---- uinput device ---- */
@@ -1788,6 +1847,132 @@ static bool touch_pos_in_range(int x, int y) {
     return true;
 }
 
+/* ---- touch.display: panel-raw -> display-space coordinate transform ----
+ *
+ * Why: Android maps our cloned touchscreen onto the display with AXIS
+ * SCALING ONLY (raw X -> display X * W/Xmax, raw Y -> display Y * H/Ymax,
+ * no rotation), while the real panel gets the correct rotation from its own
+ * input-device orientation config. A clone that just mirrors panel-native
+ * coordinates therefore lands in the wrong place whenever the display's
+ * natural orientation (R quarter-turns from the panel's own portrait frame)
+ * is not 0. touch.display fixes this by having the daemon itself transform
+ * every position into display space before writing it to the clone, so the
+ * clone can be dumb-scaled by Android exactly like the real panel is.
+ *
+ * The four rotations, panel-raw (px in [0,xspan], py in [0,yspan]) ->
+ * display (dx in [0,W-1], dy in [0,H-1]):
+ *   R=0: dx = px*W/Xmax,        dy = py*H/Ymax
+ *   R=1: dx = py*W/Ymax,        dy = H - px*H/Xmax
+ *   R=2: dx = (Xmax-px)*W/Xmax, dy = (Ymax-py)*H/Ymax
+ *   R=3: dx = W - py*W/Ymax,    dy = px*H/Xmax
+ * In every case dx is a function of exactly one raw axis and dy of the
+ * other -- R=0/2 keep X feeding dx and Y feeding dy, R=1/3 swap them -- so
+ * each incoming ABS_MT_POSITION_X/Y (or ABS_X/Y) event can be remapped on
+ * its own, without waiting to see its paired axis; touch_axis_to_display()
+ * below is exactly this per-axis map, and touch_display_transform() (used
+ * only by --selftest-transform) is the two-argument form for testing both
+ * axes of a point at once. */
+
+/* Rounds num/den to the nearest integer (num,den assumed >= 0). */
+static long long touch_round_div(long long num, long long den) {
+    if (den <= 0) return 0;
+    if (num < 0) num = 0;
+    return (num + den / 2) / den;
+}
+
+/* Maps one raw axis value `rel` (already relative to that axis' own minimum,
+ * i.e. in [0,span]) into a display coordinate for display rotation `r`.
+ * `is_x` says whether `rel` came from the panel's X axis (true) or Y axis
+ * (false); *out_is_x reports whether the returned value feeds the display's
+ * X or Y axis -- they swap for R=1/3. Result is unclamped; callers clamp to
+ * [0,w-1]/[0,h-1] as appropriate. */
+static long long touch_axis_to_display(bool is_x, long long rel, long long span,
+                                        int w, int h, int r, bool *out_is_x) {
+    r = ((r % 4) + 4) % 4;
+    if (is_x) {
+        switch (r) {
+            case 0: *out_is_x = true;  return touch_round_div(rel * w, span);
+            case 2: *out_is_x = true;  return touch_round_div((span - rel) * w, span);
+            case 1: *out_is_x = false; return (long long)h - touch_round_div(rel * h, span);
+            default /* 3 */: *out_is_x = false; return touch_round_div(rel * h, span);
+        }
+    } else {
+        switch (r) {
+            case 0: *out_is_x = false; return touch_round_div(rel * h, span);
+            case 2: *out_is_x = false; return touch_round_div((span - rel) * h, span);
+            case 1: *out_is_x = true;  return touch_round_div(rel * w, span);
+            default /* 3 */: *out_is_x = true;  return (long long)w - touch_round_div(rel * w, span);
+        }
+    }
+}
+
+/* Two-axis form of touch_axis_to_display(), for --selftest-transform: px/py
+ * are panel-raw positions relative to their own axis minimum (so xspan/yspan
+ * are Xmax/Ymax when the panel's minimum is 0, as on every touchscreen this
+ * has been tested against), r is the display rotation. Result clamped to
+ * [0,w-1]/[0,h-1]. */
+static void touch_display_transform(long long px, long long py, long long xspan, long long yspan,
+                                     int w, int h, int r, int *out_dx, int *out_dy) {
+    bool x_is_dx, y_is_dx;
+    long long vx = touch_axis_to_display(true, px, xspan, w, h, r, &x_is_dx);
+    long long vy = touch_axis_to_display(false, py, yspan, w, h, r, &y_is_dx);
+    long long dx = x_is_dx ? vx : vy;
+    long long dy = x_is_dx ? vy : vx;
+    if (dx < 0) dx = 0; else if (dx > w - 1) dx = w - 1;
+    if (dy < 0) dy = 0; else if (dy > h - 1) dy = h - 1;
+    *out_dx = (int)dx;
+    *out_dy = (int)dy;
+}
+
+/* Display-space counterpart of offset_touch_event_panel(): remaps one event
+ * from panel-raw into display coordinates (touch_axis_to_display(), which may
+ * swap ABS_MT_POSITION_X<->Y or ABS_X<->Y for R=1/3 -- exactly what the
+ * panel-space path could never do without recreating the clone), THEN adds
+ * the stylus offset in display pixels, clamped, THEN applies touch_rotation
+ * (kept for compatibility) as a mirror in display space. Non-position codes
+ * pass through untouched. */
+static void offset_touch_event_display(const config_t *cfg, struct input_event *ev) {
+    if (ev->type != EV_ABS) return;
+    bool is_x, is_mt;
+    const struct input_absinfo *info;
+    if (ev->code == ABS_MT_POSITION_X && g_touch_has_mtx) { is_x = true; is_mt = true; info = &g_touch_mtx_info; }
+    else if (ev->code == ABS_MT_POSITION_Y && g_touch_has_mty) { is_x = false; is_mt = true; info = &g_touch_mty_info; }
+    else if (ev->code == ABS_X && g_touch_has_x) { is_x = true; is_mt = false; info = &g_touch_x_info; }
+    else if (ev->code == ABS_Y && g_touch_has_y) { is_x = false; is_mt = false; info = &g_touch_y_info; }
+    else return;
+
+    long long span = (long long)info->maximum - (long long)info->minimum;
+    long long rel = (long long)ev->value - (long long)info->minimum;
+    if (span <= 0) span = 1;
+    if (rel < 0) rel = 0; else if (rel > span) rel = span;
+
+    bool out_is_x;
+    long long outv = touch_axis_to_display(is_x, rel, span,
+                                            cfg->touch_display_w, cfg->touch_display_h,
+                                            cfg->touch_display_r, &out_is_x);
+    int dim = out_is_x ? cfg->touch_display_w : cfg->touch_display_h;
+    if (outv < 0) outv = 0; else if (outv > dim - 1) outv = dim - 1;
+
+    outv += out_is_x ? cfg->touch_dx : cfg->touch_dy;
+    if (outv < 0) outv = 0; else if (outv > dim - 1) outv = dim - 1;
+
+    if (cfg->touch_rotation == 2) {
+        outv = (long long)(dim - 1) - outv;
+    } else if (cfg->touch_rotation == 1 || cfg->touch_rotation == 3) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "dpadkeys: touch: rotation %d (90/270) is not supported together "
+                            "with touch.display; ignoring\n", cfg->touch_rotation);
+            fflush(stderr);
+        }
+    }
+
+    ev->code = out_is_x ? (unsigned short)(is_mt ? ABS_MT_POSITION_X : ABS_X)
+                         : (unsigned short)(is_mt ? ABS_MT_POSITION_Y : ABS_Y);
+    ev->value = (int)outv;
+}
+
 /* Applies the configured rotation-compensation and offset to one event in
  * place, clamped to that axis' reported range. Only the four position axes are
  * touched; MAJOR, SLOT, TRACKING_ID, BTN_TOUCH, timestamps and everything else
@@ -1804,7 +1989,7 @@ static bool touch_pos_in_range(int x, int y) {
  *      clone with landscape axes. Not reachable on the Odin (forced landscape
  *      only ever flips 1<->3, i.e. delta 0 or 2); warned once and passed
  *      through so a misconfig degrades to "no rotation" rather than garbage. */
-static void offset_touch_event(const config_t *cfg, struct input_event *ev) {
+static void offset_touch_event_panel(const config_t *cfg, struct input_event *ev) {
     if (ev->type != EV_ABS) return;
     int delta;
     const struct input_absinfo *info;
@@ -1831,6 +2016,17 @@ static void offset_touch_event(const config_t *cfg, struct input_event *ev) {
     ev->value = (int)v;
 }
 
+/* Single choke point every call site uses: dispatches to the display-space
+ * transform when touch.display is configured, otherwise to the exact
+ * pre-existing panel-space behaviour. This is deliberately the only place
+ * that branches on touch_display_set, so both touch_sync_initial_contacts()
+ * and forward_touch_batch() -- the two places positions are written to the
+ * clone -- get the transform for free without knowing which mode is active. */
+static void offset_touch_event(const config_t *cfg, struct input_event *ev) {
+    if (cfg->touch_display_set) offset_touch_event_display(cfg, ev);
+    else offset_touch_event_panel(cfg, ev);
+}
+
 /* Creates the virtual touchscreen once at startup, copying the real panel's
  * EV_KEY/EV_ABS capabilities (with identical absinfo via UI_ABS_SETUP) and
  * INPUT_PROP bits, name "<device name> Touch" (dev_name, see g_touch_device_name),
@@ -1845,8 +2041,18 @@ static void offset_touch_event(const config_t *cfg, struct input_event *ev) {
  * .idc file is needed for that. The descriptor EventHub derives from
  * bus/vendor/product/version would collide with the real panel's, but
  * EventHub::assignDescriptorLocked() salts duplicates with an incrementing
- * nonce until the descriptor is unique, so both devices coexist. */
-static int open_touch_uinput(int real_fd, const struct input_id *id, const char *dev_name) {
+ * nonce until the descriptor is unique, so both devices coexist.
+ *
+ * When cfg->touch_display_set, the position axes are NOT cloned verbatim:
+ * ABS_MT_POSITION_X/Y (and ABS_X/Y, if the panel has them) get range
+ * [0,W-1]/[0,H-1], resolution 0, since the daemon is about to feed them
+ * display-space coordinates instead of panel-raw ones (see
+ * offset_touch_event_display()) and the ABS range is fixed for the life of
+ * the clone. fuzz/flat are zeroed too -- the panel's noise-filtering
+ * thresholds were tuned for its own raw scale and mean nothing at the
+ * display's. */
+static int open_touch_uinput(int real_fd, const struct input_id *id, const char *dev_name,
+                              const config_t *cfg) {
     int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
     if (fd < 0) {
         perror("open /dev/uinput (touch)");
@@ -1883,6 +2089,19 @@ static int open_touch_uinput(int real_fd, const struct input_id *id, const char 
         /* The clone starts with no contacts down, so never inherit a live
          * value; UI_ABS_SETUP also implies UI_SET_ABSBIT. */
         as.absinfo.value = 0;
+        if (cfg->touch_display_set && (c == ABS_MT_POSITION_X || c == ABS_X)) {
+            as.absinfo.minimum = 0;
+            as.absinfo.maximum = cfg->touch_display_w - 1;
+            as.absinfo.resolution = 0;
+            as.absinfo.fuzz = 0;
+            as.absinfo.flat = 0;
+        } else if (cfg->touch_display_set && (c == ABS_MT_POSITION_Y || c == ABS_Y)) {
+            as.absinfo.minimum = 0;
+            as.absinfo.maximum = cfg->touch_display_h - 1;
+            as.absinfo.resolution = 0;
+            as.absinfo.fuzz = 0;
+            as.absinfo.flat = 0;
+        }
         if (ioctl(fd, UI_ABS_SETUP, &as) < 0) {
             perror("UI_ABS_SETUP (touch)");
             close(fd);
@@ -2452,7 +2671,7 @@ static touch_enable_result_t touch_enable(const config_t *cfg) {
     query_touch_axes(g_touch_fd);
 
     if (g_touch_uinput_fd < 0) {
-        g_touch_uinput_fd = open_touch_uinput(g_touch_fd, &touch_id, g_touch_device_name);
+        g_touch_uinput_fd = open_touch_uinput(g_touch_fd, &touch_id, g_touch_device_name, cfg);
         if (g_touch_uinput_fd < 0) {
             fprintf(stderr, "dpadkeys: touch: could not create virtual touchscreen\n");
             close(g_touch_fd);
@@ -2770,8 +2989,14 @@ static void print_touch_banner(const config_t *cfg) {
         panic_spec_str(cfg, pb, sizeof(pb));
         snprintf(panic_b, sizeof(panic_b), "%s %dms", pb, PANIC_CHORD_MS);
     } else snprintf(panic_b, sizeof(panic_b), "none");
-    printf("dpadkeys: touch=%s \"%s\" off=(%d,%d) x=%s y=%s panic=%s\n",
-           g_touch_path, g_touch_name, cfg->touch_dx, cfg->touch_dy, xb, yb, panic_b);
+    char space_b[32];
+    if (cfg->touch_display_set)
+        snprintf(space_b, sizeof(space_b), "display %dx%d rot=%d",
+                 cfg->touch_display_w, cfg->touch_display_h, cfg->touch_display_r);
+    else
+        snprintf(space_b, sizeof(space_b), "panel");
+    printf("dpadkeys: touch=%s \"%s\" off=(%d,%d) x=%s y=%s panic=%s space=%s\n",
+           g_touch_path, g_touch_name, cfg->touch_dx, cfg->touch_dy, xb, yb, panic_b, space_b);
     fflush(stdout);
 }
 
@@ -3429,13 +3654,15 @@ static void write_status(const config_t *cfg) {
      * hung. Single-valued by contract; the panel wins if both are pending,
      * since that is the one the user has to act on. */
     /* `gen` is the touch.generation the live virtual touchscreen was built
-     * for, so the app can confirm a rotation-triggered rebuild landed. */
-    fprintf(f, "state=%s touch=%s keys=%d panic=%ld contacts=%d waiting=%s gen=%d\n",
+     * for, so the app can confirm a rotation-triggered rebuild landed.
+     * `space` is which coordinate space that clone was built in. */
+    fprintf(f, "state=%s touch=%s keys=%d panic=%ld contacts=%d waiting=%s gen=%d space=%s\n",
             (g_want_pad || g_want_touch) ? "active" : "idle",
             g_want_touch ? "on" : "off", count_bindings(cfg), g_panic_count,
             touch_contacts_live(),
             g_touch_wait ? "panel" : (g_pad_wait ? "pad" : "none"),
-            g_touch_gen_applied);
+            g_touch_gen_applied,
+            g_touch_display_applied_set ? "display" : "panel");
     fflush(f);
     fsync(fileno(f));
     fclose(f);
@@ -3646,9 +3873,14 @@ static void serve_recreate_touch_clone(const config_t *cfg) {
         fflush(stderr);
     }
     g_touch_gen_applied = cfg->touch_generation;
+    g_touch_display_applied_set = cfg->touch_display_set;
+    g_touch_display_applied_w = cfg->touch_display_w;
+    g_touch_display_applied_h = cfg->touch_display_h;
+    g_touch_display_applied_r = cfg->touch_display_r;
     if (ok) {
-        fprintf(stderr, "dpadkeys: touch: generation %d -> recreated virtual touchscreen\n",
-                cfg->touch_generation);
+        fprintf(stderr, "dpadkeys: touch: generation %d -> recreated virtual touchscreen "
+                        "(space=%s)\n", cfg->touch_generation,
+                cfg->touch_display_set ? "display" : "panel");
         fflush(stderr);
     }
 }
@@ -3672,7 +3904,13 @@ static void serve_apply(config_t *cfg, const config_t *newcfg, const char *devic
     /* Before the no-clone test below, so a profile that wants touch is judged
      * against the device this reload is about to build, and before the
      * acquisition further down, so the re-grab targets the new clone. */
-    if (cfg->touch_generation != g_touch_gen_applied) serve_recreate_touch_clone(cfg);
+    bool touch_display_changed = cfg->touch_display_set != g_touch_display_applied_set ||
+        (cfg->touch_display_set &&
+         (cfg->touch_display_w != g_touch_display_applied_w ||
+          cfg->touch_display_h != g_touch_display_applied_h ||
+          cfg->touch_display_r != g_touch_display_applied_r));
+    if (cfg->touch_generation != g_touch_gen_applied || touch_display_changed)
+        serve_recreate_touch_clone(cfg);
 
     if (g_want_touch && g_touch_uinput_fd < 0) {
         fprintf(stderr, "dpadkeys: serve: profile asks for touch.offset but there is no "
@@ -3817,7 +4055,7 @@ static bool serve_create_touch_device(const config_t *cfg) {
     if (ioctl(fd, EVIOCGNAME(sizeof(g_touch_name)), g_touch_name) < 0)
         snprintf(g_touch_name, sizeof(g_touch_name), "?");
     query_touch_axes(fd);
-    g_touch_uinput_fd = open_touch_uinput(fd, &touch_id, g_touch_device_name);
+    g_touch_uinput_fd = open_touch_uinput(fd, &touch_id, g_touch_device_name, cfg);
     close(fd);
     if (g_touch_uinput_fd < 0) {
         fprintf(stderr, "dpadkeys: serve: could not create the virtual touchscreen\n");
@@ -4264,8 +4502,13 @@ static int run_serve(config_t *cfg, const char *config_path, const char *device_
         return 1;
     }
     /* The clone about to be created belongs to the startup config's
-     * generation, so the startup serve_apply() below must not rebuild it. */
+     * generation and touch.display, so the startup serve_apply() below must
+     * not immediately think either changed and rebuild it again. */
     g_touch_gen_applied = cfg->touch_generation;
+    g_touch_display_applied_set = cfg->touch_display_set;
+    g_touch_display_applied_w = cfg->touch_display_w;
+    g_touch_display_applied_h = cfg->touch_display_h;
+    g_touch_display_applied_r = cfg->touch_display_r;
     bool touch_ok = serve_create_touch_device(cfg);
 
     {
@@ -4302,6 +4545,52 @@ static int run_serve(config_t *cfg, const char *config_path, const char *device_
     return 0;
 }
 
+/* --selftest-transform: exercises touch_display_transform() against an
+ * independent floating-point reference of the same four formulas (see the
+ * comment above touch_axis_to_display()), for the Odin's own panel/display
+ * geometry (Xmax=1080, Ymax=1920, W=1920, H=1080) plus the four panel
+ * corners, at every rotation. No device needed. Prints one PASS/FAIL line
+ * per case plus a summary, and returns 0 iff every case passed. */
+static int selftest_transform(void) {
+    static const struct { int px, py; const char *label; } cases[] = {
+        { 100, 200, "example" },
+        { 0, 0, "corner top-left" },
+        { 1080, 0, "corner top-right" },
+        { 0, 1920, "corner bottom-left" },
+        { 1080, 1920, "corner bottom-right" },
+    };
+    const int xmax = 1080, ymax = 1920, w = 1920, h = 1080;
+    bool all_ok = true;
+
+    for (int r = 0; r < 4; r++) {
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            int px = cases[i].px, py = cases[i].py;
+            int dx, dy;
+            touch_display_transform(px, py, xmax, ymax, w, h, r, &dx, &dy);
+
+            double edx, edy;
+            switch (r) {
+                case 0: edx = (double)px * w / xmax; edy = (double)py * h / ymax; break;
+                case 1: edx = (double)py * w / ymax; edy = (double)h - (double)px * h / xmax; break;
+                case 2: edx = (double)(xmax - px) * w / xmax; edy = (double)(ymax - py) * h / ymax; break;
+                default: edx = (double)w - (double)py * w / ymax; edy = (double)px * h / xmax; break;
+            }
+            long erx = lround(edx), ery = lround(edy);
+            if (erx < 0) erx = 0; else if (erx > w - 1) erx = w - 1;
+            if (ery < 0) ery = 0; else if (ery > h - 1) ery = h - 1;
+
+            bool ok = (dx == (int)erx && dy == (int)ery);
+            printf("%s R=%d %-19s panel=(%d,%d) -> display=(%d,%d) expected=(%ld,%ld)\n",
+                   ok ? "PASS" : "FAIL", r, cases[i].label, px, py, dx, dy, erx, ery);
+            if (!ok) all_ok = false;
+        }
+    }
+    printf(all_ok ? "PASS: touch.display transform selftest\n"
+                  : "FAIL: touch.display transform selftest\n");
+    fflush(stdout);
+    return all_ok ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     /* We may be spawned from a Java process (Shizuku user service) whose threads
      * block SIGUSR1/SIGTERM; the mask is inherited across exec, so clear it or
@@ -4319,6 +4608,7 @@ int main(int argc, char **argv) {
     bool do_learn = false;
     bool do_learn_chord = false;
     bool do_serve = false;
+    bool do_selftest_transform = false;
     long long learn_timeout_ms = 15000;
     long long learn_hold_ms = 150;
     const char *device_override = NULL;
@@ -4333,6 +4623,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--dump") == 0) do_dump = true;
         else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) device_override = argv[++i];
         else if (strcmp(argv[i], "--device-name") == 0 && i + 1 < argc) device_name_arg = argv[++i];
+        else if (strcmp(argv[i], "--touch-name") == 0 && i + 1 < argc) { snprintf(g_touch_device_name, sizeof g_touch_device_name, "%s", argv[++i]); g_touch_name_overridden = true; }
         else if (strcmp(argv[i], "--verbose") == 0) g_verbose = true;
         else if (strcmp(argv[i], "--allow-q") == 0) g_allow_q = true;
         else if (strcmp(argv[i], "--pidfile") == 0 && i + 1 < argc) pidfile = argv[++i];
@@ -4340,6 +4631,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--learn") == 0) do_learn = true;
         else if (strcmp(argv[i], "--learn-chord") == 0) do_learn_chord = true;
         else if (strcmp(argv[i], "--serve") == 0) do_serve = true;
+        else if (strcmp(argv[i], "--selftest-transform") == 0) do_selftest_transform = true;
         else if (strcmp(argv[i], "--status-file") == 0 && i + 1 < argc) g_status_path = argv[++i];
         else if (strcmp(argv[i], "--learn-timeout-ms") == 0 && i + 1 < argc) learn_timeout_ms = atoll(argv[++i]);
         else if (strcmp(argv[i], "--learn-hold-ms") == 0 && i + 1 < argc) learn_hold_ms = atoll(argv[++i]);
@@ -4356,9 +4648,12 @@ int main(int argc, char **argv) {
     }
     if (device_override && strcmp(device_override, "auto") == 0) device_override = NULL;
 
+    if (do_selftest_transform) return selftest_transform();
+
     if (device_name_arg) sanitize_device_name(g_device_name, sizeof(g_device_name), device_name_arg);
     if (g_device_name[0] == '\0') sanitize_device_name(g_device_name, sizeof(g_device_name), DEFAULT_DEVICE_NAME);
-    snprintf(g_touch_device_name, sizeof(g_touch_device_name), "%s Touch", g_device_name);
+    if (!g_touch_name_overridden)
+        snprintf(g_touch_device_name, sizeof(g_touch_device_name), "%s Touch", g_device_name);
 
     if (do_dump) {
         struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_handler = on_signal;

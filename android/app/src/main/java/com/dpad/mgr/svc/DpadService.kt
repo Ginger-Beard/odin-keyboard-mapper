@@ -66,18 +66,29 @@ class DpadService : Service() {
 
     private lateinit var displayManager: DisplayManager
 
-    /** Feeds the live display rotation into the Supervisor so it can compensate touch coordinates
-     *  when the handheld is physically flipped. Only the default display matters here. */
+    /** Feeds the live display size + rotation into the Supervisor so it can tell the daemon the
+     *  current `touch.display W H R` (and compensate touch.generation when the handheld is
+     *  physically flipped). Only the default display matters here. */
     private val displayListener = object : DisplayManager.DisplayListener {
         override fun onDisplayAdded(displayId: Int) {}
         override fun onDisplayRemoved(displayId: Int) {}
         override fun onDisplayChanged(displayId: Int) {
             if (displayId != Display.DEFAULT_DISPLAY) return
-            supervisor.setDisplayRotation(currentRotation())
+            val (w, h) = currentDisplaySize()
+            supervisor.setDisplayMetrics(w, h, currentRotation())
         }
     }
 
     private fun currentRotation(): Int = displayManager.getDisplay(Display.DEFAULT_DISPLAY)?.rotation ?: 0
+
+    /** The default display's current logical size in px (rotation-adjusted, e.g. 1920x1080 in
+     *  landscape) -- what `touch.display W H` reports to the daemon. */
+    @Suppress("DEPRECATION")
+    private fun currentDisplaySize(): Pair<Int, Int> {
+        val p = android.graphics.Point()
+        runCatching { displayManager.getDisplay(Display.DEFAULT_DISPLAY)?.getRealSize(p) }
+        return p.x to p.y
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -99,7 +110,7 @@ class DpadService : Service() {
         ServiceState.serviceRunning.value = true
 
         displayManager = getSystemService(DisplayManager::class.java)
-        supervisor.seedRotation(currentRotation())
+        run { val (w, h) = currentDisplaySize(); supervisor.seedDisplayMetrics(w, h, currentRotation()) }
         displayManager.registerDisplayListener(displayListener, null)
 
         scope.launch {
@@ -115,7 +126,10 @@ class DpadService : Service() {
                 // Re-seed the rotation whenever the serve daemon (re)spawns (fresh process, or a
                 // respawn after death/restart): a fresh daemon always creates its touchscreen
                 // clone fresh at the current rotation, so this must not bump touch.generation.
-                if (s is DaemonState.Starting) supervisor.seedRotation(currentRotation())
+                if (s is DaemonState.Starting) {
+                    val (w, h) = currentDisplaySize()
+                    supervisor.seedDisplayMetrics(w, h, currentRotation())
+                }
                 // Clear the test countdown once the daemon state shows the test truly ended:
                 // fully idle, or running/starting the real assigned target (pkg != null). Backoff
                 // and Failed are left alone since they can happen mid-test as well as mid-run.
@@ -341,6 +355,11 @@ class DpadService : Service() {
         ServiceState.supervisor = null
         runCatching { Shizuku.removeBinderReceivedListener(shizukuBinderListener) }
         runCatching { displayManager.unregisterDisplayListener(displayListener) }
+        // Clean stop: tear down the Shizuku user-service helper process (unbind with remove=true)
+        // rather than leaving it to Shizuku's own timeout, so a normal service restart doesn't
+        // leak a `com.dpad.mgr:dpad` process. See ShizukuUserService's init for the belt-and-
+        // suspenders sweep that also catches ones leaked despite this.
+        probe.release()
         scope.cancel()
         super.onDestroy()
     }

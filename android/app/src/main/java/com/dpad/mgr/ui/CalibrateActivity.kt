@@ -69,7 +69,7 @@ import kotlin.math.roundToInt
  * on-screen crosshair (which follows the raw touch position) is centered on the dot and lifts;
  * the drag's end-minus-start delta is one sample. Samples can be collected at multiple dot
  * positions (center, then the four corners) and averaged (plain mean, no outlier rejection) into
- * a screen-space offset, which is converted to panel units and saved; step 2 runs the daemon in
+ * a screen-space offset, which IS the display-space offset and is saved as-is; step 2 runs the daemon in
  * TEST mode with the offset applied so the user can verify (and nudge) it. Runs full-screen while the
  * Supervisor is suspended (daemon stopped, foreground changes ignored) so calibration taps are
  * never intercepted or shifted by a live daemon.
@@ -522,7 +522,7 @@ private fun CalibrateScreen(
                         Button(
                             modifier = Modifier.heightIn(min = 48.dp),
                             onClick = {
-                                val (dx, dy) = Calibration.toPanelOffset(meanX, meanY, rotation, natSize.natW, natSize.natH, panelMaxX, panelMaxY)
+                                val (dx, dy) = Calibration.toPanelOffset(meanX, meanY, natSize.natW, natSize.natH, panelMaxX, panelMaxY)
                                 resultDx = dx; resultDy = dy
                                 val rotName = when (rotation) {
                                     Calibration.ROTATION_90 -> "ROTATION_90"
@@ -532,7 +532,7 @@ private fun CalibrateScreen(
                                 }
                                 Log.i(
                                     TAG,
-                                    "calib: continue meanDelta=($meanX,$meanY) rotation=$rotName -> panelOffset=($dx,$dy)",
+                                    "calib: continue meanDelta=($meanX,$meanY) rotation=$rotName -> displayOffset=($dx,$dy)",
                                 )
                                 saveOffset(dx, dy, liveUpdate = false)
                                 phase = Phase.VERIFY
@@ -594,10 +594,10 @@ private fun CalibrateScreen(
                     Modifier.align(Alignment.CenterStart),
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
-                    NudgeButton("←") { nudge(ctx, profileName, data, -1f, 0f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
-                    NudgeButton("→") { nudge(ctx, profileName, data, 1f, 0f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
-                    NudgeButton("↑") { nudge(ctx, profileName, data, 0f, -1f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
-                    NudgeButton("↓") { nudge(ctx, profileName, data, 0f, 1f, rotation, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
+                    NudgeButton("←") { nudge(ctx, profileName, data, -1f, 0f, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
+                    NudgeButton("→") { nudge(ctx, profileName, data, 1f, 0f, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
+                    NudgeButton("↑") { nudge(ctx, profileName, data, 0f, -1f, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
+                    NudgeButton("↓") { nudge(ctx, profileName, data, 0f, 1f, natSize, panelMaxX, panelMaxY); countdown = CalibrateActivity.VERIFY_COUNTDOWN_S; kept = false }
                 }
                 OutlinedButton(
                     modifier = Modifier.align(Alignment.Center).heightIn(min = 48.dp),
@@ -646,12 +646,12 @@ private fun NudgeButton(label: String, onClick: () -> Unit) {
 
 private fun nudge(
     ctx: android.content.Context, profileName: String, data: com.dpad.mgr.core.AppData,
-    dsx: Float, dsy: Float, rotation: Int, natSize: Calibration.NaturalSize, panelMaxX: Int, panelMaxY: Int,
+    dsx: Float, dsy: Float, natSize: Calibration.NaturalSize, panelMaxX: Int, panelMaxY: Int,
 ) {
     val cur = data.profile(profileName) ?: return
-    val (ddx, ddy) = Calibration.toPanelOffset(dsx, dsy, rotation, natSize.natW, natSize.natH, panelMaxX, panelMaxY)
+    val (ddx, ddy) = Calibration.toPanelOffset(dsx, dsy, natSize.natW, natSize.natH, panelMaxX, panelMaxY)
     val updated = cur.copy(touchOffsetEnabled = true, touchDx = cur.touchDx + ddx, touchDy = cur.touchDy + ddy)
     Store.saveProfile(updated, cur.name)
-    Log.i(TAG, "calib: nudge screen=(${dsx.roundToInt()},${dsy.roundToInt()}) -> panel offset now (${updated.touchDx},${updated.touchDy})")
+    Log.i(TAG, "calib: nudge screen=(${dsx.roundToInt()},${dsy.roundToInt()}) -> display offset now (${updated.touchDx},${updated.touchDy})")
     DpadService.send(ctx, DpadService.ACTION_UPDATE_CONFIG_LIVE, profile = updated.name)
 }

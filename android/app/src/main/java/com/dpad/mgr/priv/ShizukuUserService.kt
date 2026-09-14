@@ -33,6 +33,39 @@ class ShizukuUserService() : IUserService.Stub() {
             val p = ProcessBuilder("pkill", "-f", "logcat -b events").redirectErrorStream(true).start()
             p.waitFor(2, TimeUnit.SECONDS)
         }.onFailure { Log.w(TAG, "userservice: startup pkill failed: $it") }
+
+        killOtherHelperProcesses()
+    }
+
+    /**
+     * Belt-and-suspenders for leaked helper processes: DpadService.onDestroy now unbinds with
+     * remove=true on a clean stop (see PrivProbe.release/ShizukuShell.release), but a Shizuku
+     * rebind, an app force-stop, or an older build's install can still leave a stale
+     * `com.dpad.mgr:dpad` process (this service's own Shizuku process name, set via
+     * UserServiceArgs.processNameSuffix("dpad")) running under uid shell. Every time a NEW
+     * instance of this process starts, kill every OTHER process with that exact cmdline --
+     * never this one, compared by pid against Process.myPid() so a fresh instance never kills
+     * itself mid-startup.
+     */
+    private fun killOtherHelperProcesses() {
+        val myPid = android.os.Process.myPid()
+        var killed = 0
+        runCatching {
+            File("/proc").listFiles { f -> f.isDirectory && f.name.toIntOrNull() != null }?.forEach { procDir ->
+                val pid = procDir.name.toIntOrNull() ?: return@forEach
+                if (pid == myPid) return@forEach
+                val cmdline = runCatching {
+                    File(procDir, "cmdline").readBytes().toString(Charsets.UTF_8).trimEnd('\u0000')
+                }.getOrNull() ?: return@forEach
+                if (cmdline == HELPER_PROCESS_NAME) {
+                    runCatching {
+                        ProcessBuilder("kill", "-TERM", pid.toString()).redirectErrorStream(true).start().waitFor(2, TimeUnit.SECONDS)
+                    }.onFailure { Log.w(TAG, "userservice: kill of leaked pid=$pid failed: $it") }
+                    killed++
+                }
+            }
+        }.onFailure { Log.w(TAG, "userservice: leaked-helper sweep failed: $it") }
+        if (killed > 0) Log.i(TAG, "userservice: killed $killed leaked '$HELPER_PROCESS_NAME' process(es)")
     }
 
     override fun exec(argv: Array<String>): Bundle = execTimeout(argv, 20_000)
@@ -246,5 +279,8 @@ class ShizukuUserService() : IUserService.Stub() {
     companion object {
         private const val TAG = "DpadMgr"
         const val LOG = "/data/local/tmp/dpadkeys.log"
+        /** This service's Shizuku process name (package + UserServiceArgs.processNameSuffix("dpad")
+         *  in ShizukuShell), as it appears verbatim in each pid's /proc cmdline file. */
+        private const val HELPER_PROCESS_NAME = "com.dpad.mgr:dpad"
     }
 }
