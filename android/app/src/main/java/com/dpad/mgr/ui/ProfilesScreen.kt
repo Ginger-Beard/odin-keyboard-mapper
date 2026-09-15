@@ -2,12 +2,14 @@ package com.dpad.mgr.ui
 
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -18,8 +20,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
@@ -33,21 +38,23 @@ import androidx.compose.material3.InputChipDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.surfaceColorAtElevation
 import android.content.Context
 import android.content.Intent
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -58,6 +65,7 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -100,7 +108,7 @@ fun ProfilesScreen(modifier: Modifier = Modifier) {
                 onClick = { editing = null to Profile(name = uniqueName("New profile", data.profiles.map { it.name }), touchSpace = "display") },
             ) { Text("New profile") }
         }
-        LazyColumn(contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 16.dp)) {
+        LazyColumn(contentPadding = PaddingValues(bottom = 16.dp)) {
             items(data.profiles, key = { it.name }) { p ->
                 val used = data.assignments.count { it.value == p.name }
                 Row(
@@ -161,24 +169,32 @@ private data class PanicConflict(val chord: String, val message: String)
 
 /**
  * Editor for one profile. Every change persists to the Store immediately: this editor never has
- * "unsaved" state, so there is no Save button — only a debounce on text/slider fields to avoid
- * hammering disk + the daemon on every keystroke/drag tick. [original] is the profile name as it
- * stood when this editor session began (or null for a brand-new profile); it is intentionally
- * never mutated so "Reset to default" keeps working after a mid-session rename. All Store lookups
- * instead key off [persistedName] below, which tracks whatever name the draft is currently saved
- * under and is updated in place on every successful save (including renames and Duplicate) --
- * this editor composable is never re-created (no re-keying) for any of that to happen.
+ * "unsaved" state, so there is no Save button — only a debounce on text fields to avoid hammering
+ * disk + the daemon on every keystroke. Deadzone and wheel repeat are steppers (not sliders), so
+ * they commit on every tap with no debounce -- see [stepDeadzone]/[stepWheel]. [original] is the
+ * profile name as it stood when this editor session began (or null for a brand-new profile); it is
+ * intentionally never mutated so "Reset to default" keeps working after a mid-session rename. All
+ * Store lookups instead key off [persistedName] below, which tracks whatever name the draft is
+ * currently saved under and is updated in place on every successful save (including renames and
+ * Duplicate) -- this editor composable is never re-created (no re-keying) for any of that to
+ * happen.
  *
  * `draft` is a pure VIEW derived from [Store.data] (the profile currently stored under
  * [persistedName]) -- this editor never holds its own authoritative copy of the profile, so it can
  * never write a stale field back over a concurrent writer's change (notably CalibrateActivity's
- * touch offset). Every edit -- bind/unbind, a switch, a slider, a rename, Duplicate, Reset to
+ * touch offset). Every edit -- bind/unbind, a switch, a stepper, a rename, Duplicate, Reset to
  * default -- persists as a field-level merge onto whatever's currently in the Store, via
  * [Store.updateProfile] (or [Store.saveProfile] for the rename/Duplicate/create cases that need its
  * name-keyed/assignment-remapping behavior), never as a whole-draft overwrite. The only local state
- * is transient: `nameText`/`deadzoneLocal`/`wheelLocal` hold in-progress values for the three
- * debounced fields while their save is still pending, so typing/dragging stays responsive; they're
- * cleared the moment the debounced write lands.
+ * is transient: `nameText`/`touchXText`/`touchYText` hold in-progress values for the three
+ * debounced fields while their save is still pending, so typing stays responsive; they're cleared
+ * the moment the debounced write lands.
+ *
+ * The body below is a [LazyColumn] (not a scrolled [Column]) so the Keys card's often-huge
+ * "Unassigned" list is only composed/laid out near the viewport, and each row/section is its own
+ * keyed item so an edit to one row's data doesn't force every other row to recompose -- both of
+ * which is what made scrolling stutter (and made it easy to snag the deadzone/wheel sliders by
+ * accident) before this was a plain scrolled Column of everything.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -214,16 +230,9 @@ fun ProfileEditor(
     val stored = storeData.profile(persistedName) ?: initial
     var nameText by remember { mutableStateOf<String?>(null) }
     var nameJob by remember { mutableStateOf<Job?>(null) }
-    var deadzoneLocal by remember { mutableStateOf<Float?>(null) }
-    var deadzoneJob by remember { mutableStateOf<Job?>(null) }
-    var wheelLocal by remember { mutableStateOf<Int?>(null) }
-    var wheelJob by remember { mutableStateOf<Job?>(null) }
-    val draft = stored.copy(
-        name = nameText ?: stored.name,
-        deadzone = deadzoneLocal ?: stored.deadzone,
-        wheelRepeatMs = wheelLocal ?: stored.wheelRepeatMs,
-    )
+    val draft = stored.copy(name = nameText ?: stored.name)
     val nameClash = draft.name.isBlank() || (draft.name != persistedName && draft.name in existingNames)
+    val listState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
 
     // Stylus offset, in DISPLAY pixels as seen on screen in the game's orientation: the stored
     // profile holds touchDx/touchDy directly in this space (see Profile.touchSpace / Store's
@@ -277,18 +286,14 @@ fun ProfileEditor(
         flashSaved()
     }
 
-    fun commitDeadzone(v: Float) {
-        val name = persistedName ?: return
-        Store.updateProfile(name) { p -> p.copy(deadzone = v) }
-        deadzoneLocal = null
-        flashSaved()
+    /** Steppers commit immediately (no debounce): each tap re-reads the CURRENTLY stored value
+     *  inside the mutate lambda so rapid taps never race against a stale closed-over value. */
+    fun stepDeadzone(delta: Float) {
+        changeNow { d -> d.copy(deadzone = (d.deadzone + delta).coerceIn(0.2f, 0.8f)) }
     }
 
-    fun commitWheel(v: Int) {
-        val name = persistedName ?: return
-        Store.updateProfile(name) { p -> p.copy(wheelRepeatMs = v) }
-        wheelLocal = null
-        flashSaved()
+    fun stepWheel(delta: Int) {
+        changeNow { d -> d.copy(wheelRepeatMs = (d.wheelRepeatMs + delta).coerceIn(60, 400)) }
     }
 
     /** Reads the CURRENTLY stored profile's touch offset back out as a display-space (horizontal,
@@ -330,10 +335,6 @@ fun ProfileEditor(
     fun flushPending() {
         nameJob?.cancel(); nameJob = null
         nameText?.let { commitName(it) }
-        deadzoneJob?.cancel(); deadzoneJob = null
-        deadzoneLocal?.let { commitDeadzone(it) }
-        wheelJob?.cancel(); wheelJob = null
-        wheelLocal?.let { commitWheel(it) }
         touchXJob?.cancel(); touchXJob = null
         touchXText?.toIntOrNull()?.let { commitTouchX(it) }
         touchYJob?.cancel(); touchYJob = null
@@ -361,236 +362,271 @@ fun ProfileEditor(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    // Keys section rows/groups: computed once per recomposition of this whole editor (cheap --
+    // linear scans over Keys.ALL, ~150 entries) and handed to the LazyColumn below as item lists.
+    // Per-row *content* (a row's bound sources, its callbacks) is still derived independently
+    // inside each item so an edit to one row doesn't invalidate its siblings -- see the per-row
+    // remember(...)/derivedStateOf blocks below.
+    val assignedKeys = Keys.ALL.filter { draft.sourcesFor(it.keyName).isNotEmpty() }
+    val assignedNames = assignedKeys.map { it.keyName }.toSet()
+    val unassignedCount = Keys.ALL.count { it.keyName !in assignedNames }
+    val groupsWithUnassigned = Keys.GROUPS.mapNotNull { g ->
+        val ks = g.keys.filter { it.keyName !in assignedNames }
+        if (ks.isEmpty()) null else g to ks
+    }
+    val toggleIsLastKeysItem = !showUnassigned || groupsWithUnassigned.isEmpty()
+
     Box(modifier.fillMaxSize().focusRequester(rootFocusRequester).focusTarget()) {
-        Column(
-            Modifier.fillMaxWidth().padding(12.dp).verticalScroll(rememberScrollState()),
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.fillMaxWidth().padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
+            contentPadding = PaddingValues(bottom = 24.dp),
         ) {
             // ---- Header card ----
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(
-                        draft.name,
-                        { text ->
-                            nameText = text
-                            nameJob?.cancel()
-                            nameJob = scope.launch { delay(300); commitName(text) }
-                        },
-                        Modifier.fillMaxWidth(),
-                        label = { Text("Profile name") }, isError = nameClash, singleLine = true,
-                    )
-                    AnimatedVisibility(visible = showSaved, exit = fadeOut()) {
-                        Text("Saved", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        val def = builtinDefault(original)
-                        if (def != null) {
-                            OutlinedButton(modifier = Modifier.heightIn(min = 48.dp), onClick = { changeNow { def } }) {
-                                Text("Reset to default")
-                            }
-                        }
-                        OutlinedButton(
-                            modifier = Modifier.heightIn(min = 48.dp),
-                            onClick = {
-                                flushPending()
-                                val base = persistedName?.let { Store.data.value.profile(it) } ?: draft
-                                val dup = base.copy(name = uniqueName("${base.name} copy", existingNames))
-                                Store.saveProfile(dup)
-                                persistedName = dup.name
-                                flashSaved()
+            item(key = "header") {
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(
+                            draft.name,
+                            { text ->
+                                nameText = text
+                                nameJob?.cancel()
+                                nameJob = scope.launch { delay(300); commitName(text) }
                             },
-                        ) { Text("Duplicate") }
-                        if (persistedName != null) {
-                            TextButton(
+                            Modifier.fillMaxWidth(),
+                            label = { Text("Profile name") }, isError = nameClash, singleLine = true,
+                        )
+                        AnimatedVisibility(visible = showSaved, exit = fadeOut()) {
+                            Text("Saved", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            val def = builtinDefault(original)
+                            if (def != null) {
+                                OutlinedButton(modifier = Modifier.heightIn(min = 48.dp), onClick = { changeNow { def } }) {
+                                    Text("Reset to default")
+                                }
+                            }
+                            OutlinedButton(
                                 modifier = Modifier.heightIn(min = 48.dp),
-                                enabled = existingNames.size > 1,
-                                onClick = { confirmDelete = true },
-                            ) { Text("Delete") }
+                                onClick = {
+                                    flushPending()
+                                    val base = persistedName?.let { Store.data.value.profile(it) } ?: draft
+                                    val dup = base.copy(name = uniqueName("${base.name} copy", existingNames))
+                                    Store.saveProfile(dup)
+                                    persistedName = dup.name
+                                    flashSaved()
+                                },
+                            ) { Text("Duplicate") }
+                            if (persistedName != null) {
+                                TextButton(
+                                    modifier = Modifier.heightIn(min = 48.dp),
+                                    enabled = existingNames.size > 1,
+                                    onClick = { confirmDelete = true },
+                                ) { Text("Delete") }
+                            }
                         }
                     }
                 }
             }
 
-            // ---- Keys section ----
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            // ---- Keys section: header, then one item per bound key row, then the Unassigned
+            // toggle, then (when expanded) one item per key group with any unassigned keys. All
+            // share a background so they still read as one continuous card. ----
+            item(key = "keysHeader") {
+                Column(
+                    Modifier.keysCardSection(top = true).padding(top = 16.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
                     Text("Keys", style = MaterialTheme.typography.titleMedium)
                     Text(
                         "To bind a combo, hold a button while pressing the control during Bind.",
                         style = MaterialTheme.typography.bodySmall,
                     )
-                    Spacer(Modifier.height(4.dp))
-                    val assignedKeys = Keys.ALL.filter { draft.sourcesFor(it.keyName).isNotEmpty() }
-                    val assignedNames = assignedKeys.map { it.keyName }.toSet()
                     if (assignedKeys.isEmpty()) {
+                        Spacer(Modifier.height(4.dp))
                         Text("No keys mapped yet.", style = MaterialTheme.typography.bodySmall)
                     }
-                    for (k in assignedKeys) {
-                        KeyRow(
-                            k, draft.sourcesFor(k.keyName),
-                            onUnbind = { src -> changeNow { d -> d.unbind(src) } },
-                            onBind = { binding = k.keyName },
-                            onWarningClick = if (k.keyName in Keys.WHEEL_TARGETS) ({ showWheelWarning = true }) else null,
-                        )
-                    }
-                    val unassignedCount = Keys.ALL.count { it.keyName !in assignedNames }
+                }
+            }
+            items(assignedKeys, key = { "keyrow:${it.keyName}" }) { k ->
+                val sourcesState = remember(k.keyName) {
+                    derivedStateOf { (storeData.profile(persistedName) ?: initial).sourcesFor(k.keyName) }
+                }
+                val sources by sourcesState
+                val onUnbind = remember(k.keyName) { { src: String -> changeNow { d -> d.unbind(src) } } }
+                val onBind = remember(k.keyName) { { binding = k.keyName } }
+                val onWarningClick = remember(k.keyName) {
+                    if (k.keyName in Keys.WHEEL_TARGETS) ({ showWheelWarning = true }) else null
+                }
+                Column(Modifier.keysCardSection()) {
+                    KeyRow(k, sources, onUnbind, onBind, onWarningClick)
+                }
+            }
+            item(key = "unassignedToggle") {
+                Column(Modifier.keysCardSection(bottom = toggleIsLastKeysItem)) {
                     TextButton(modifier = Modifier.heightIn(min = 48.dp), onClick = { showUnassigned = !showUnassigned }) {
                         Text(if (showUnassigned) "Hide unassigned" else "Unassigned ($unassignedCount)")
                     }
-                    if (showUnassigned) {
-                        for (group in Keys.GROUPS) {
-                            val groupUnassigned = group.keys.filter { it.keyName !in assignedNames }
-                            if (groupUnassigned.isEmpty()) continue
-                            Text(group.label, style = MaterialTheme.typography.titleSmall)
-                            for (k in groupUnassigned) {
-                                KeyRow(
-                                    k, draft.sourcesFor(k.keyName),
-                                    onUnbind = { src -> changeNow { d -> d.unbind(src) } },
-                                    onBind = { binding = k.keyName },
-                                    onWarningClick = if (k.keyName in Keys.WHEEL_TARGETS) ({ showWheelWarning = true }) else null,
-                                    forceEnabled = k.keyName == "KEY_Q" && storeData.allowQ,
-                                    onAllowClick = if (k.keyName == "KEY_Q" && !storeData.allowQ) ({ showAllowQDialog = true }) else null,
-                                )
+                }
+            }
+            if (showUnassigned) {
+                itemsIndexed(groupsWithUnassigned, key = { _, (g, _) -> "unassignedGroup:${g.label}" }) { idx, (group, keys) ->
+                    Column(
+                        Modifier.keysCardSection(bottom = idx == groupsWithUnassigned.lastIndex)
+                            .padding(bottom = if (idx == groupsWithUnassigned.lastIndex) 16.dp else 0.dp),
+                    ) {
+                        Text(group.label, style = MaterialTheme.typography.titleSmall)
+                        for (k in keys) {
+                            val sourcesState = remember(k.keyName) {
+                                derivedStateOf { (storeData.profile(persistedName) ?: initial).sourcesFor(k.keyName) }
                             }
+                            val sources by sourcesState
+                            val onUnbind = remember(k.keyName) { { src: String -> changeNow { d -> d.unbind(src) } } }
+                            val onBind = remember(k.keyName) { { binding = k.keyName } }
+                            val onWarningClick = remember(k.keyName) {
+                                if (k.keyName in Keys.WHEEL_TARGETS) ({ showWheelWarning = true }) else null
+                            }
+                            val forceEnabled = k.keyName == "KEY_Q" && storeData.allowQ
+                            val onAllowClick = if (k.keyName == "KEY_Q" && !storeData.allowQ) ({ showAllowQDialog = true }) else null
+                            KeyRow(k, sources, onUnbind, onBind, onWarningClick, forceEnabled, onAllowClick)
                         }
                     }
                 }
             }
 
             // ---- Sticks section ----
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    StickRow(
-                        "Left stick", draft.lsInvertY, { v -> changeNow { d -> d.copy(lsInvertY = v) } },
-                        draft.lsInvertX, { v -> changeNow { d -> d.copy(lsInvertX = v) } },
-                    )
-                    StickRow(
-                        "Right stick", draft.rsInvertY, { v -> changeNow { d -> d.copy(rsInvertY = v) } },
-                        draft.rsInvertX, { v -> changeNow { d -> d.copy(rsInvertX = v) } },
-                    )
-                    Text("Deadzone: ${"%.2f".format(draft.deadzone)}", style = MaterialTheme.typography.bodyMedium)
-                    Slider(
-                        value = draft.deadzone,
-                        onValueChange = { v ->
-                            deadzoneLocal = v
-                            deadzoneJob?.cancel()
-                            deadzoneJob = scope.launch { delay(300); commitDeadzone(v) }
-                        },
-                        valueRange = 0.2f..0.8f, steps = 11,
-                    )
-                    Text("Wheel repeat: ${draft.wheelRepeatMs} ms", style = MaterialTheme.typography.bodyMedium)
-                    Slider(
-                        value = draft.wheelRepeatMs.toFloat(),
-                        onValueChange = { v ->
-                            val iv = v.toInt()
-                            wheelLocal = iv
-                            wheelJob?.cancel()
-                            wheelJob = scope.launch { delay(300); commitWheel(iv) }
-                        },
-                        valueRange = 60f..400f, steps = 32,
-                    )
+            item(key = "sticks") {
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        StickRow(
+                            "Left stick", draft.lsInvertY, { v -> changeNow { d -> d.copy(lsInvertY = v) } },
+                            draft.lsInvertX, { v -> changeNow { d -> d.copy(lsInvertX = v) } },
+                        )
+                        StickRow(
+                            "Right stick", draft.rsInvertY, { v -> changeNow { d -> d.copy(rsInvertY = v) } },
+                            draft.rsInvertX, { v -> changeNow { d -> d.copy(rsInvertX = v) } },
+                        )
+                        StepperRow(
+                            "Deadzone", "%.2f".format(draft.deadzone),
+                            onDec = { stepDeadzone(-0.05f) }, onInc = { stepDeadzone(0.05f) },
+                            decEnabled = draft.deadzone > 0.2f, incEnabled = draft.deadzone < 0.8f,
+                        )
+                        StepperRow(
+                            "Wheel repeat", "${draft.wheelRepeatMs} ms",
+                            onDec = { stepWheel(-10) }, onInc = { stepWheel(10) },
+                            decEnabled = draft.wheelRepeatMs > 60, incEnabled = draft.wheelRepeatMs < 400,
+                        )
+                    }
                 }
             }
 
             // ---- Panic chord card ----
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Panic chord", style = MaterialTheme.typography.titleMedium)
-                    Text(
-                        "Hold this to stop mapping from inside a game: 1 second pauses, 4 seconds restarts the daemon. Required before enabling the stylus offset.",
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        val chord = draft.panicChord
-                        if (chord != null) {
-                            InputChip(
-                                selected = false,
-                                onClick = {
-                                    changeNow { d -> d.copy(panicChord = null) }
-                                    if (draft.touchOffsetEnabled) {
-                                        changeNow(live = true) { d -> d.copy(touchOffsetEnabled = false) }
-                                        scope.launch { snackbarHostState.showSnackbar("Stylus offset turned off: no panic chord") }
-                                    }
-                                },
-                                label = { Text(SourceNames.chordLabel(chord)) },
-                                trailingIcon = { Icon(Icons.Default.Close, contentDescription = "Clear panic chord", Modifier.size(InputChipDefaults.IconSize)) },
-                            )
-                        } else {
-                            Text("Not set", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+            item(key = "panic") {
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Panic chord", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            "Hold this to stop mapping from inside a game: 1 second pauses, 4 seconds restarts the daemon. Required before enabling the stylus offset.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            val chord = draft.panicChord
+                            if (chord != null) {
+                                InputChip(
+                                    selected = false,
+                                    onClick = {
+                                        changeNow { d -> d.copy(panicChord = null) }
+                                        if (draft.touchOffsetEnabled) {
+                                            changeNow(live = true) { d -> d.copy(touchOffsetEnabled = false) }
+                                            scope.launch { snackbarHostState.showSnackbar("Stylus offset turned off: no panic chord") }
+                                        }
+                                    },
+                                    label = { Text(SourceNames.chordLabel(chord)) },
+                                    trailingIcon = { Icon(Icons.Default.Close, contentDescription = "Clear panic chord", Modifier.size(InputChipDefaults.IconSize)) },
+                                )
+                            } else {
+                                Text("Not set", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+                            }
+                            Spacer(Modifier.weight(1f))
+                            OutlinedButton(modifier = Modifier.heightIn(min = 48.dp), onClick = { settingPanic = true }) { Text("Set by pressing…") }
                         }
-                        Spacer(Modifier.weight(1f))
-                        OutlinedButton(modifier = Modifier.heightIn(min = 48.dp), onClick = { settingPanic = true }) { Text("Set by pressing…") }
                     }
                 }
             }
 
             // ---- Stylus offset card ----
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("Stylus offset", style = MaterialTheme.typography.titleMedium)
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Text("Enabled", Modifier.weight(1f))
-                        Switch(
-                            checked = draft.touchOffsetEnabled,
-                            enabled = draft.panicChord != null,
-                            onCheckedChange = { v -> changeNow(live = true) { d -> d.copy(touchOffsetEnabled = v) } },
+            item(key = "stylus") {
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("Stylus offset", style = MaterialTheme.typography.titleMedium)
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text("Enabled", Modifier.weight(1f))
+                            Switch(
+                                checked = draft.touchOffsetEnabled,
+                                enabled = draft.panicChord != null,
+                                onCheckedChange = { v -> changeNow(live = true) { d -> d.copy(touchOffsetEnabled = v) } },
+                            )
+                        }
+                        if (draft.panicChord == null) {
+                            Text("Set a panic chord first", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                        }
+                        Text(
+                            "Only active while the assigned game is in front. To turn it off from inside the game, hold " +
+                                (draft.panicChord?.let { SourceNames.chordLabel(it) } ?: "the panic chord") +
+                                " for 1 second. Turning Enabled off keeps these values, ready to restore.",
+                            style = MaterialTheme.typography.bodySmall,
                         )
+                        Text("Offset, as seen in landscape", style = MaterialTheme.typography.bodySmall)
+                        OffsetRow(
+                            "Horizontal", touchXText ?: storedScreenX.toString(),
+                            onStep = { delta ->
+                                touchXJob?.cancel(); touchXJob = null
+                                val cur = touchXText?.toIntOrNull() ?: storedScreenX
+                                commitTouchX((cur + delta).coerceIn(-Calibration.MAX_OFFSET, Calibration.MAX_OFFSET))
+                            },
+                            onTextChange = { text ->
+                                touchXText = text
+                                touchXJob?.cancel()
+                                touchXJob = scope.launch { delay(300); text.toIntOrNull()?.let { commitTouchX(it) } }
+                            },
+                        )
+                        OffsetRow(
+                            "Vertical", touchYText ?: storedScreenY.toString(),
+                            onStep = { delta ->
+                                touchYJob?.cancel(); touchYJob = null
+                                val cur = touchYText?.toIntOrNull() ?: storedScreenY
+                                commitTouchY((cur + delta).coerceIn(-Calibration.MAX_OFFSET, Calibration.MAX_OFFSET))
+                            },
+                            onTextChange = { text ->
+                                touchYText = text
+                                touchYJob?.cancel()
+                                touchYJob = scope.launch { delay(300); text.toIntOrNull()?.let { commitTouchY(it) } }
+                            },
+                        )
+                        OutlinedButton(
+                            modifier = Modifier.heightIn(min = 48.dp),
+                            enabled = draft.panicChord != null,
+                            onClick = {
+                                // Flush any pending debounced edit first so calibration (a separate
+                                // activity) has a fully up-to-date saved profile to read and write
+                                // touch offset fields on.
+                                flushPending()
+                                ctx.startActivity(Intent(ctx, CalibrateActivity::class.java).putExtra(CalibrateActivity.EXTRA_PROFILE, draft.name))
+                            },
+                        ) { Text("Calibrate…") }
                     }
-                    if (draft.panicChord == null) {
-                        Text("Set a panic chord first", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-                    }
-                    Text(
-                        "Only active while the assigned game is in front. To turn it off from inside the game, hold " +
-                            (draft.panicChord?.let { SourceNames.chordLabel(it) } ?: "the panic chord") +
-                            " for 1 second. Turning Enabled off keeps these values, ready to restore.",
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                    Text("Offset, as seen in landscape", style = MaterialTheme.typography.bodySmall)
-                    OffsetRow(
-                        "Horizontal", touchXText ?: storedScreenX.toString(),
-                        onStep = { delta ->
-                            touchXJob?.cancel(); touchXJob = null
-                            val cur = touchXText?.toIntOrNull() ?: storedScreenX
-                            commitTouchX((cur + delta).coerceIn(-Calibration.MAX_OFFSET, Calibration.MAX_OFFSET))
-                        },
-                        onTextChange = { text ->
-                            touchXText = text
-                            touchXJob?.cancel()
-                            touchXJob = scope.launch { delay(300); text.toIntOrNull()?.let { commitTouchX(it) } }
-                        },
-                    )
-                    OffsetRow(
-                        "Vertical", touchYText ?: storedScreenY.toString(),
-                        onStep = { delta ->
-                            touchYJob?.cancel(); touchYJob = null
-                            val cur = touchYText?.toIntOrNull() ?: storedScreenY
-                            commitTouchY((cur + delta).coerceIn(-Calibration.MAX_OFFSET, Calibration.MAX_OFFSET))
-                        },
-                        onTextChange = { text ->
-                            touchYText = text
-                            touchYJob?.cancel()
-                            touchYJob = scope.launch { delay(300); text.toIntOrNull()?.let { commitTouchY(it) } }
-                        },
-                    )
-                    OutlinedButton(
-                        modifier = Modifier.heightIn(min = 48.dp),
-                        enabled = draft.panicChord != null,
-                        onClick = {
-                            // Flush any pending debounced edit first so calibration (a separate
-                            // activity) has a fully up-to-date saved profile to read and write
-                            // touch offset fields on.
-                            flushPending()
-                            ctx.startActivity(Intent(ctx, CalibrateActivity::class.java).putExtra(CalibrateActivity.EXTRA_PROFILE, draft.name))
-                        },
-                    ) { Text("Calibrate…") }
                 }
             }
 
-            Spacer(Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(modifier = Modifier.heightIn(min = 48.dp), onClick = onDone) { Text("Done") }
+            item(key = "done") {
+                Column {
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(modifier = Modifier.heightIn(min = 48.dp), onClick = onDone) { Text("Done") }
+                    }
+                }
             }
-            Spacer(Modifier.height(24.dp))
         }
 
         SnackbarHost(snackbarHostState, Modifier.align(Alignment.BottomCenter))
@@ -747,6 +783,22 @@ private fun WheelWarningDialog(onDismiss: () -> Unit) {
     )
 }
 
+/** Backing for one LazyColumn item inside the Keys section (see [ProfileEditor]): a flat
+ *  surface-tinted background so a run of separately-keyed items (header, each key row, the
+ *  Unassigned toggle, each unassigned group) still reads as one continuous card, rounded only at
+ *  [top] and/or [bottom] of that run. */
+@Composable
+private fun Modifier.keysCardSection(top: Boolean = false, bottom: Boolean = false): Modifier {
+    val shape = RoundedCornerShape(
+        topStart = if (top) 12.dp else 0.dp, topEnd = if (top) 12.dp else 0.dp,
+        bottomStart = if (bottom) 12.dp else 0.dp, bottomEnd = if (bottom) 12.dp else 0.dp,
+    )
+    return this
+        .fillMaxWidth()
+        .background(MaterialTheme.colorScheme.surfaceColorAtElevation(1.dp), shape)
+        .padding(horizontal = 16.dp)
+}
+
 /** One target key: label, chips for each bound source (with × to unbind), and a "+ Bind" button —
  *  or, if [KeyDef.disabledReason] is set and [forceEnabled] is false, a greyed label/reason and no
  *  bind button (still shows any existing chips, so a legacy binding to a since-disabled key stays
@@ -829,12 +881,37 @@ private fun OffsetRow(label: String, text: String, onStep: (Int) -> Unit, onText
 }
 
 @Composable
-private fun OffsetStepButton(label: String, onClick: () -> Unit) {
+private fun OffsetStepButton(label: String, onClick: () -> Unit, enabled: Boolean = true) {
     OutlinedButton(
         modifier = Modifier.size(48.dp),
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
+        contentPadding = PaddingValues(0.dp),
+        enabled = enabled,
         onClick = onClick,
     ) { Text(label, style = MaterialTheme.typography.titleMedium) }
+}
+
+/** A labeled stepper row in the same style as [OffsetRow], but for a value that's read-only
+ *  between the −/+ buttons (no text field) and commits on every tap -- no debounce. Used for
+ *  Deadzone and Wheel repeat, which used to be [androidx.compose.material3.Slider]s; those were
+ *  easy to drag by accident while scrolling the editor, which this replaces. */
+@Composable
+private fun StepperRow(
+    label: String, valueText: String, onDec: () -> Unit, onInc: () -> Unit,
+    decEnabled: Boolean = true, incEnabled: Boolean = true,
+) {
+    Row(
+        Modifier.fillMaxWidth().heightIn(min = 48.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(label, Modifier.width(88.dp), style = MaterialTheme.typography.bodyMedium)
+        OffsetStepButton("−", onClick = onDec, enabled = decEnabled)
+        Text(
+            valueText, Modifier.width(84.dp), style = MaterialTheme.typography.bodyMedium,
+            textAlign = TextAlign.Center,
+        )
+        OffsetStepButton("+", onClick = onInc, enabled = incEnabled)
+    }
 }
 
 /** Compact per-stick row: label plus "Invert vertical" / "Invert horizontal" switches. */
