@@ -153,6 +153,19 @@ static const struct { const char *name; int code; } KEY_TABLE[] = {
     {"KEY_VOLUMEUP",KEY_VOLUMEUP},{"KEY_VOLUMEDOWN",KEY_VOLUMEDOWN},{"KEY_MUTE",KEY_MUTE},
     {"KEY_PLAYPAUSE",KEY_PLAYPAUSE},{"KEY_NEXTSONG",KEY_NEXTSONG},{"KEY_PREVIOUSSONG",KEY_PREVIOUSSONG},
     {"KEY_BACK",KEY_BACK},{"KEY_HOMEPAGE",KEY_HOMEPAGE},
+    /* Standard controller buttons as TARGETS: emitting these on the virtual
+     * device is identical to emitting a KEY_* target (same press-count logic
+     * in apply_target_press/release, same KEY_CNT-sized state arrays), and
+     * registering any of them makes Android classify the device as a
+     * GAMEPAD source in addition to KEYBOARD/MOUSE. See open_uinput_superset()
+     * and open_uinput() -- both already register a target's key bit whenever
+     * it's in KEY_TABLE, so no special-casing is needed here. */
+    {"BTN_SOUTH",BTN_SOUTH},{"BTN_EAST",BTN_EAST},{"BTN_NORTH",BTN_NORTH},{"BTN_WEST",BTN_WEST},
+    {"BTN_TL",BTN_TL},{"BTN_TR",BTN_TR},{"BTN_TL2",BTN_TL2},{"BTN_TR2",BTN_TR2},
+    {"BTN_SELECT",BTN_SELECT},{"BTN_START",BTN_START},{"BTN_MODE",BTN_MODE},
+    {"BTN_THUMBL",BTN_THUMBL},{"BTN_THUMBR",BTN_THUMBR},
+    {"BTN_DPAD_UP",BTN_DPAD_UP},{"BTN_DPAD_DOWN",BTN_DPAD_DOWN},
+    {"BTN_DPAD_LEFT",BTN_DPAD_LEFT},{"BTN_DPAD_RIGHT",BTN_DPAD_RIGHT},
 };
 #define KEY_TABLE_LEN (int)(sizeof(KEY_TABLE) / sizeof(KEY_TABLE[0]))
 #define TARGET_NONE -1
@@ -4575,7 +4588,7 @@ static int run_serve(config_t *cfg, const char *config_path, const char *device_
     {
         char pb[160];
         panic_spec_str(cfg, pb, sizeof(pb));
-        printf("dpadkeys: serve: keyboard+mouse ok, touch=%s, state=idle panic=%s\n",
+        printf("dpadkeys: serve: keyboard+mouse ok, touch=%s, state=idle panic=%s targets=keys+mouse+gamepad\n",
                touch_ok ? g_touch_path : "none",
                cfg->n_panic > 0 ? pb : "none");
     }

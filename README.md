@@ -112,7 +112,11 @@ line):
   `EV_KEY` code) and `abs.0xNN.neg` / `abs.0xNN.pos` (any `EV_ABS` axis,
   thresholded like a trigger).
 - Targets: a `KEY_*` name, `NONE` (explicit swallow), `WHEEL_UP` /
-  `WHEEL_DOWN`, or `MOD` (marks a source as the modifier).
+  `WHEEL_DOWN`, `MOD` (marks a source as the modifier), or a standard
+  controller-button name -- `BTN_SOUTH/EAST/NORTH/WEST`,
+  `BTN_TL/TR/TL2/TR2`, `BTN_SELECT/START/MODE/THUMBL/THUMBR`,
+  `BTN_DPAD_UP/DOWN/LEFT/RIGHT` -- emitted as a real button press on the
+  virtual device (Android then sees it as a GAMEPAD source too).
 - `deadzone <0..1>` — fraction of half-range that counts as pressed.
 - `ls.invert_y 0|1`, `rs.invert_y 0|1` — flip a stick's up/down.
 - `mod+<source> <target>` — binding that only applies while the modifier

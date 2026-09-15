@@ -477,6 +477,12 @@ fun ProfileEditor(
                             .padding(bottom = if (idx == groupsWithUnassigned.lastIndex) 16.dp else 0.dp),
                     ) {
                         Text(group.label, style = MaterialTheme.typography.titleSmall)
+                        if (group.label == "Controller buttons") {
+                            Text(
+                                "Sends real controller button presses from the virtual device (Android sees it as a gamepad too).",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
                         for (k in keys) {
                             val sourcesState = remember(k.keyName) {
                                 derivedStateOf { (storeData.profile(persistedName) ?: initial).sourcesFor(k.keyName) }

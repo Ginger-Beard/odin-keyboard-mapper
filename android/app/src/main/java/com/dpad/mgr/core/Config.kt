@@ -125,6 +125,28 @@ object Keys {
         add(KeyDef("Space", "KEY_SPACE"))
         add(KeyDef("Esc", "KEY_ESC"))
     }
+    /** "Controller buttons": standard gamepad button targets. The virtual device emits these as real
+     *  button presses (identical mechanism to a KEY_* target), which also makes Android see the
+     *  device as a GAMEPAD source in addition to KEYBOARD/MOUSE. */
+    val CONTROLLER: List<KeyDef> = listOf(
+        KeyDef("A (south)", "BTN_SOUTH"),
+        KeyDef("B (east)", "BTN_EAST"),
+        KeyDef("X (north)", "BTN_NORTH"),
+        KeyDef("Y (west)", "BTN_WEST"),
+        KeyDef("L1", "BTN_TL"),
+        KeyDef("R1", "BTN_TR"),
+        KeyDef("L2 button", "BTN_TL2"),
+        KeyDef("R2 button", "BTN_TR2"),
+        KeyDef("Select", "BTN_SELECT"),
+        KeyDef("Start", "BTN_START"),
+        KeyDef("Mode / Home", "BTN_MODE"),
+        KeyDef("L3", "BTN_THUMBL"),
+        KeyDef("R3", "BTN_THUMBR"),
+        KeyDef("D-pad up", "BTN_DPAD_UP"),
+        KeyDef("D-pad down", "BTN_DPAD_DOWN"),
+        KeyDef("D-pad left", "BTN_DPAD_LEFT"),
+        KeyDef("D-pad right", "BTN_DPAD_RIGHT"),
+    )
     val LETTERS: List<KeyDef> = ('A'..'Z').map { c ->
         if (c == 'Q') KeyDef("Q", "KEY_Q", disabledReason = Q_DISABLED_REASON) else KeyDef("$c", "KEY_$c")
     }
@@ -199,6 +221,7 @@ object Keys {
      *  "Unassigned" expansion). */
     val GROUPS: List<KeyGroup> = listOf(
         KeyGroup("Game keys", GAME),
+        KeyGroup("Controller buttons", CONTROLLER),
         KeyGroup("Letters", LETTERS),
         KeyGroup("Function F13–F24", FUNCTION_HIGH),
         KeyGroup("Editing", EDITING),
