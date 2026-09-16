@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.AlertDialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -60,6 +61,9 @@ fun LearnDialog(
 
     AlertDialog(
         onDismissRequest = cancel,
+        // Gamepad B falls back to BACK in Android's generic key map; while we are listening for a
+        // press, Back must not dismiss the dialog (that cancelled every attempt to bind B).
+        properties = DialogProperties(dismissOnBackPress = false, dismissOnClickOutside = false),
         title = { Text("Press a control") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
