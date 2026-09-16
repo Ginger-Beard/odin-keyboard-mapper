@@ -2,23 +2,27 @@
 
 Turns a handheld's built-in gamepad into real keyboard keystrokes, per app,
 with no root, no touch injection, and no accessibility service. Built for
-OSRS mobile on the AYN Odin 2 Portal. Works with any Android gamepad
-exposed as an evdev device — bind new controls by pressing them. The
-Retroid Pocket and AYN Thor are intended targets too, but untested.
+OSRS mobile on the AYN Odin 2 Portal and also tested on the Retroid Pocket
+5. Works with any Android gamepad exposed as an evdev device — bind
+controls by pressing them, nothing is hardcoded to one layout.
 
 ## How it works
 
 - A daemon (`dpadkeys`) opens the gamepad's kernel input device and grabs
-  it exclusively, so its raw input never reaches any app.
-- It emits keystrokes (and mouse-wheel events) from a virtual keyboard
-  device, translated from the pad according to a per-app profile.
-- The Android app assigns a profile to each app and starts/stops the
-  daemon automatically when the foreground app changes.
+  it exclusively while a profile is active, so its raw input never reaches
+  the game.
+- It emits keystrokes (or controller buttons, or mouse-wheel events) from
+  a virtual device, translated from the pad according to a per-app
+  profile.
+- One daemon stays running for as long as the app holds its privilege.
+  The Android app assigns a profile to each app and switches the daemon
+  between profiles (or idle) as the foreground app changes, so no input
+  device appears or disappears on each game launch.
 - Shizuku provides the shell rights the daemon needs to run, without
   rooting the device.
-- An optional touch offset (for stylus play) adds a second virtual
-  touchscreen with a fixed pixel offset; the mouse pointer is hidden while
-  scrolling.
+- An optional touch offset (for stylus play) adds a cloned touchscreen
+  with a fixed pixel offset. While a profile with wheel bindings is
+  active the mouse pointer is kept hidden.
 
 ## Install
 
@@ -43,22 +47,38 @@ Retroid Pocket and AYN Thor are intended targets too, but untested.
 ## Use
 
 - **Apps tab** — assign a profile to each app you want remapped. The
-  daemon starts and stops automatically as you switch apps.
-- **Profiles tab** — a key-first editor: pick the keys a game needs and
-  tap **Bind...** to assign the pad control that should send that key by
-  pressing it on the pad. A profile can designate one control as the
-  modifier button; controls bound under "While modifier held" only fire
-  while it's held. Sticks support inversion and a deadzone; the mouse
-  wheel has a configurable repeat rate.
-- **Status tab** — shows privilege source (Shizuku/root/none), the
-  detected pad, and whether the daemon is running.
-- **Stylus offset calibration** — from a profile, calibrate a fixed pixel
-  offset for stylus play: tap five targets, verify the offset feels
-  right, then tap **Keep** within 20 seconds or it reverts automatically.
-- **Safety** — press the Home button, or hold both back buttons for 1
-  second while inside the game, to disable an active touch offset
-  immediately. The app's own screens are never offset, only the target
-  game.
+  mapping switches on and off automatically as you switch apps.
+- **Profiles tab** — a key-first editor: every keyboard key and standard
+  controller button is listed, so pick the ones a game needs and tap
+  **Bind…** to assign the pad control that should send it by pressing that
+  control. Keys with nothing bound are collapsed under **Unassigned**.
+  To bind a combo, hold one button while pressing the control during
+  Bind; the binding then only fires while that button is held. Binding a
+  control that is already in use asks before moving it. Sticks map to
+  four directions (diagonals press two keys), with a deadzone and
+  horizontal/vertical inversion; the mouse wheel has a repeat rate.
+  Any pad control with no binding is swallowed while the profile is
+  active, so nothing leaks into the game.
+- **Panic chord** — each profile can set a button or combination to stop
+  the mapping from inside a game: hold it 1 second to pause, 4 seconds to
+  restart the daemon. There is no default; set it by pressing. A panic
+  chord is required before the stylus offset can be turned on.
+- **Stylus offset calibration** — from a profile, put the stylus down on
+  the target dot, slide until the crosshair sits on the dot, and lift;
+  repeat at more positions if you like. The verify step then runs the
+  offset live on a grid of targets: tap **Keep** within 45 seconds or it
+  reverts automatically, as it does if you leave the screen.
+- **Status tab** — shows Ready / Mapping / Needs setup, walks through
+  setup when access is missing, and has a Keep alive card (battery
+  exemption, the Q-key switch) plus an Advanced section for the raw
+  daemon state, a 30 second profile test and a daemon restart.
+- **The Q key** is greyed out by default: binding it makes Android treat
+  the virtual keyboard as a full keyboard and hide the on-screen keyboard
+  everywhere. The **Allow…** link on the key explains this and turns it
+  on if you want it anyway.
+- **Safety** — press Home to leave the game and everything is released
+  immediately; the panic chord does the same from inside it. The app's
+  own screens are never offset, only the target game.
 
 ## Device notes
 
@@ -66,9 +86,17 @@ Retroid Pocket and AYN Thor are intended targets too, but untested.
 for the game you're remapping — None/Disconnect removes the pad entirely
 and the daemon will see nothing. The back buttons M1/M2 are supported.
 
+**Retroid Pocket 5**: works as-is; the pad shows up as "Retroid Pocket
+Controller".
+
 **Other devices**: bind every control by pressing it; nothing is
-hardcoded to one pad's layout. Please report quirks (unusual button
-codes, axes that don't show up, etc).
+hardcoded to one pad's layout. Controls with no standard code are still
+bindable (they show as raw key/axis codes). Please report quirks
+(unusual button codes, axes that don't show up, etc).
+
+**Button letters**: the editor labels face buttons A/B/X/Y by the
+letter printed on your pad, not by position. Bind by pressing and the
+letters do not matter.
 
 ## OSRS and the rules
 
@@ -80,8 +108,10 @@ does not synthesize touches or otherwise inject input into the game
 surface — a previous project of the author's that did synthesize touches
 resulted in a ban. No warranty of any kind; use at your own risk.
 
-Wheel (scroll) bindings carry a fixed pointer position; see the in-app
-warning; not recommended for OSRS.
+Wheel (scroll) bindings reach the game as mouse scroll events, which
+Android attaches to a pointer position; the editor marks them with a
+ban-risk warning and they are not recommended for OSRS. Keyboard and
+controller-button bindings carry no position.
 
 ## For the security-minded
 
@@ -103,7 +133,8 @@ adb's own credentials; root would do the same. Concretely, the shell user is req
   this is what makes the mapped keystrokes real hardware events rather than injected ones;
 - learn which app is in the foreground by tailing the system's activity event log, which
   costs no usage-stats permission and is not visible to other apps;
-- hide the mouse pointer while a profile uses scroll-wheel targets (a hidden system call);
+- hide the mouse pointer while a profile uses scroll-wheel targets (a hidden system call,
+  re-applied periodically only while such a profile is active);
 - start, signal and stop the daemon, which runs as that same user.
 
 ### What cannot work without it
@@ -144,7 +175,8 @@ device, not by other apps):
   config errors, and panic-chord events. Never key presses, coordinates or contacts unless
   `--verbose` was given manually.
 - `dpadkeys.status` — one line of counters: state, whether touch is on, how many keys are
-  mapped, the panic count, live contact count, what it is waiting for. Rewritten on change.
+  mapped, the panic count, live contact count, what it is waiting for. Rewritten on change,
+  and the app is notified of the change by the file system rather than by polling.
 - `dpadkeys.conf` — the currently active profile (your bindings and offset), rewritten on
   every profile switch. It describes your configuration, not your input.
 
@@ -153,8 +185,9 @@ over adb or by root, gone on reboot):
 
 - service and privilege state, and the package name of the app that came to the foreground
   each time it changes (this is how it decides which profile to activate);
-- during **Bind**, the name of the control you pressed;
-- during **Calibrate**, the tap and drag coordinates it measured.
+- during **Bind**, the name of the control you pressed (the daemon is idled first, so the
+  pad is ungrabbed while you press);
+- during **Calibrate**, the drag deltas and target positions it measured.
 
 The last two exist for diagnosing a bad binding or calibration and only run while you are on
 those screens. Nothing is written while a game is in front.
@@ -162,9 +195,12 @@ those screens. Nothing is written while a game is in front.
 ### Scope and escape hatches
 
 - The daemon only grabs the pad (and panel) while an app you assigned is in front. Everywhere
-  else the controller and touchscreen are untouched, including inside this app.
-- Leaving the game (Home) releases everything immediately. The per-profile panic chord pauses
-  the mapping from inside the game after one second and rebuilds the virtual devices after four.
+  else the controller and touchscreen are untouched, including inside this app. The virtual
+  keyboard device itself stays attached for as long as the service runs, so that switching
+  profiles never makes a device appear or disappear; it emits nothing while idle.
+- Leaving the game (Home) releases everything immediately. The per-profile panic chord (none
+  by default; you choose it by pressing) pauses the mapping from inside the game after one
+  second and rebuilds the virtual devices after four.
 - To see for yourself: `adb shell cat /data/local/tmp/dpadkeys.log`, `adb logcat -s DpadMgr:V`,
   and `adb shell dumpsys package com.dpad.mgr | grep permission`.
 
@@ -176,13 +212,13 @@ those screens. Nothing is written while a game is in front.
   scripts.
 - `android/` — the Android app (Kotlin, Jetpack Compose).
 - `scripts/` — release and packaging tooling.
-- `docs/` — reference docs, including this file's legacy history.
+- `docs/` — release procedure and the history of the abandoned `.kl` route.
 
 **Build**
 
 ```
 ZIG=/path/to/zig daemon/build.sh   # cross-compiles dpadkeys, needs zig 0.13+, no NDK
-android/sync-daemon.sh             # copies the built binary into the app's assets
+android/sync-daemon.sh             # copies the built binary into the app's jniLibs
 cd android && ./gradlew assembleDebug
 ```
 
@@ -196,19 +232,26 @@ line):
 - Raw sources for controls with no standard code: `key.0xNNN` (any
   `EV_KEY` code) and `abs.0xNN.neg` / `abs.0xNN.pos` (any `EV_ABS` axis,
   thresholded like a trigger).
+- Chords: `<hold>+<source> <target>` — applies only while `<hold>` (any
+  button-like source) is held. A source used as a hold always swallows
+  its own press.
 - Targets: a `KEY_*` name, `NONE` (explicit swallow), `WHEEL_UP` /
-  `WHEEL_DOWN`, `MOD` (marks a source as the modifier), or a standard
-  controller-button name -- `BTN_SOUTH/EAST/NORTH/WEST`,
-  `BTN_TL/TR/TL2/TR2`, `BTN_SELECT/START/MODE/THUMBL/THUMBR`,
-  `BTN_DPAD_UP/DOWN/LEFT/RIGHT` -- emitted as a real button press on the
-  virtual device (Android then sees it as a GAMEPAD source too).
+  `WHEEL_DOWN`, or a standard controller-button name --
+  `BTN_SOUTH/EAST/NORTH/WEST`, `BTN_TL/TR/TL2/TR2`,
+  `BTN_SELECT/START/MODE/THUMBL/THUMBR`, `BTN_DPAD_UP/DOWN/LEFT/RIGHT` --
+  emitted as a real button press on the virtual device (Android then
+  sees it as a GAMEPAD source too). `KEY_Q` is ignored in `--serve`
+  unless `--allow-q` was given.
 - `deadzone <0..1>` — fraction of half-range that counts as pressed.
-- `ls.invert_y 0|1`, `rs.invert_y 0|1` — flip a stick's up/down.
-- `mod+<source> <target>` — binding that only applies while the modifier
-  is held.
+- `ls.invert_x`, `ls.invert_y`, `rs.invert_x`, `rs.invert_y` (`0|1`) —
+  flip a stick axis.
 - `wheel_repeat_ms <n>` — repeat interval for a held wheel target.
-- `touch.offset <dx> <dy>` — enables the virtual touchscreen with this
-  pixel offset.
+- `panic <src>[+<src>...]` — the panic chord (no default).
+- `touch.offset <dx> <dy>` — enables the cloned touchscreen with this
+  offset, in display pixels; `touch.display <w> <h> <rotation>` gives
+  the display geometry used to convert it into panel units.
+- `idle 1` — an explicitly idle profile (nothing grabbed, nothing
+  emitted); an empty file means the same.
 - `device.match <substring-of-name>` or `device.match vvvv:pppp` (hex) —
   prefer one pad when several are present.
 
@@ -216,15 +259,22 @@ line):
 
 ```
 --config FILE | --profile fkeys|wasd
---grab                    grab the pad exclusively (omit for testing)
+--serve                   stay resident; re-read the config on SIGUSR1 (what the app uses)
+--status-file PATH        with --serve: write a one-line status on every transition
+--grab                    one-shot mode: grab the pad exclusively (omit for testing)
 --list                    list candidate pad devices and exit
---learn [--learn-timeout-ms N]   print the first control pressed, for bind-by-press
+--learn [--learn-timeout-ms N] [--learn-hold-ms N]
+                          print the first control (or hold+control chord) pressed
+--learn-chord             capture a whole button chord at once (for the panic chord)
 --dump                    print every EV_KEY/EV_ABS event from all evdev nodes
---print-config             print the effective config and exit
---panic-chord none|m1+m2  chord that disables an active touch offset
+--print-config            print the effective config and exit
+--panic-chord none|SRC+SRC  override the profile's panic chord
+--allow-q                 let the serve keyboard carry KEY_Q
 --device auto|/dev/input/eventN
---device-name NAME        name the virtual devices (default "Odin DPad Keys"; touch clone is "NAME Touch")
---verbose
+--device-name NAME        name the keyboard+mouse device (default "Odin DPad Keys")
+--touch-name NAME         rename the cloned touchscreen (testing only; it must normally
+                          match the real panel's name to be mapped identically)
+--verbose                 per-event logging (never passed by the app)
 --pidfile PATH
 ```
 
