@@ -11,6 +11,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -62,9 +63,10 @@ private data class Status(
  * Owns exactly ONE long-lived `dpadkeys --serve` process per privilege session: it creates the
  * virtual devices once and keeps them until it exits. Everything else -- foreground app changes,
  * manual tests, calibration suspend/verify, live config edits -- is "write the config file that
- * should be active now, then SIGUSR1 the daemon", never a process spawn or kill. A 2 s watchdog
- * respawns the serve daemon (with backoff) if it dies; that is the only case where the virtual
- * devices are recreated.
+ * should be active now, then SIGUSR1 the daemon", never a process spawn or kill. Event-driven:
+ * the daemon's death is pushed via [PrivShell.watchExit] (a 60 s [safetyTick] is just the
+ * backstop) and respawns it (with backoff); that is the only case where the virtual devices are
+ * recreated.
  */
 class Supervisor(
     ctx: Context,
@@ -120,6 +122,8 @@ class Supervisor(
     private var lastStatusRaw = ""
     /** Most recently read `waiting` value ("panel"/"pad"/null); also drives the once-per-change log. */
     private var lastWaiting: String? = null
+    /** Latest parsed status line, pushed by [PrivShell.watchStatus] -- no polling. */
+    private val _status = MutableStateFlow<Status?>(null)
 
     private var pointerRefreshJob: Job? = null
     private var pointerHidden = false
@@ -131,12 +135,27 @@ class Supervisor(
     private var failedLatched = false
 
     init {
+        Log.i(TAG, "supervisor: event-driven (status watch + exit watch), safety tick 60 s")
         scope.launch {
             while (isActive) {
                 runCatching { reconcile() }.onFailure { Log.w(TAG, "supervisor: reconcile threw $it") }
-                // wait for a wake-up or the 2 s watchdog tick
-                withTimeoutOrNull(2000) { wake.receive() }
+                // wait for a wake-up, or the 60 s safety tick if nothing wakes us
+                val woke = withTimeoutOrNull(SAFETY_TICK_MS) { wake.receive() }
+                if (woke == null) runCatching { safetyTick() }.onFailure { Log.w(TAG, "supervisor: safety tick threw $it") }
             }
+        }
+    }
+
+    /** Backstop for the (normally event-driven, via [PrivShell.watchExit]) death detection: at
+     *  most once a minute, and only when a pid is actually known, in case the exit push was ever
+     *  missed (binder death, race between spawn and subscribe). */
+    private suspend fun safetyTick() {
+        val shell = serveShell ?: return
+        val pid = servePid
+        if (pid <= 1) return
+        if (!shell.isAlive(pid)) {
+            Log.w(TAG, "supervisor: safety tick found pid=$pid dead")
+            handleDaemonExit(shell, pid)
         }
     }
 
@@ -304,6 +323,7 @@ class Supervisor(
         pointerHidden = false
         _state.value = DaemonState.Stopped
         exitScope.launch {
+            runCatching { shell?.stopWatchStatus() }
             if (wasHidden) runCatching { shell?.setPointerHidden(false) }
             if (pid > 1 && shell != null) {
                 Log.i(TAG, "supervisor: SIGTERM pid=$pid")
@@ -347,6 +367,7 @@ class Supervisor(
             // through the new channel so we never end up with two serve daemons.
             if (servePid > 1) {
                 Log.i(TAG, "supervisor: privilege changed, SIGTERM pid=$servePid")
+                runCatching { serveShell?.stopWatchStatus() }
                 shell.kill(servePid)
                 delay(200)
             }
@@ -355,36 +376,68 @@ class Supervisor(
         }
         if (restartRequested) {
             restartRequested = false
-            if (servePid > 1) { Log.i(TAG, "supervisor: SIGTERM pid=$servePid (restart)"); shell.kill(servePid); delay(300) }
+            if (servePid > 1) {
+                Log.i(TAG, "supervisor: SIGTERM pid=$servePid (restart)")
+                runCatching { shell.stopWatchStatus() }
+                shell.kill(servePid); delay(300)
+            }
             servePid = -1; appliedConf = null; appliedTarget = null
             fastFailures = 0; attempt = 0; backoffUntil = 0; failedLatched = false
             restorePointer(shell)
         }
 
-        // 1. keep exactly one serve daemon alive
-        if (servePid > 1 && !shell.isAlive(servePid)) {
-            Log.w(TAG, "supervisor: serve pid=$servePid died")
-            val fast = System.currentTimeMillis() - startedAt < 10_000
-            servePid = -1; appliedConf = null; appliedTarget = null
-            restorePointer(shell)
-            onFailure("daemon exited: ${lastLogLine(shell)}", fast)
-        }
+        // 1. keep exactly one serve daemon alive (death is normally caught immediately via
+        //    watchExit/safetyTick -> handleDaemonExit; spawning here also covers first start and
+        //    the backoff retry path)
         if (servePid <= 1) {
             if (failedLatched) return
             if (System.currentTimeMillis() < backoffUntil) return
             if (!spawnServe(shell)) return
         }
 
-        // 2. panic detection (the daemon goes idle by itself and bumps the counter)
-        readStatus(shell)?.let { st ->
-            logStatus(st)
-            if (checkPanic(shell, st)) return
-        }
-
-        // 3. make the active config match what should be active now
+        // 2. make the active config match what should be active now
         val want = wanted()
         val conf = withTouchRotation(want?.profile?.toConfigText() ?: IDLE_CONF)
         if (conf != appliedConf) apply(shell, want, conf) else syncState(want)
+    }
+
+    /** Death handling for the serve daemon, whether learned about via [PrivShell.watchExit]
+     *  (immediate) or the 60 s [safetyTick] backstop: fast-failure/backoff bookkeeping, same as
+     *  the old per-tick isAlive check used to do. Ignored if [pid] is no longer the current
+     *  daemon (already handled, or a fresh one has since been spawned). */
+    private suspend fun handleDaemonExit(shell: PrivShell, pid: Int) {
+        if (servePid != pid) return
+        Log.w(TAG, "supervisor: serve pid=$pid died")
+        val fast = System.currentTimeMillis() - startedAt < 10_000
+        servePid = -1; appliedConf = null; appliedTarget = null
+        runCatching { shell.stopWatchStatus() }
+        restorePointer(shell)
+        onFailure("daemon exited: ${lastLogLine(shell)}", fast)
+        wake.trySend(Unit)
+    }
+
+    /** [PrivShell.watchExit] callback: fires once, off the reconcile loop, so hop back onto
+     *  [scope] before touching any of the supervisor's state. */
+    private fun onExitLine(pid: Int, line: String) {
+        if (!line.startsWith("exit ")) return
+        scope.launch {
+            val shell = serveShell ?: return@launch
+            handleDaemonExit(shell, pid)
+        }
+    }
+
+    /** [PrivShell.watchStatus] callback: same hop-to-[scope] treatment as [onExitLine]. Updates
+     *  the [_status] flow (so [pollStatus] can await it), runs panic detection, and refreshes the
+     *  visible state (for live `waitingFor` changes) exactly as the old per-tick poll did. */
+    private fun onStatusLine(raw: String) {
+        scope.launch {
+            val st = parseStatus(raw) ?: return@launch
+            _status.value = st
+            logStatus(st)
+            val shell = serveShell ?: return@launch
+            if (checkPanic(shell, st)) return@launch
+            syncState(wanted())
+        }
     }
 
     private suspend fun spawnServe(shell: PrivShell): Boolean {
@@ -418,14 +471,17 @@ class Supervisor(
         appliedTarget = null
         attempt = 0
         lastStatusRaw = ""
-        lastPanic = pollStatus(shell, "idle")?.panic ?: 0
+        _status.value = null
+        shell.watchStatus(STATUS) { line -> onStatusLine(line) }
+        shell.watchExit(pid) { line -> onExitLine(pid, line) }
+        lastPanic = pollStatus("idle")?.panic ?: 0
         Log.i(TAG, "supervisor: serve spawned pid=$pid")
         _state.value = DaemonState.Idle
         return true
     }
 
-    /** Writes the config that should be active and SIGUSR1s the daemon, then waits for the status
-     *  file to reflect it (up to 1 s). Never spawns or kills a process. */
+    /** Writes the config that should be active and SIGUSR1s the daemon, then waits for the pushed
+     *  status to reflect it (up to 1 s). Never spawns or kills a process. */
     private suspend fun apply(shell: PrivShell, want: Target?, conf: String) {
         if (!shell.writeFile(CONF, conf)) { onFailure("cannot write $CONF", fast = true); return }
         val r = shell.exec(listOf("kill", "-USR1", servePid.toString()))
@@ -435,8 +491,8 @@ class Supervisor(
         if (want == null) Log.i(TAG, "supervisor: idle") else Log.i(TAG, activateLogLine(want.profile.name, conf))
 
         val expect = if (want == null) "idle" else "active"
-        val st = pollStatus(shell, expect)
-        if (st == null) Log.w(TAG, "supervisor: no status file after SIGUSR1")
+        val st = pollStatus(expect)
+        if (st == null) Log.w(TAG, "supervisor: no status pushed after SIGUSR1")
         else if (st.state != expect) Log.w(TAG, "supervisor: status still state=${st.state}, expected $expect")
         if (st != null && checkPanic(shell, st)) return
 
@@ -454,12 +510,13 @@ class Supervisor(
         if (_state.value != s) _state.value = s
     }
 
-    // ---- status file ----
+    // ---- status (pushed by PrivShell.watchStatus, not polled) ----
 
-    private suspend fun readStatus(shell: PrivShell): Status? {
-        val r = runCatching { shell.exec(listOf("cat", STATUS)) }.getOrNull() ?: return null
-        if (!r.ok) return null
-        val line = r.out.lineSequence().map { it.trim() }.lastOrNull { it.startsWith("state=") } ?: return null
+    /** Parses one `state=... touch=... keys=N panic=C waiting=panel|pad|none` line as pushed by
+     *  [PrivShell.watchStatus]/[onStatusLine]. Pure -- no I/O. */
+    private fun parseStatus(raw: String): Status? {
+        val line = raw.trim()
+        if (!line.startsWith("state=")) return null
         val kv = line.split(Regex("\\s+")).mapNotNull { tok ->
             val i = tok.indexOf('=')
             if (i <= 0) null else tok.substring(0, i) to tok.substring(i + 1)
@@ -473,18 +530,13 @@ class Supervisor(
         return Status(state, kv["touch"] ?: "?", kv["keys"]?.toIntOrNull() ?: 0, kv["panic"]?.toIntOrNull() ?: 0, waiting, line)
     }
 
-    /** Polls the status file for up to 1 s waiting for [expectState]; returns the last line read. */
-    private suspend fun pollStatus(shell: PrivShell, expectState: String): Status? {
-        val deadline = System.currentTimeMillis() + STATUS_POLL_MS
-        var last: Status? = null
-        while (true) {
-            last = readStatus(shell) ?: last
-            if (last?.state == expectState) break
-            if (System.currentTimeMillis() >= deadline) break
-            delay(100)
-        }
-        last?.let { logStatus(it) }
-        return last
+    /** Awaits [_status] reaching [expectState], up to 1 s; falls back to whatever the flow last
+     *  held (possibly null, or a different state) if the timeout elapses. No polling: the flow is
+     *  only ever updated by [onStatusLine], which [PrivShell.watchStatus] pushes into. */
+    private suspend fun pollStatus(expectState: String): Status? {
+        val cur = _status.value
+        if (cur?.state == expectState) return cur
+        return withTimeoutOrNull(STATUS_POLL_MS) { _status.first { it?.state == expectState } } ?: _status.value
     }
 
     private fun logStatus(st: Status) {
@@ -520,7 +572,7 @@ class Supervisor(
     // ---- pointer ----
 
     /**
-     * Re-applies setPointerHidden(true) every 200 ms while the active config uses a wheel target.
+     * Re-applies setPointerHidden(true) every 500 ms while the active config uses a wheel target.
      * Android resets the pointer icon back to the arrow on the first mouse event delivered to a
      * newly-focused window, so a single call isn't enough -- the first wheel notch would show
      * (and leave visible) the cursor.
@@ -533,7 +585,7 @@ class Supervisor(
             runCatching { shell.setPointerHidden(true) }
             Log.i(TAG, "pointer: hidden")
             while (isActive) {
-                delay(200)
+                delay(500)
                 runCatching { shell.setPointerHidden(true) }
             }
         }
@@ -602,6 +654,10 @@ class Supervisor(
         const val LOG = "/data/local/tmp/dpadkeys.log"
         private const val TARGET_DEBOUNCE_MS = 150L
         private const val STATUS_POLL_MS = 1000L
+        /** Loop's slow watchdog when nothing wakes it: one [safetyTick] (at most one [PrivShell.isAlive]
+         *  call) per minute, only when a pid is known -- death is normally caught immediately via
+         *  [PrivShell.watchExit] instead. */
+        private const val SAFETY_TICK_MS = 60_000L
         private const val KEY_TOUCH_GENERATION = "touch_generation"
         /** A config with no bindings and no touch.offset: the daemon serves but grabs nothing. */
         const val IDLE_CONF = "# generated by Odin DPad Keys (idle)\nidle 1\n"

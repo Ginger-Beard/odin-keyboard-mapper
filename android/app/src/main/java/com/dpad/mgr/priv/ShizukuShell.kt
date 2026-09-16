@@ -144,6 +144,28 @@ class ShizukuShell(ctx: Context) : PrivShell {
 
     override suspend fun stopTail() { withContext(Dispatchers.IO) { runCatching { svc()?.stopTail() } } }
 
+    override suspend fun watchStatus(path: String, cb: (String) -> Unit) {
+        withContext(Dispatchers.IO) {
+            runCatching {
+                svc()?.watchStatus(path, object : ILineCallback.Stub() {
+                    override fun onLine(line: String?) { if (line != null) cb(line) }
+                })
+            }.onFailure { Log.w(TAG, "shizuku: watchStatus failed $it") }
+        }
+    }
+
+    override suspend fun stopWatchStatus() { withContext(Dispatchers.IO) { runCatching { svc()?.stopWatchStatus() } } }
+
+    override suspend fun watchExit(pid: Int, cb: (String) -> Unit) {
+        withContext(Dispatchers.IO) {
+            runCatching {
+                svc()?.watchExit(pid, object : ILineCallback.Stub() {
+                    override fun onLine(line: String?) { if (line != null) cb(line) }
+                })
+            }.onFailure { Log.w(TAG, "shizuku: watchExit failed $it") }
+        }
+    }
+
     fun release() {
         runCatching { Shizuku.unbindUserService(args, conn, true) }
         runCatching { Shizuku.removeBinderReceivedListener(binderListener) }

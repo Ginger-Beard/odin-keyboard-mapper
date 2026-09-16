@@ -2,6 +2,8 @@ package com.dpad.mgr.priv
 
 import android.content.Context
 import android.os.Bundle
+import android.os.FileObserver
+import android.os.RemoteException
 import android.util.Log
 import java.io.BufferedReader
 import java.io.File
@@ -24,6 +26,12 @@ class ShizukuUserService() : IUserService.Stub() {
     private val spawned = java.util.concurrent.ConcurrentHashMap<Int, Process>()
     /** pid -> exit code, filled in by the waiter thread once a spawned child has died. */
     private val spawnedExit = java.util.concurrent.ConcurrentHashMap<Int, Int>()
+    /** pid -> one-shot callback registered via [watchExit], fired (and removed) by the waiter
+     *  thread the moment that pid's exit code is known. */
+    private val exitWatchers = java.util.concurrent.ConcurrentHashMap<Int, ILineCallback>()
+
+    @Volatile private var statusObserver: FileObserver? = null
+    @Volatile private var statusCb: ILineCallback? = null
 
     init {
         // Safety net: a previous instance of this user service can die (Shizuku rebind,
@@ -106,6 +114,13 @@ class ShizukuUserService() : IUserService.Stub() {
             spawnedExit[pid] = rc
             spawned.remove(pid)
             Log.i(TAG, "userservice: pid=$pid exited rc=$rc")
+            exitWatchers.remove(pid)?.let { cb ->
+                try {
+                    cb.onLine("exit $pid $rc")
+                } catch (e: RemoteException) {
+                    Log.w(TAG, "userservice: watchExit callback for pid=$pid died: $e")
+                }
+            }
         }
         pid
     } catch (e: Exception) {
@@ -162,7 +177,7 @@ class ShizukuUserService() : IUserService.Stub() {
     }
 
     // Cached reflection handles for setPointerIconType, resolved once and reused on every call
-    // thereafter (this is polled every 700ms by the Supervisor while a wheel profile's daemon is
+    // thereafter (this is polled every 500ms by the Supervisor while a wheel profile's daemon is
     // running, so re-resolving via Class.forName/getMethod on every tick would be wasteful).
     @Volatile private var pointerImInstance: Any? = null
     @Volatile private var pointerImMethod: java.lang.reflect.Method? = null
@@ -271,8 +286,66 @@ class ShizukuUserService() : IUserService.Stub() {
         tailProc = null
     }
 
+    /**
+     * Pushes [path]'s current single status line to [cb] once immediately, then again every
+     * time the file is closed-after-write or renamed into place (the daemon writes via
+     * temp+rename, hence watching MOVED_TO on the directory rather than the file itself) --
+     * replaces polling `cat` of the status file 30x/minute. Only one status watch is active at
+     * a time; a new call implicitly replaces any previous one (see [stopWatchStatus]).
+     */
+    override fun watchStatus(path: String, cb: ILineCallback) {
+        stopWatchStatus()
+        val file = File(path)
+        val dir = file.parentFile ?: File("/")
+        val name = file.name
+        statusCb = cb
+        pushStatusLine(file, cb)
+        val observer = object : FileObserver(dir, CLOSE_WRITE or MOVED_TO) {
+            override fun onEvent(event: Int, relPath: String?) {
+                if (relPath != name) return
+                val c = statusCb ?: return
+                pushStatusLine(file, c)
+            }
+        }
+        statusObserver = observer
+        observer.startWatching()
+    }
+
+    private fun pushStatusLine(file: File, cb: ILineCallback) {
+        val line = runCatching {
+            file.readText().lineSequence().map { it.trim() }.lastOrNull { it.startsWith("state=") }
+        }.getOrNull() ?: return
+        try {
+            cb.onLine(line)
+        } catch (e: RemoteException) {
+            Log.w(TAG, "userservice: watchStatus callback died: $e")
+            stopWatchStatus()
+        }
+    }
+
+    override fun stopWatchStatus() {
+        statusObserver?.let { runCatching { it.stopWatching() } }
+        statusObserver = null
+        statusCb = null
+    }
+
+    /**
+     * Fires once with `"exit <pid> <code>"` the moment [pid] (started via [spawn]) dies -- either
+     * immediately, if it has already exited by the time this is called, or later from the same
+     * waiter thread [spawn] started for it. No polling on either side.
+     */
+    override fun watchExit(pid: Int, cb: ILineCallback) {
+        val rc = spawnedExit[pid]
+        if (rc != null) {
+            try { cb.onLine("exit $pid $rc") } catch (e: RemoteException) { /* caller already gone */ }
+            return
+        }
+        exitWatchers[pid] = cb
+    }
+
     override fun destroy() {
         stopTail()
+        stopWatchStatus()
         exitProcess(0)
     }
 

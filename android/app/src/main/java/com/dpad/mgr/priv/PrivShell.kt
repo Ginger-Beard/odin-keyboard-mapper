@@ -47,6 +47,20 @@ interface PrivShell {
 
     suspend fun stopTail()
 
+    /** Subscribes to push notifications of [path]'s content (its one `state=...` line): cb is
+     *  invoked with the current line immediately, then again on every subsequent change (no
+     *  polling). Only meaningful over Shizuku (see [ShizukuShell], backed by FileObserver in
+     *  [ShizukuUserService]); other channels keep the default (unsupported, never calls cb). */
+    suspend fun watchStatus(path: String, cb: (String) -> Unit) {}
+
+    /** Stops the subscription started by [watchStatus]. */
+    suspend fun stopWatchStatus() {}
+
+    /** Subscribes to a one-shot push of `"exit <pid> <code>"` when [pid] (started via [spawn])
+     *  dies. Only meaningful over Shizuku; other channels keep the default (unsupported, never
+     *  calls cb -- callers must fall back to polling [isAlive] there). */
+    suspend fun watchExit(pid: Int, cb: (String) -> Unit) {}
+
     companion object {
         val SAFE_TOKEN = Regex("^[A-Za-z0-9._/~=+,:@ -]+$")
         // wm_set_resumed_activity carries "pkg/cls" in its raw text on Android 13; am_resume_activity

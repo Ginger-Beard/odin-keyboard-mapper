@@ -13,5 +13,8 @@ interface IUserService {
     boolean setPointerIconType(int type);
     void startTail(ILineCallback cb);
     void stopTail();
+    void watchStatus(String path, ILineCallback cb);
+    void stopWatchStatus();
+    void watchExit(int pid, ILineCallback cb);
     void destroy();
 }
