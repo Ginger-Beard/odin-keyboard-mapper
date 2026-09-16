@@ -83,6 +83,91 @@ resulted in a ban. No warranty of any kind; use at your own risk.
 Wheel (scroll) bindings carry a fixed pointer position; see the in-app
 warning; not recommended for OSRS.
 
+## For the security-minded
+
+This section states plainly what the app needs, why, and what it records.
+
+### Why it needs Shizuku (or root)
+
+Everything the mapping daemon does sits below the line Android draws for normal apps.
+A normal app only ever receives input aimed at its own windows. This app has to work
+underneath the whole system, which needs the rights of the `shell` user (what `adb`
+runs as). Shizuku lends those rights to the app by starting one helper process through
+adb's own credentials; root would do the same. Concretely, the shell user is required to:
+
+- read the gamepad and touchscreen event nodes under `/dev/input` (blocked for app
+  processes by SELinux policy regardless of file permissions);
+- take an exclusive grab on the pad (and, when a stylus offset is enabled, the panel)
+  so the game does not also see the original events;
+- create virtual input devices through `/dev/uinput` (reserved for the `uhid` group);
+  this is what makes the mapped keystrokes real hardware events rather than injected ones;
+- learn which app is in the foreground by tailing the system's activity event log, which
+  costs no usage-stats permission and is not visible to other apps;
+- hide the mouse pointer while a profile uses scroll-wheel targets (a hidden system call);
+- start, signal and stop the daemon, which runs as that same user.
+
+### What cannot work without it
+
+- **Accessibility-service mappers** can intercept key events and inject events into other
+  apps, but they cannot grab the pad (the game keeps seeing the original buttons), cannot
+  see analog sticks or hat D-pads at all, and their injected events carry the system's
+  virtual-keyboard device id. An enabled accessibility service is also visible to every
+  app on the device. This app deliberately has no accessibility service.
+- **Input-method (keyboard app) tricks** only work while a text field has focus, which a
+  fullscreen game never has.
+- With no privilege at all the app can do nothing: it will show "Needs setup" and wait.
+
+### Android permissions the app declares
+
+| Permission | Why |
+|---|---|
+| `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_SPECIAL_USE` | the always-on service that watches for assigned apps |
+| `RECEIVE_BOOT_COMPLETED` | start the service after a reboot |
+| `POST_NOTIFICATIONS` | the persistent "active" notification and the panic-chord notice |
+| `QUERY_ALL_PACKAGES` | list installed apps so you can assign profiles to them |
+| `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` | offer the "run in background" exemption |
+
+No network permission of any kind is declared. Nothing can leave the device, and there is
+no analytics or crash-reporting library in the build.
+
+### What is logged, where, and for how long
+
+**During play: no input is recorded.** The daemon has a per-event logging mode, but it is
+behind a `--verbose` flag that the app never passes; it can only be turned on by starting the
+daemon by hand from a shell.
+
+Files the daemon writes, all under `/data/local/tmp/` (readable by any shell/adb user on the
+device, not by other apps):
+
+- `dpadkeys.log` — overwritten every time the daemon starts. Contains the startup banner
+  (which devices it found), state transitions (idle/active), grab and release messages,
+  config errors, and panic-chord events. Never key presses, coordinates or contacts unless
+  `--verbose` was given manually.
+- `dpadkeys.status` — one line of counters: state, whether touch is on, how many keys are
+  mapped, the panic count, live contact count, what it is waiting for. Rewritten on change.
+- `dpadkeys.conf` — the currently active profile (your bindings and offset), rewritten on
+  every profile switch. It describes your configuration, not your input.
+
+Lines the app writes to Android's logcat (tag `DpadMgr`; a volatile ring buffer, readable only
+over adb or by root, gone on reboot):
+
+- service and privilege state, and the package name of the app that came to the foreground
+  each time it changes (this is how it decides which profile to activate);
+- during **Bind**, the name of the control you pressed;
+- during **Calibrate**, the tap and drag coordinates it measured.
+
+The last two exist for diagnosing a bad binding or calibration and only run while you are on
+those screens. Nothing is written while a game is in front.
+
+### Scope and escape hatches
+
+- The daemon only grabs the pad (and panel) while an app you assigned is in front. Everywhere
+  else the controller and touchscreen are untouched, including inside this app.
+- Leaving the game (Home) releases everything immediately. The per-profile panic chord pauses
+  the mapping from inside the game after one second and rebuilds the virtual devices after four.
+- To see for yourself: `adb shell cat /data/local/tmp/dpadkeys.log`, `adb logcat -s DpadMgr:V`,
+  and `adb shell dumpsys package com.dpad.mgr | grep permission`.
+
 ## Developer
 
 **Layout**
